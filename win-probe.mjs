@@ -1,7 +1,10 @@
-// Temporary: what Windows can answer about a process, and what asking costs.
+// Temporary: how sharply Windows can tell two processes apart by their start time, and what a lookup costs.
 import { execFileSync, spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 
+const ps = (cmd) =>
+  execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", cmd], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+const start = (pid) => ps(`(Get-Process -Id ${pid}).StartTime.Ticks`);
 const timed = (label, fn) => {
   const t = process.hrtime.bigint();
   let r;
@@ -13,64 +16,44 @@ const timed = (label, fn) => {
   console.log(`${label}: ${(Number(process.hrtime.bigint() - t) / 1e6).toFixed(0)} ms -> ${r}`);
 };
 
-const code = (pid) => {
-  try {
-    process.kill(pid, 0);
-    return "ok";
-  } catch (e) {
-    return e.code;
-  }
-};
+writeFileSync("wait.mjs", "setTimeout(() => {}, 30_000);\n");
+const spawnKid = () => spawn(process.execPath, ["wait.mjs", "--user-data-dir=C:\\some profile\\dir"], { stdio: "ignore" });
 
-console.log("== process.kill(pid, 0) ==");
-for (const pid of [0, 1, 4, 8, 100, process.pid, process.ppid, 999999]) console.log(`  ${pid} -> ${code(pid)}`);
+console.log("== five children spawned back to back ==");
+const kids = [0, 1, 2, 3, 4].map(spawnKid);
+await new Promise((r) => setTimeout(r, 400));
+const ticks = kids.map((k) => start(k.pid));
+for (let i = 0; i < kids.length; i++) console.log(`  pid ${kids[i].pid} start ${ticks[i]}${i ? ` (+${Number(BigInt(ticks[i] || 0) - BigInt(ticks[i - 1] || 0)) / 10_000} ms)` : ""}`);
+console.log(`  distinct: ${new Set(ticks).size} of ${ticks.length}`);
+for (const k of kids) k.kill();
 
-const rows = execFileSync("tasklist", ["/FO", "CSV", "/NH"], { encoding: "utf8" })
-  .split("\n")
-  .map((l) => l.split('","'))
-  .filter((r) => r.length > 2)
-  .map((r) => [r[0].replace(/"/g, ""), Number(r[1])]);
-console.log(`  running processes: ${rows.length}`);
-const notOk = rows.filter(([, p]) => code(p) !== "ok");
-console.log(`  not "ok": ${notOk.map(([n, p]) => `${p} ${n} ${code(p)}`).join(", ") || "(none)"}`);
-
-const ps = (cmd) =>
-  execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", cmd], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-const wmic = (...args) => execFileSync("wmic", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-
-console.log("== cost of one lookup ==");
-timed("powershell Get-Process StartTime.Ticks (cold)", () => ps(`(Get-Process -Id ${process.pid}).StartTime.Ticks`));
-timed("powershell Get-Process StartTime.Ticks", () => ps(`(Get-Process -Id ${process.pid}).StartTime.Ticks`));
-timed("powershell Get-Process StartTime.Ticks", () => ps(`(Get-Process -Id ${process.pid}).StartTime.Ticks`));
-timed("powershell CIM CreationDate.Ticks", () => ps(`(Get-CimInstance Win32_Process -Filter "ProcessId=${process.pid}").CreationDate.Ticks`));
-timed("powershell CIM CommandLine", () => ps(`(Get-CimInstance Win32_Process -Filter "ProcessId=${process.pid}").CommandLine`));
-timed("powershell Get-Process both", () => ps(`$p=Get-Process -Id ${process.pid};"$($p.StartTime.Ticks)"`));
-timed("wmic CreationDate", () => wmic("process", "where", `processid=${process.pid}`, "get", "CreationDate", "/value"));
-timed("wmic CommandLine", () => wmic("process", "where", `processid=${process.pid}`, "get", "CommandLine", "/value"));
-timed("tasklist one pid", () => execFileSync("tasklist", ["/FO", "CSV", "/NH", "/FI", `PID eq ${process.pid}`], { encoding: "utf8" }).trim());
-
-console.log("== a pid that does not exist ==");
-timed("powershell StartTime of 999999", () => ps("(Get-Process -Id 999999).StartTime.Ticks"));
-timed("powershell CIM of 999999", () => ps(`(Get-CimInstance Win32_Process -Filter "ProcessId=999999").CommandLine`));
-timed("wmic of 999999", () => wmic("process", "where", "processid=999999", "get", "CreationDate", "/value"));
-
-console.log("== a process this user did not start ==");
-for (const [name, pid] of [["System", 4], ...notOk.slice(0, 3), ...rows.slice(0, 3)]) {
-  timed(`  StartTime of ${pid} ${name}`, () => ps(`(Get-Process -Id ${pid}).StartTime.Ticks`));
-  timed(`  CIM CreationDate of ${pid} ${name}`, () => ps(`(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CreationDate.Ticks`));
+console.log("== children spaced apart ==");
+let prev;
+for (const gap of [0, 1, 5, 20, 100]) {
+  await new Promise((r) => setTimeout(r, gap));
+  const k = spawnKid();
+  await new Promise((r) => setTimeout(r, 250));
+  const t = start(k.pid);
+  console.log(`  after ${gap} ms: pid ${k.pid} start ${t}${prev ? ` (+${Number(BigInt(t || 0) - BigInt(prev)) / 10_000} ms)` : ""}`);
+  prev = t || prev;
+  k.kill();
 }
 
-console.log("== resolution, and the command line of a child we spawn ==");
-writeFileSync("wait.mjs", "setTimeout(() => {}, 20_000);\n");
-const kids = [0, 1].map(() => spawn(process.execPath, ["wait.mjs", "--user-data-dir=C:\\some profile\\dir"], { stdio: "ignore" }));
+console.log("== batching, and the shape of the value ==");
+const live = [0, 1, 2].map(spawnKid);
 await new Promise((r) => setTimeout(r, 300));
-for (const kid of kids) {
-  console.log(`  pid ${kid.pid} start ${ps(`(Get-Process -Id ${kid.pid}).StartTime.Ticks`)}`);
-  console.log(`  pid ${kid.pid} cmdline ${ps(`(Get-CimInstance Win32_Process -Filter "ProcessId=${kid.pid}").CommandLine`)}`);
-  console.log(`  pid ${kid.pid} wmic cmdline ${wmic("process", "where", `processid=${kid.pid}`, "get", "CommandLine", "/value")}`);
-}
-for (const kid of kids) kid.kill();
-console.log("== what a dead pid answers after it exits ==");
-await new Promise((r) => setTimeout(r, 500));
-console.log(`  kill(${kids[0].pid},0) -> ${code(kids[0].pid)}`);
-timed("  StartTime of the exited child", () => ps(`(Get-Process -Id ${kids[0].pid}).StartTime.Ticks`));
+timed("one pid", () => start(live[0].pid));
+timed("three pids in one call", () => ps(`Get-Process -Id ${live.map((k) => k.pid).join(",")} | ForEach-Object { "$($_.Id) $($_.StartTime.Ticks)" }`));
+timed("three pids, one of them gone", () => ps(`Get-Process -Id ${[live[0].pid, 999999, live[1].pid].join(",")} | ForEach-Object { "$($_.Id) $($_.StartTime.Ticks)" }`));
+console.log(`  value contains ':' or '|': ${/[:|]/.test(start(live[0].pid))}`);
+console.log(`  full path: ${ps(`(Get-Process -Id ${live[0].pid}).Path`)}`);
+for (const k of live) k.kill();
+
+console.log("== powershell without PATH, and its own startup ==");
+timed("full path to Windows PowerShell", () =>
+  execFileSync(`${process.env.SystemRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`, ["-NoProfile", "-NonInteractive", "-Command", "$PID"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim(),
+);
+console.log(`  version: ${ps("$PSVersionTable.PSVersion.ToString()")}`);

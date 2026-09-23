@@ -33,6 +33,15 @@ jobs:
           fi
           echo "releasing $manifest"
 
+      # The same setup ci.yml does, and for the same reason: /usr/bin/chromium on the runner is a snap build that
+      # never opens a DevTools port, and Ubuntu restricts the user namespaces Chromium's sandbox needs. Without it
+      # the suite fails here on a machine detail while the code is fine -- which is exactly what happened to v0.2.0.
+      - name: Install a browser the launch test can use
+        run: |
+          npx --yes playwright-core install --with-deps chromium
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          echo "FIGMA_BROWSER_PATH=$(node -e "console.log(require('playwright-core').chromium.executablePath())")" >> "$GITHUB_ENV"
+
       - run: npm test
       - run: npm run build
 

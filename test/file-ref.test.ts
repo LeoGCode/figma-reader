@@ -1,7 +1,7 @@
 // Every tool's `file` argument goes through parseFileRef, so the forms users paste are pinned here.
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileKeyFromPath, keyFromFileName, parseFileRef } from "../src/figma-web.ts";
@@ -109,7 +109,10 @@ test("a bare name is never read as a design file just because the cwd happens to
   // server's working directory carried that name. The order was inverted, and what stops the inverse — an ordinary
   // word being read as a design because a file of that name sits there — is that a ref with no '/', '.' or '~' in
   // it is not a path. An MCP server runs wherever its client started it, so that directory is not one we choose.
-  const dir = mkdtempSync(join(tmpdir(), "figma-reader-ref-"));
+  //
+  // Resolved, since process.chdir below makes this the cwd that parseFileRef resolves "./real.fig" against, and
+  // the cwd comes back with its symlinks gone: on macOS the temp dir is under /var, which is a link to /private/var.
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "figma-reader-ref-")));
   after(() => rmSync(dir, { recursive: true, force: true }));
   const cwd = process.cwd();
   process.chdir(dir);

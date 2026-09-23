@@ -3,13 +3,16 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { figBytes, type TestNode } from "./fixtures.ts";
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
-const root = mkdtempSync(join(tmpdir(), "figma-reader-cli-"));
+// Resolved, because every path the CLI prints has been through the cwd the kernel reports, which is resolved:
+// on macOS the temp dir is reached through /var -> /private/var, and "use" named the file it copied under the
+// /private spelling while the test looked for it under the other one.
+const root = realpathSync(mkdtempSync(join(tmpdir(), "figma-reader-cli-")));
 after(() => rmSync(root, { recursive: true, force: true }));
 const home = join(root, "home");
 const work = join(root, "work");

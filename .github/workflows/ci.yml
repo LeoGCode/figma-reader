@@ -22,13 +22,14 @@ jobs:
           cache: npm
       - run: npm ci
 
-      # /usr/bin/chromium exists on the runner but is a snap wrapper that never opens a DevTools port, so the one
-      # test that launches a real browser would fail there and, guarded only on the file existing, could not skip
-      # either. Playwright's build is a native one and launches; the test prefers FIGMA_BROWSER_PATH.
+      # One test starts a real browser. /usr/bin/chromium is present on the runner but is a snap build, and Ubuntu
+      # 24.04 also restricts the unprivileged user namespaces Chromium's sandbox needs, so both that binary and
+      # Playwright's exit before opening a DevTools port. Install a native build and relax the restriction, rather
+      # than passing --no-sandbox in the code: a real user runs with the sandbox on, so that is what to test.
       - name: Install a browser the launch test can use
-        run: npx --yes playwright-core install --with-deps chromium
-      - name: Resolve its path
         run: |
+          npx --yes playwright-core install --with-deps chromium
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           echo "FIGMA_BROWSER_PATH=$(node -e "console.log(require('playwright-core').chromium.executablePath())")" >> "$GITHUB_ENV"
 
       # Typechecks src, test and scripts, then runs the suite from the TypeScript source.

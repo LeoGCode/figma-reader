@@ -445,7 +445,9 @@ const chromium = [process.env.FIGMA_BROWSER_PATH, "/usr/bin/chromium", "/usr/bin
  */
 const launchable = chromium ?? (win ? browserCandidates()[0] : undefined);
 
-test("a browser that cannot start is passed over for one that can", { skip: !launchable && "no browser that starts" }, async () => {
+// A real browser behind the dud, and on Windows every record written and read on the way costs a PowerShell call:
+// measured at 9 s on one runner and 24 s on a slower one, which is too close to the suite's 30 s ceiling.
+test("a browser that cannot start is passed over for one that can", { skip: !launchable && "no browser that starts", timeout: 60_000 }, async () => {
   // The picker used to commit to the first browser that existed, so a snap Chromium was a dead end: it exits
   // without opening a DevTools port, and nothing tried the working Chrome beside it. Here the first candidate
   // exits at once, exactly as that one does, and the launch must end on the browser behind it.

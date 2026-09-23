@@ -159,15 +159,41 @@ export function sameProcess(pid: number, start: string | undefined): boolean {
   return pidAlive(pid) && (start === undefined || processStart(pid) === start);
 }
 
+let cachedNs: string | null | undefined;
+
 /**
- * Identity of a process for a file that outlives it: "<boot>|<start>", or the start time alone where no boot id is
- * readable. The boot belongs in it because processStart counts ticks since boot: on Linux the whole pair is
- * reproduced by unrelated processes after a reboot, and the stamp is what keeps a lease or a record honest. A
- * Windows start time counts from an absolute epoch instead, so there a bare one already means only one boot.
+ * Identity of the pid namespace this process's pids are numbered in: the inode of /proc/self/ns/pid, which the
+ * kernel gives each namespace on this boot. The number alone is taken, so that a stamp's parts still contain no
+ * ':' (the link itself reads "pid:[4026531836]"). Undefined off Linux and wherever /proc cannot be read.
+ */
+export function pidNamespace(): string | undefined {
+  if (cachedNs === undefined) cachedNs = readPidNamespace() ?? null;
+  return cachedNs ?? undefined;
+}
+
+function readPidNamespace(): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    return readlinkSync("/proc/self/ns/pid").match(/\[(\d+)\]/)?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Identity of a process for a file that outlives it: "<boot>|<start>|<ns>", or "<boot>|<start>", or the start time
+ * alone where no boot id is readable. The boot belongs in it because processStart counts ticks since boot: on Linux
+ * the whole pair is reproduced by unrelated processes after a reboot, and the stamp is what keeps a lease or a
+ * record honest. A Windows start time counts from an absolute epoch instead, so there a bare one already means only
+ * one boot. The namespace belongs in it because a pid means nothing outside the one it was issued in (see
+ * sameStampedProcess), and two containers sharing a bind-mounted cache have their own.
  */
 export function processStamp(pid: number): string {
   const boot = bootId();
   const start = processStart(pid) ?? "";
+  const ns = pidNamespace();
+  // The boot's place is held even when it is unknown, so that a reader can tell the third field from the second.
+  if (ns) return `${boot ?? ""}|${start}|${ns}`;
   return boot ? `${boot}|${start}` : start;
 }
 
@@ -176,12 +202,21 @@ export function processStamp(pid: number): string {
  * tell: on macOS a pid reissued within the same second passes, and anywhere the start time cannot be read at all a
  * live pid alone passes. What that costs is a lease read as live or a tab left unadopted, never a signal - killing
  * goes through ownsProcess, which does not rest on the start time alone.
+ *
+ * A stamp from another pid namespace passes too, because there is nothing here to judge it by: its pid names one of
+ * our processes or none at all, and its start time counts ticks a container's /proc reports from its own pid 1. A
+ * container's pid 1 stamped 75516567 ticks while the host's pid 1 read 12, under one boot id, so the host read a
+ * live holder as a pid reissued to someone else - and liveLeases then deleted its lease while its export ran. Costs
+ * as above, bounded by the caller's own ceiling; the lease of a container that crashed is swept by nothing.
  */
 export function sameStampedProcess(pid: number, stamp: string): boolean {
-  const bar = stamp.indexOf("|");
-  // Stamps without a boot predate it, or come from a platform with none; they are read as bare start times.
-  if (bar < 0) return sameProcess(pid, stamp || undefined);
-  return sameBoot(stamp.slice(0, bar)) && sameProcess(pid, stamp.slice(bar + 1) || undefined);
+  const [first, second, ns] = stamp.split("|");
+  // Stamps without a boot predate it, or come from a platform with none; they are read as bare start times, and
+  // one written before the namespace was in the stamp is read as this build read every stamp before it.
+  const boot = second === undefined ? undefined : first || undefined;
+  if (!sameBoot(boot)) return false;
+  if (ns !== undefined && ns !== pidNamespace()) return true;
+  return sameProcess(pid, (second ?? first) || undefined);
 }
 
 /** Write via rename so a concurrent reader never sees a half-written file (and mistakes it for a stale one). */

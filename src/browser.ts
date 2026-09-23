@@ -266,12 +266,17 @@ function declaredBeat(stamp: string): number | undefined {
 const beats = new Map<string, { mtime: number; since: number }>();
 
 /**
- * The lease at `path` has been touched within `window` ms of wall time as measured here. Every comparison is between
- * two readings of one clock - an mtime against an mtime, and this process's elapsed time against itself - because a
- * cache reached across a pid namespace is reached across machines too, and an mtime held against Date.now() reads a
- * holder whose filesystem clock runs a minute behind as long dead. A lease this process has not seen before is live:
- * the first reading is only what the next is measured from, and that way round costs a duplicate export, where the
- * other way round deletes a live holder's lease and reports its pre-refresh export as current.
+ * The lease at `path` has been touched within `window` ms of running time as measured here. Every comparison is
+ * between two readings of one clock - an mtime against an mtime, and this process's own elapsed time against itself
+ * - because a cache reached across a pid namespace is reached across machines too, and an mtime held against
+ * Date.now() reads a holder whose filesystem clock runs a minute behind as long dead. A lease this process has not
+ * seen before is live: the first reading is only what the next is measured from, and that way round costs a
+ * duplicate export, where the other way round deletes a live holder's lease and reports its pre-refresh export as
+ * current.
+ *
+ * The span is monotonic running time, not wall time, because the two things wall time would count are exactly the
+ * two that are not missed beats: a clock stepped by chrony or date -s, and a suspended machine, which stops the
+ * holder's timer and this process for the same hour and leaves neither any the wiser.
  */
 function stillBeating(path: string, window: number): boolean {
   let mtime: number;
@@ -280,13 +285,12 @@ function stillBeating(path: string, window: number): boolean {
   } catch {
     return false;
   }
-  const now = Date.now();
+  const now = performance.now();
   const seen = beats.get(path);
   if (!seen || seen.mtime !== mtime) {
     beats.set(path, { mtime, since: now });
     return true;
   }
-  // A clock stepped back between the two readings makes the span negative, which reads as "not cold yet".
   return now - seen.since < window;
 }
 

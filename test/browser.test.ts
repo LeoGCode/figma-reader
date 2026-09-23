@@ -119,14 +119,20 @@ let b = 0;
  * it. That argument is not decoration - ownsProcess reads it off Linux, where ps's lstart resolves to one second
  * and cannot tell a pid reissued inside that second from the browser that held it. `body` must not be a lone
  * command: sh execs one of those, and the arguments ps then reports are the exec'd program's, not ours.
+ *
+ * It waits in one-second steps rather than one long sleep so that killing the shell leaves a grandchild behind for
+ * at most a second; after() can only reach the pids spawned here.
  */
-function ourBrowser(userDataDir: string, body = "sleep 60 &\nwait"): number {
+function ourBrowser(userDataDir: string, body = "while :; do sleep 1; done"): number {
   const exe = join(root, `browser${b++}`);
   writeFileSync(exe, `#!/bin/sh\n${body}\n`);
   chmodSync(exe, 0o755);
   const child = spawn(exe, [`--user-data-dir=${userDataDir}`], { stdio: "ignore" });
-  children.push(child.pid!);
-  return child.pid!;
+  // A spawn that never started leaves pid undefined, and a record naming no pid is read as no record at all: the
+  // tests below would then assert undefined against undefined and pass having stood nothing in for anything.
+  assert.ok(child.pid, `${exe} did not start`);
+  children.push(child.pid);
+  return child.pid;
 }
 
 /** Half a second to die, SIGTERM included, so the wait in close() is real. */

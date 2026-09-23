@@ -474,7 +474,12 @@ export class BrowserManager {
     return profileHasLoginCookie(this.opts.userDataDir, rec?.purpose === "login" ? rec.launchedAt : undefined);
   }
 
-  /** Close the login window gracefully (SIGTERM lets Chromium flush cookies to disk). */
+  /**
+   * Close the login window. SIGTERM asks Chromium to shut down rather than dropping it, but nothing here rests on
+   * that: both callers signal only once loginCookiePresent() has seen the auth cookie in the profile's cookie DB,
+   * so the login is already on disk. Windows has no graceful signal to send -- process.kill(pid, "SIGTERM") is
+   * TerminateProcess there, and the window is gone the moment it arrives.
+   */
   async closeLoginWindow(): Promise<void> {
     const found = this.readRecord();
     if (found?.rec.purpose !== "login") return;

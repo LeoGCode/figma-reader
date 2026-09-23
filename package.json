@@ -1,0 +1,64 @@
+{
+  "name": "@leogcode/figma-reader",
+  "version": "0.1.0",
+  "description": "Read-only Figma access for AI agents without plugin or API token, as an MCP server or a CLI: local .fig decoding, or logged-in figma.com over CDP",
+  "keywords": [
+    "figma",
+    "mcp",
+    "model-context-protocol",
+    "cli",
+    "design-tokens",
+    "ai-agents"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/tools.js",
+  "bin": {
+    "figma-reader-mcp": "dist/mcp.js",
+    "figma-reader": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/mcp.js",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "test": "npm run typecheck && node --test --test-timeout=30000 test/*.test.ts",
+    "corpus": "node scripts/corpus.ts",
+    "test:private": "if ls test/private/*.test.ts >/dev/null 2>&1; then node --test --test-timeout=30000 test/private/*.test.ts; else case \"$FIGMA_PRIVATE_OPTIONAL\" in [1yY]*|[tT][rR][uU][eE]) echo 'test:private: no test files in test/private/, skipped (FIGMA_PRIVATE_OPTIONAL)';; *) echo 'test:private: no test files in test/private/, so this step proves nothing. Set FIGMA_PRIVATE_OPTIONAL=1 if that is on purpose.' >&2; exit 1;; esac; fi",
+    "test:private:update": "node --test --test-timeout=30000 --test-update-snapshots test/private/*.test.ts",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "fflate": "^0.8.3",
+    "fzstd": "^0.1.1",
+    "kiwi-schema": "^0.5.0",
+    "playwright-core": "^1.63.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.3",
+    "typescript": "^7.0.2"
+  },
+  "author": "Leonel Guerrero",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LeoGCode/figma-reader.git"
+  },
+  "homepage": "https://github.com/LeoGCode/figma-reader#readme",
+  "bugs": {
+    "url": "https://github.com/LeoGCode/figma-reader/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

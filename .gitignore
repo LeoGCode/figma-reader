@@ -1,0 +1,9 @@
+node_modules
+dist
+# Real design files to test against: they are not ours to publish.
+test/private
+# Browser-automation artifacts: page snapshots of a logged-in Figma session.
+.playwright-cli
+# Installed skills and the worktrees agents run in; skills-lock.json records what to reinstall.
+.agents
+.claude

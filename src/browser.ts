@@ -1,0 +1,558 @@
+// Browser lifecycle: attach to FIGMA_CDP_URL, or launch a Chromium-family executable on a persistent profile
+// (headless for work, headed for login). Launched browsers are shared by every server using the same profile,
+// discovered through Chromium's DevToolsActivePort file, and closed when the last server exits.
+import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, hostname } from "node:os";
+import { basename, join } from "node:path";
+import { CdpSession, sleep, type TargetInfo } from "./cdp.ts";
+
+export interface BrowserOptions {
+  /** Attach to an already running browser instead of launching one. */
+  cdpUrl?: string;
+  /** Browser executable; defaults to Playwright's Chromium. */
+  executablePath?: string;
+  /** Persistent profile directory (cookies = Figma login). */
+  userDataDir: string;
+  headless: boolean;
+  stateDir: string;
+}
+
+interface LaunchRecord {
+  pid: number;
+  headless: boolean;
+  purpose: "work" | "login";
+  exe?: string;
+  /** processStart() of pid when the record was written: a pid reused by another process has a different one. */
+  start?: string;
+  /** bootId() when the record was written: `start` counts from boot, so it means nothing after another one. */
+  boot?: string;
+  /** Unix ms just before the launch; a login window only counts auth cookies written after it. */
+  launchedAt?: number;
+}
+
+/** How long the target list may take. A browser answers it in milliseconds; the ceiling is for one that cannot. */
+const LIST_TIMEOUT_MS = 5_000;
+
+export function pidAlive(pid: number) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e: any) {
+    return e.code === "EPERM";
+  }
+}
+
+/**
+ * Opaque start time of a process, stable for its whole life, so a pid can be told apart from a later process that
+ * reuses it. Linux: /proc/<pid>/stat field 22 (starttime, clock ticks since boot); elsewhere ps's lstart.
+ */
+export function processStart(pid: number): string | undefined {
+  if (!pid) return undefined;
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      // The command name (field 2) is parenthesized and may contain spaces or ')'; fields restart after the last ')'.
+      return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return out.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+let cachedBoot: string | null | undefined;
+
+/**
+ * Identity of the running boot, so that identities recorded before a reboot can be told apart from live ones:
+ * /proc/sys/kernel/random/boot_id, or the boot timestamp from /proc/stat. Undefined off Linux, where records and
+ * marks simply carry none. Neither form contains ':' or '|', which both mark formats rely on.
+ */
+export function bootId(): string | undefined {
+  if (cachedBoot === undefined) cachedBoot = readBootId() ?? null;
+  return cachedBoot ?? undefined;
+}
+
+function readBootId(): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  try {
+    const id = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    if (id) return id;
+  } catch {}
+  try {
+    return readFileSync("/proc/stat", "utf8").match(/^btime (\d+)$/m)?.[1];
+  } catch {
+    return undefined;
+  }
+}
+
+/** False only when `boot` names a boot other than the running one; an unknown boot on either side cannot say. */
+export function sameBoot(boot: string | undefined): boolean {
+  const now = bootId();
+  return boot === undefined || now === undefined || boot === now;
+}
+
+function processCmdline(pid: number): string | undefined {
+  try {
+    if (process.platform === "linux") return readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ");
+    return execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch {
+    return undefined;
+  }
+}
+
+/** pid is alive and still the process that had start time `start` (any live process when start is unknown). */
+export function sameProcess(pid: number, start: string | undefined): boolean {
+  return pidAlive(pid) && (start === undefined || processStart(pid) === start);
+}
+
+/**
+ * Identity of a process for a file that outlives it: "<boot>|<start>", or the start time alone where no boot id is
+ * readable. The boot belongs in it because processStart counts ticks since boot: on Linux the whole pair is
+ * reproduced by unrelated processes after a reboot, and the stamp is what keeps a lease or a record honest.
+ */
+export function processStamp(pid: number): string {
+  const boot = bootId();
+  const start = processStart(pid) ?? "";
+  return boot ? `${boot}|${start}` : start;
+}
+
+/** The process that wrote `stamp` (see processStamp) is still the one holding pid. */
+export function sameStampedProcess(pid: number, stamp: string): boolean {
+  const bar = stamp.indexOf("|");
+  // Stamps without a boot predate it, or come from a platform with none; they are read as bare start times.
+  if (bar < 0) return sameProcess(pid, stamp || undefined);
+  return sameBoot(stamp.slice(0, bar)) && sameProcess(pid, stamp.slice(bar + 1) || undefined);
+}
+
+/** Write via rename so a concurrent reader never sees a half-written file (and mistakes it for a stale one). */
+function writeAtomic(path: string, data: string) {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, data);
+  renameSync(tmp, path);
+}
+
+/** Remove path only if it still holds `seen`: another process may have just replaced it with a fresh record. */
+function removeIfUnchanged(path: string, seen: string) {
+  try {
+    if (readFileSync(path, "utf8") === seen) rmSync(path, { force: true });
+  } catch {}
+}
+
+/**
+ * Presence files named "<pid>[-...]" holding their owner's processStamp(), under dir. Returns the live ones and
+ * removes those whose process exited or whose pid now belongs to another process. Empty files predate the stamp.
+ */
+export function liveLeases(dir: string): string[] {
+  const live: string[] = [];
+  let names: string[] = [];
+  try {
+    names = readdirSync(dir);
+  } catch {}
+  for (const f of names) {
+    let stamp: string;
+    try {
+      stamp = readFileSync(join(dir, f), "utf8");
+    } catch {
+      continue;
+    }
+    if (sameStampedProcess(Number(f.split("-")[0]), stamp)) live.push(f);
+    else removeIfUnchanged(join(dir, f), stamp);
+  }
+  return live;
+}
+
+/** Create a presence file for this process under dir (see liveLeases); returns its path. */
+export function takeLease(dir: string, name = String(process.pid)): string {
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, name);
+  writeFileSync(path, processStamp(process.pid));
+  return path;
+}
+
+/**
+ * First installed real browser. Playwright's build ("Chrome for Testing") is only a last resort:
+ * Google sign-in refuses it as insecure, which breaks "Continue with Google" on figma.com.
+ */
+export function defaultExecutable(): string {
+  const candidates = [
+    "brave", "brave-browser", "chromium", "chromium-browser", "google-chrome-stable", "google-chrome",
+  ];
+  for (const name of candidates) {
+    for (const dir of (process.env.PATH ?? "").split(":")) {
+      const path = join(dir, name);
+      if (dir && existsSync(path)) return path;
+    }
+  }
+  const { chromium } = createRequire(import.meta.url)("playwright-core");
+  const path = chromium.executablePath();
+  if (!existsSync(path)) {
+    throw new Error("No Chromium-family browser found. Install Brave/Chromium/Chrome or set FIGMA_BROWSER_PATH.");
+  }
+  return path;
+}
+
+/**
+ * Spawn a detached browser. A spawn failure (missing or non-executable FIGMA_BROWSER_PATH) arrives as an 'error'
+ * event, which would crash the whole server if unhandled; check() rethrows it as a clear launch error instead.
+ */
+function spawnBrowser(exe: string, args: string[]) {
+  const child = spawn(exe, args, { detached: true, stdio: "ignore" });
+  let failed: Error | undefined;
+  child.on("error", (e) => (failed = e));
+  child.unref();
+  return {
+    process: child,
+    check() {
+      if (failed) throw new Error(`Cannot start browser ${exe}: ${failed.message}. Set FIGMA_BROWSER_PATH to a Chromium-family browser.`);
+    },
+  };
+}
+
+export class BrowserManager {
+  private browserSession?: CdpSession;
+  private endpoint?: string;
+  readonly stateDir: string;
+  readonly opts: BrowserOptions;
+
+  constructor(opts: BrowserOptions) {
+    this.opts = opts;
+    const id = createHash("sha1").update(opts.cdpUrl ?? opts.userDataDir).digest("hex").slice(0, 12);
+    this.stateDir = join(opts.stateDir, id);
+    takeLease(join(this.stateDir, "clients"));
+  }
+
+  get managed() {
+    return !this.opts.cdpUrl;
+  }
+
+  get httpUrl() {
+    return this.endpoint ?? this.opts.cdpUrl ?? "(not running)";
+  }
+
+  private get recordPath() {
+    return join(this.stateDir, "browser.json");
+  }
+
+  /**
+   * The launched browser, verified to still be the recorded process; a stale record is removed. The raw text comes
+   * with it: every delete of the record must be conditional on it, so a record another process wrote meanwhile
+   * survives (its browser would otherwise be unmanaged forever, holding the profile and the session).
+   */
+  private readRecord(): { raw: string; rec: LaunchRecord } | undefined {
+    let raw: string;
+    try {
+      raw = readFileSync(this.recordPath, "utf8");
+    } catch {
+      return undefined;
+    }
+    try {
+      const rec = JSON.parse(raw) as LaunchRecord;
+      // The record outlives reboots (it sits in the state dir) while `start` counts ticks since boot: after a
+      // reboot the recorded pair can name an unrelated process, and that pair alone authorises process.kill.
+      if (sameBoot(rec.boot) && this.ownsProcess(rec.pid, rec.start)) return { raw, rec };
+    } catch {}
+    // The browser exited, or its pid now belongs to an unrelated process that must never be signalled.
+    removeIfUnchanged(this.recordPath, raw);
+    return undefined;
+  }
+
+  private record(): LaunchRecord | undefined {
+    return this.readRecord()?.rec;
+  }
+
+  private writeRecord(r: Omit<LaunchRecord, "start" | "boot">) {
+    writeAtomic(this.recordPath, JSON.stringify({ ...r, start: processStart(r.pid), boot: bootId() } satisfies LaunchRecord));
+  }
+
+  /**
+   * pid is a browser on our profile: its start time is the recorded one or, lacking one (older records, the
+   * profile lock), its command line names our profile. Anything else is a reused pid.
+   */
+  private ownsProcess(pid: number, start?: string): boolean {
+    if (!pidAlive(pid)) return false;
+    if (start !== undefined) return processStart(pid) === start;
+    return !!processCmdline(pid)?.includes(`--user-data-dir=${this.opts.userDataDir}`);
+  }
+
+  private async reachable(url: string): Promise<{ webSocketDebuggerUrl: string; "User-Agent": string } | undefined> {
+    try {
+      const r = await fetch(`${url}/json/version`, { signal: AbortSignal.timeout(1500) });
+      return (await r.json()) as any;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Endpoint of a browser already running on our profile, if any. */
+  private async discover(): Promise<string | undefined> {
+    const file = join(this.opts.userDataDir, "DevToolsActivePort");
+    if (!existsSync(file)) return undefined;
+    const port = readFileSync(file, "utf8").split("\n")[0]?.trim();
+    const url = `http://127.0.0.1:${port}`;
+    return port && (await this.reachable(url)) ? url : undefined;
+  }
+
+  /** Pid of a browser holding the profile lock (running with or without a DevTools port). */
+  private profileLockPid(): number | undefined {
+    try {
+      // "<hostname>-<pid>"; a lock left by a crash may name a pid since reused by something else.
+      const target = readlinkSync(join(this.opts.userDataDir, "SingletonLock"));
+      const dash = target.lastIndexOf("-");
+      const pid = Number(target.slice(dash + 1));
+      return target.slice(0, dash) === hostname() && this.ownsProcess(pid) ? pid : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Visible login window with no DevTools port: sites like Google sign-in refuse remotely controlled browsers.
+   * Login is detected later, after the user closes the window, by a headless launch on the same profile.
+   */
+  async launchLoginWindow(url: string): Promise<number> {
+    const exe = this.opts.executablePath ?? defaultExecutable();
+    mkdirSync(this.opts.userDataDir, { recursive: true });
+    rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
+    const launchedAt = Date.now();
+    const child = spawnBrowser(exe, [`--user-data-dir=${this.opts.userDataDir}`, "--no-first-run", "--no-default-browser-check", "--new-window", url]);
+    await sleep(1500);
+    child.check();
+    // Launcher scripts may exit after handing off; the profile lock names the real browser pid.
+    const pid = this.profileLockPid() ?? child.process.pid!;
+    this.writeRecord({ pid, headless: false, purpose: "login", exe, launchedAt });
+    this.browserSession = undefined;
+    this.endpoint = undefined;
+    return pid;
+  }
+
+  /**
+   * While a login window is open, only a cookie written after it opened counts: the profile may still hold an auth
+   * cookie Figma has revoked (logged out everywhere, password changed) that has not expired yet.
+   */
+  loginCookiePresent(): boolean {
+    const rec = this.record();
+    return profileHasLoginCookie(this.opts.userDataDir, rec?.purpose === "login" ? rec.launchedAt : undefined);
+  }
+
+  /** Close the login window gracefully (SIGTERM lets Chromium flush cookies to disk). */
+  async closeLoginWindow(): Promise<void> {
+    const found = this.readRecord();
+    if (found?.rec.purpose !== "login") return;
+    const { raw, rec } = found;
+    try {
+      process.kill(rec.pid, "SIGTERM");
+    } catch {}
+    for (let i = 0; i < 100 && (this.ownsProcess(rec.pid, rec.start) || this.profileLockPid()); i++) await sleep(100);
+    removeIfUnchanged(this.recordPath, raw);
+  }
+
+  async executable() {
+    return this.opts.executablePath ?? defaultExecutable();
+  }
+
+  async launch(headless: boolean, purpose: LaunchRecord["purpose"], url = "about:blank"): Promise<string> {
+    const exe = this.opts.executablePath ?? defaultExecutable();
+    mkdirSync(this.opts.userDataDir, { recursive: true });
+    rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
+    const args = [
+      "--remote-debugging-port=0",
+      `--user-data-dir=${this.opts.userDataDir}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--window-size=1600,1000",
+      ...(headless ? ["--headless=new", "--mute-audio"] : ["--new-window"]),
+      url,
+    ];
+    const child = spawnBrowser(exe, args);
+    for (let i = 0; i < 100; i++) {
+      await sleep(200);
+      child.check();
+      const ep = await this.discover();
+      if (ep) {
+        this.writeRecord({ pid: this.profileLockPid() ?? child.process.pid!, headless, purpose, exe });
+        this.endpoint = ep;
+        this.browserSession = undefined;
+        return ep;
+      }
+      if (child.process.exitCode !== null && !this.profileLockPid()) break;
+    }
+    const holder = this.profileLockPid();
+    throw new Error(
+      holder
+        ? `Profile ${this.opts.userDataDir} is in use by another browser (pid ${holder}) without a DevTools port. ` +
+            `Close it, or start it with --remote-debugging-port and set FIGMA_CDP_URL.`
+        : `Browser ${exe} did not expose a DevTools endpoint.`,
+    );
+  }
+
+  /** Connect to the browser, launching a headless one on the profile when nothing is running. */
+  async session(): Promise<CdpSession> {
+    if (this.browserSession?.open) return this.browserSession;
+    let ep = this.opts.cdpUrl ?? (await this.discover());
+    if (!ep && this.opts.cdpUrl) {
+      throw new Error(`No browser DevTools endpoint at ${this.opts.cdpUrl}.`);
+    }
+    if (!ep && this.record()?.purpose === "login") {
+      if (!this.loginCookiePresent()) throw new Error("A Figma login window is open. Log in there, then retry.");
+      await this.closeLoginWindow();
+    }
+    if (!ep) ep = await this.launch(this.opts.headless, "work");
+    const v = await this.reachable(ep);
+    if (!v) throw new Error(`Browser DevTools endpoint ${ep} is not reachable.`);
+    this.endpoint = ep;
+    this.browserSession = await CdpSession.connect(v.webSocketDebuggerUrl);
+    return this.browserSession;
+  }
+
+  async isHeadless(): Promise<boolean> {
+    await this.session();
+    const v = await this.reachable(this.endpoint!);
+    return !!v?.["User-Agent"].includes("HeadlessChrome");
+  }
+
+  /** User agent to present to figma.com: CloudFront rejects "HeadlessChrome". */
+  async userAgent(): Promise<string> {
+    await this.session();
+    const v = await this.reachable(this.endpoint!);
+    return (v?.["User-Agent"] ?? "").replace("HeadlessChrome", "Chrome");
+  }
+
+  async targets(): Promise<TargetInfo[]> {
+    await this.session();
+    // A browser that still accepts the websocket but never answers /json/list (swapping, frozen) left this pending
+    // for undici's 300 s headers timeout, on the hot path of editorTab and of newTab's 20-iteration loop.
+    const r = await fetch(`${this.endpoint}/json/list`, { signal: AbortSignal.timeout(LIST_TIMEOUT_MS) });
+    return ((await r.json()) as TargetInfo[]).filter((t) => t.type === "page");
+  }
+
+  async attach(target: TargetInfo): Promise<CdpSession> {
+    if (!target.webSocketDebuggerUrl) throw new Error(`target ${target.id} has no debugger URL`);
+    const s = await CdpSession.connect(target.webSocketDebuggerUrl);
+    const ua = await this.userAgent();
+    await s.send("Emulation.setUserAgentOverride", { userAgent: ua }).catch(() => {});
+    // Headless pages have no OS focus; Figma ignores shortcuts without it.
+    await s.send("Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+    return s;
+  }
+
+  async newTab(url: string, foreground = false): Promise<TargetInfo> {
+    const b = await this.session();
+    const { targetId } = await b.send("Target.createTarget", { url, newWindow: true, background: !foreground });
+    for (let i = 0; i < 20; i++) {
+      const t = (await this.targets()).find((x) => x.id === targetId);
+      if (t?.webSocketDebuggerUrl) return t;
+      await sleep(250);
+    }
+    throw new Error("new tab did not appear");
+  }
+
+  /** Connect to a browser already running on our profile; never launches one. */
+  private async connectExisting(): Promise<CdpSession | undefined> {
+    const ep = await this.discover();
+    const v = ep ? await this.reachable(ep) : undefined;
+    return v ? CdpSession.connect(v.webSocketDebuggerUrl).catch(() => undefined) : undefined;
+  }
+
+  /**
+   * Close the browser if this manager's profile launched it (never an attached FIGMA_CDP_URL browser). The recorded
+   * pid is signalled only while it is verifiably that browser, and no browser is ever started just to close it.
+   */
+  async close(): Promise<void> {
+    const found = this.readRecord();
+    if (!this.managed || !found) return;
+    const { raw, rec } = found;
+    if (rec.purpose === "work") {
+      const s = this.browserSession?.open ? this.browserSession : await this.connectExisting();
+      await s?.send("Browser.close", {}, 5000).catch(() => {});
+    }
+    for (let i = 0; i < 50 && this.ownsProcess(rec.pid, rec.start); i++) await sleep(100);
+    if (this.ownsProcess(rec.pid, rec.start)) {
+      try {
+        process.kill(rec.pid);
+      } catch {}
+    }
+    // Waiting for the old browser to die takes up to 5 s, in which another process can launch one and record it.
+    removeIfUnchanged(this.recordPath, raw);
+    this.browserSession = undefined;
+    this.endpoint = undefined;
+  }
+
+  launchRecord() {
+    return this.record();
+  }
+
+  private get busyDir() {
+    return join(this.stateDir, "busy");
+  }
+
+  /** Run fn while advertising that this process is working in the browser, so no other process closes it meanwhile. */
+  async busy<T>(fn: () => Promise<T>): Promise<T> {
+    const lease = takeLease(this.busyDir, `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    try {
+      return await fn();
+    } finally {
+      rmSync(lease, { force: true });
+    }
+  }
+
+  /** Pids of other live processes currently working in this browser. */
+  busyElsewhere(): number[] {
+    const pids = liveLeases(this.busyDir).map((f) => Number(f.split("-")[0]));
+    return [...new Set(pids)].filter((pid) => pid !== process.pid);
+  }
+
+  /** Unregister this server; close a launched browser when no other live server uses it. */
+  async release(): Promise<void> {
+    const dir = join(this.stateDir, "clients");
+    rmSync(join(dir, String(process.pid)), { force: true });
+    const others = liveLeases(dir);
+    const rec = this.record();
+    // Keep a login window open for the user; only tear down work browsers.
+    if (!others.length && rec?.purpose === "work") await this.close();
+  }
+}
+
+/** Chromium cookie times are microseconds since 1601-01-01 UTC. */
+const chromeTimeToUnixMs = (t: unknown) => Number(t ?? 0) / 1000 - 11_644_473_600_000;
+
+/**
+ * Cheap login hint readable while the login window runs (no DevTools there) or with no browser at all: an unexpired
+ * Figma auth cookie in the profile's cookie DB, written at or after `since` (unix ms) when given. Values are
+ * encrypted, so this is only a hint; callers verify with the real session.
+ */
+export function profileHasLoginCookie(userDataDir: string, since?: number): boolean {
+  for (const rel of ["Default/Cookies", "Default/Network/Cookies"]) {
+    const file = join(userDataDir, rel);
+    if (!existsSync(file)) continue;
+    try {
+      const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+      // Read-only, but not immutable=1: that tells SQLite to ignore -wal and any hot journal, so a committed but
+      // uncheckpointed login cookie is invisible (reproduced) and a crashed browser's journal is never rolled back.
+      const db = new DatabaseSync(`file:${file}?mode=ro`, { readOnly: true });
+      // select *: last_update_utc only exists in newer Chromium versions.
+      const stmt = db.prepare("select * from cookies where host_key like '%figma.com' and name = '__Host-figma.authn'");
+      stmt.setReadBigInts(true); // these timestamps exceed Number.MAX_SAFE_INTEGER
+      const rows = stmt.all() as Record<string, unknown>[];
+      db.close();
+      const now = Date.now();
+      const valid = rows.some((r) => {
+        if (Number(r.has_expires ?? 1) && Number(r.expires_utc ?? 0) && chromeTimeToUnixMs(r.expires_utc) < now) return false;
+        const written = Math.max(chromeTimeToUnixMs(r.creation_utc), chromeTimeToUnixMs(r.last_update_utc));
+        return since === undefined || written >= since;
+      });
+      if (valid) return true;
+    } catch {}
+  }
+  return false;
+}
+
+export const defaultStateDir = () => join(homedir(), ".local", "state", "figma-reader");

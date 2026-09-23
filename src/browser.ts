@@ -4,7 +4,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { CdpSession, sleep, type TargetInfo } from "./cdp.ts";
@@ -179,6 +179,20 @@ export function takeLease(dir: string, name = String(process.pid)): string {
 }
 
 const BROWSER_NAMES = ["brave", "brave-browser", "chromium", "chromium-browser", "google-chrome-stable", "google-chrome"];
+// Windows spells them with an extension and separates PATH with ';', where a Linux split on ':' would cut every
+// entry at its drive letter. The names differ too: there is no google-chrome-stable, and Brave is brave.exe.
+const WINDOWS_NAMES = ["brave.exe", "chrome.exe", "chromium.exe", "msedge.exe"];
+const onWindows = () => process.platform === "win32";
+const pathEntries = () => (process.env.PATH ?? "").split(onWindows() ? ";" : ":").filter(Boolean);
+/**
+ * Where Windows keeps browsers when they are not on PATH, which is the normal case: an installer writes to Program
+ * Files and registers the app rather than extending PATH.
+ */
+function windowsDirs(): string[] {
+  const roots = [process.env.PROGRAMFILES, process.env["PROGRAMFILES(X86)"], process.env.LOCALAPPDATA].filter((d): d is string => !!d);
+  const apps = ["BraveSoftware\\Brave-Browser\\Application", "Google\\Chrome\\Application", "Chromium\\Application", "Microsoft\\Edge\\Application"];
+  return roots.flatMap((root) => apps.map((app) => join(root, app)));
+}
 
 /**
  * Whether a path is inside a confined package. Such a build cannot reach a profile directory outside its own
@@ -213,17 +227,26 @@ export const demoteConfined = (paths: string[]) => [...paths.filter((p) => !sand
  */
 export function browserCandidates(): string[] {
   const found: string[] = [];
-  for (const name of BROWSER_NAMES) {
-    for (const dir of (process.env.PATH ?? "").split(":")) {
-      if (!dir) continue;
+  // One browser is on PATH under several names once directories are merged: on Debian /bin links to /usr/bin, so
+  // /bin/chromium and /usr/bin/chromium are one file and trying both is one failed launch paid for twice. The first
+  // spelling is what gets reported, since that is the one a user would recognise.
+  const seen = new Set<string>();
+  const names = onWindows() ? WINDOWS_NAMES : BROWSER_NAMES;
+  const dirs = [...pathEntries(), ...(onWindows() ? windowsDirs() : [])];
+  for (const name of names) {
+    for (const dir of dirs) {
       const path = join(dir, name);
+      let id: string;
       try {
         if (!statSync(path).isFile()) continue;
         accessSync(path, constants.X_OK);
+        id = realpathSync(path);
       } catch {
         continue;
       }
-      if (!found.includes(path)) found.push(path);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      found.push(path);
     }
   }
   const ordered = demoteConfined(found);

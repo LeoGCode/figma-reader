@@ -1,5 +1,6 @@
 ---
 name: figma-reader
+allowed-tools: Bash(figma-reader:*) Bash(npx:*)
 description: Read Figma designs from the shell with the figma-reader CLI (layer tree, node specs, text, variables/tokens, styles, components, screenshots) without a Figma plugin or API token. Use when the user shares a figma.com/design URL, a Figma file key, or a .fig file, or asks to implement, inspect, or extract tokens from a Figma design.
 ---
 
@@ -7,7 +8,7 @@ description: Read Figma designs from the shell with the figma-reader CLI (layer 
 
 Read-only access to Figma files. `<file>` is a local `.fig` path, a Figma file key, or a `figma.com/design/...` URL. When a URL carries `?node-id=`, the commands that take `--node-id` use that node unless `--node-id` is given: `get-tree`, `get-node`, `search`, `token-usage`, `get-text`, `screenshot`, `export-image-fills`. A scoped `search` covers that node's subtree and echoes `searchedNode`; `--page` narrows by page instead. `load-file`, `get-variables`, `get-styles` and `get-components` answer about the whole file and ignore a node-id.
 
-Run `figma-reader help` for all commands and `figma-reader help <command>` for a command's options. If `figma-reader` is not on PATH, use `node <repo>/dist/cli.js`.
+Run `figma-reader help` for all commands and `figma-reader help <command>` for a command's options. If it is not on PATH, `npx -y @leogcode/figma-reader@latest <command>` works the same and needs no install; from a clone, `node <repo>/dist/cli.js`. Node 22+, and a Chromium-family browser for anything that reads figma.com.
 
 ## Workflow
 

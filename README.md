@@ -99,7 +99,13 @@ Each CLI call is its own process. Local `.fig` files and cached snapshots answer
 
 #### For agents
 
-[`skills/figma-reader/SKILL.md`](skills/figma-reader/SKILL.md) is a ready-made agent skill that teaches the CLI. Copy it into `.claude/skills/` (project) or `~/.claude/skills/` (user) for Claude Code, or paste its body into another agent's instructions (`AGENTS.md`, rules files). Agents without a skill can also run `figma-reader help`.
+[`skills/figma-reader/SKILL.md`](skills/figma-reader/SKILL.md) is a ready-made agent skill that teaches the CLI. Install it into a project with
+
+```sh
+npx skills add https://github.com/LeoGCode/figma-reader --skill figma-reader
+```
+
+which writes `.agents/skills/figma-reader/` and registers it for Claude Code and the other agents that read that directory. Or copy the file into `.claude/skills/` (project) or `~/.claude/skills/` (user) by hand, or paste its body into another agent's instructions (`AGENTS.md`, rules files). Agents without a skill can also run `figma-reader help`.
 
 ### MCP server, per project
 

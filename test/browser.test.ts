@@ -77,18 +77,24 @@ test("a process is recognized by its start time, and a different start time is a
   assert.ok(!sameProcess(pid, start));
 });
 
+// pid 1 is init, which every Unix has and no ordinary user may signal. Windows has no pid 1 at all and answers
+// ESRCH for it; what stands for init there is pid 4, the System process, which not even an administrator can open
+// (measured on the windows-latest runner, which runs elevated: pid 4, Secure System, smss, csrss, services and
+// Defender all answer EPERM, and every pid that is simply not running answers ESRCH).
+const UNSIGNALLABLE = process.platform === "win32" ? 4 : 1;
+
 test("a running process this user may not signal is alive", { skip: process.getuid?.() === 0 && "running as root: pid 1 is signallable" }, () => {
-  // pid 1 (init) is always running and, as any other user, unsignallable: the liveness probe comes back EPERM
-  // rather than ESRCH. Reading that as "gone" would drop the export and busy leases of every figma-reader running
-  // under another account on this machine, and would let close() signal a pid that process still holds.
+  // Such a process is running, and the liveness probe comes back EPERM rather than ESRCH on both platforms.
+  // Reading that as "gone" would drop the export and busy leases of every figma-reader running under another
+  // account on this machine, and would let close() signal a pid that process still holds.
   let code: string | undefined;
   try {
-    process.kill(1, 0);
+    process.kill(UNSIGNALLABLE, 0);
   } catch (e: any) {
     code = e.code;
   }
-  assert.equal(code, "EPERM", "pid 1 is running and this user may not signal it");
-  assert.ok(pidAlive(1));
+  assert.equal(code, "EPERM", `pid ${UNSIGNALLABLE} is running and this user may not signal it`);
+  assert.ok(pidAlive(UNSIGNALLABLE));
 });
 
 for (const [label, extra] of [["a mismatching start time", { start: "1" }], ["no start time (older record)", {}]] as const) {

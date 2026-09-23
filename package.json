@@ -1,6 +1,6 @@
 {
   "name": "@leogcode/figma-reader",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Read-only Figma access for AI agents without plugin or API token, as an MCP server or a CLI: local .fig decoding, or logged-in figma.com over CDP",
   "keywords": [
     "figma",

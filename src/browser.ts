@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { CdpSession, sleep, type TargetInfo } from "./cdp.ts";
 
 export interface BrowserOptions {
@@ -46,16 +46,47 @@ export function pidAlive(pid: number) {
   }
 }
 
+// Windows has neither /proc nor ps, and wmic is not on a current image at all (gone from windows-latest, build
+// 26100), so PowerShell is what can be asked about a process there. It is named by its own path because a server's
+// environment need not carry System32 on PATH, and Windows PowerShell is in every supported version of Windows.
+const POWERSHELL = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+
+/** One PowerShell expression about a process. Measured at 240-320 ms a call on a warm runner, so nothing asks twice. */
+function powershell(expr: string): string | undefined {
+  try {
+    const out = execFileSync(POWERSHELL, ["-NoProfile", "-NonInteractive", "-Command", expr], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return out.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+let ownStart: string | null | undefined;
+
 /**
  * Opaque start time of a process, stable for its whole life, so a pid can be told apart from a later process that
- * reuses it. Linux: /proc/<pid>/stat field 22 (starttime, clock ticks since boot); elsewhere ps's lstart.
+ * reuses it. Linux: /proc/<pid>/stat field 22 (starttime, clock ticks since boot). Windows: Get-Process StartTime,
+ * in 100 ns ticks from an absolute epoch. macOS: ps's lstart.
  *
- * The two do not resolve alike: a tick is 10 ms, lstart is one second. Off Linux two processes started inside one
- * second are one identity here - a parent and the child it spawns routinely are - so every check built on this is
- * that much weaker there. ownsProcess, the one that authorises process.kill, reads the command line as well.
+ * The three do not resolve alike. A Linux tick is 10 ms; Windows counts from the process's own creation, and five
+ * children spawned back to back on a runner came out 4.6 to 13 ms apart with no two alike. On both, a pid reissued
+ * later is a different identity. lstart is one second, so on macOS two processes started inside one second are one
+ * identity - a parent and the child it spawns routinely are - and every check built on this is that much weaker
+ * there. ownsProcess, the one that authorises process.kill, reads the command line as well.
+ *
+ * Undefined where none of that can be read (no PowerShell, a process whose times this user may not see). Callers
+ * then fall back to what they can still prove, which for ownsProcess is the command line and nothing weaker.
  */
 export function processStart(pid: number): string | undefined {
   if (!pid) return undefined;
+  if (pid !== process.pid) return readStart(pid);
+  // Our own start time cannot change while we run, and it is what every lease and tab mark we write carries.
+  // Reading it spawns a process off Linux - 300 ms of PowerShell on Windows - and takeLease asks for it each time.
+  if (ownStart === undefined) ownStart = readStart(pid) ?? null;
+  return ownStart ?? undefined;
+}
+
+function readStart(pid: number): string | undefined {
   if (process.platform === "linux") {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -65,6 +96,8 @@ export function processStart(pid: number): string | undefined {
       return undefined;
     }
   }
+  // Digits alone, which the stamp formats below need: they separate their own parts with '|' and ':'.
+  if (process.platform === "win32") return powershell(`(Get-Process -Id ${pid}).StartTime.Ticks`);
   try {
     const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     return out.trim() || undefined;
@@ -107,6 +140,10 @@ export function sameBoot(boot: string | undefined): boolean {
 function processCmdline(pid: number): string | undefined {
   try {
     if (process.platform === "linux") return readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ");
+    // The Get-Process of the PowerShell every Windows ships (5.1) carries no command line; the CIM class does. An
+    // argument holding a space comes back quoted around the whole of it, so "--user-data-dir=<path>" is still in
+    // the string to be found.
+    if (process.platform === "win32") return powershell(`(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`);
     // -ww, because BSD ps cuts the command at the terminal width and --user-data-dir sits behind the executable's
     // path, which for a browser is a path inside an .app bundle: two -w mean no limit, so the profile is there to
     // be read. A truncated line would read as a browser on some other profile, which is the answer that relaunches.
@@ -124,7 +161,8 @@ export function sameProcess(pid: number, start: string | undefined): boolean {
 /**
  * Identity of a process for a file that outlives it: "<boot>|<start>", or the start time alone where no boot id is
  * readable. The boot belongs in it because processStart counts ticks since boot: on Linux the whole pair is
- * reproduced by unrelated processes after a reboot, and the stamp is what keeps a lease or a record honest.
+ * reproduced by unrelated processes after a reboot, and the stamp is what keeps a lease or a record honest. A
+ * Windows start time counts from an absolute epoch instead, so there a bare one already means only one boot.
  */
 export function processStamp(pid: number): string {
   const boot = bootId();
@@ -134,8 +172,9 @@ export function processStamp(pid: number): string {
 
 /**
  * The process that wrote `stamp` (see processStamp) is still the one holding pid, as sharply as processStart can
- * tell: off Linux a pid reissued within the same second passes. What that costs is a lease read as live or a tab
- * left unadopted, never a signal - killing goes through ownsProcess, which does not rest on the start time alone.
+ * tell: on macOS a pid reissued within the same second passes, and anywhere the start time cannot be read at all a
+ * live pid alone passes. What that costs is a lease read as live or a tab left unadopted, never a signal - killing
+ * goes through ownsProcess, which does not rest on the start time alone.
  */
 export function sameStampedProcess(pid: number, stamp: string): boolean {
   const bar = stamp.indexOf("|");
@@ -190,11 +229,11 @@ export function takeLease(dir: string, name = String(process.pid)): string {
 }
 
 const BROWSER_NAMES = ["brave", "brave-browser", "chromium", "chromium-browser", "google-chrome-stable", "google-chrome"];
-// Windows spells them with an extension and separates PATH with ';', where a Linux split on ':' would cut every
-// entry at its drive letter. The names differ too: there is no google-chrome-stable, and Brave is brave.exe.
+// Windows spells them with an extension: there is no google-chrome-stable, and Brave is brave.exe.
 const WINDOWS_NAMES = ["brave.exe", "chrome.exe", "chromium.exe", "msedge.exe"];
 const onWindows = () => process.platform === "win32";
-const pathEntries = () => (process.env.PATH ?? "").split(onWindows() ? ";" : ":").filter(Boolean);
+// path.delimiter, because Windows separates PATH with ';' and a split on ':' cuts every entry at its drive letter.
+const pathEntries = () => (process.env.PATH ?? "").split(delimiter).filter(Boolean);
 /**
  * Where Windows keeps browsers when they are not on PATH, which is the normal case: an installer writes to Program
  * Files and registers the app rather than extending PATH.
@@ -233,19 +272,25 @@ const sandboxed = (path: string) => confinedPath(linkTarget(path));
 export const demoteConfined = (paths: string[]) => [...paths.filter((p) => !sandboxed(p)), ...paths.filter(sandboxed)];
 
 /**
+ * Every directory a browser is looked for in. One function rather than two reads inside the search, so that a test
+ * can hand in a directory of its own: emptying PATH is no longer enough on Windows, where the install directories
+ * above put the machine's real Chrome and Edge in front of anything a test lays out.
+ */
+export const browserSearchDirs = () => [...pathEntries(), ...(onWindows() ? windowsDirs() : [])];
+
+/**
  * Installed browsers, best first. Existence is not usability -- a file can be there, be a directory, lack the execute
  * bit, or be a confined package that cannot use our profile -- and only launching settles it, so this returns every
  * candidate and launch() works down the list. Playwright's build ("Chrome for Testing") is last whatever else is
  * found: Google sign-in refuses it as insecure, which breaks "Continue with Google" on figma.com.
  */
-export function browserCandidates(): string[] {
+export function browserCandidates(dirs = browserSearchDirs()): string[] {
   const found: string[] = [];
   // One browser is on PATH under several names once directories are merged: on Debian /bin links to /usr/bin, so
   // /bin/chromium and /usr/bin/chromium are one file and trying both is one failed launch paid for twice. The first
   // spelling is what gets reported, since that is the one a user would recognise.
   const seen = new Set<string>();
   const names = onWindows() ? WINDOWS_NAMES : BROWSER_NAMES;
-  const dirs = [...pathEntries(), ...(onWindows() ? windowsDirs() : [])];
   for (const name of names) {
     for (const dir of dirs) {
       const path = join(dir, name);
@@ -360,12 +405,13 @@ export class BrowserManager {
     const onProfile = () => processCmdline(pid)?.includes(`--user-data-dir=${this.opts.userDataDir}`);
     if (start === undefined) return !!onProfile();
     if (processStart(pid) !== start) return false;
-    // On Linux the start time is measured in clock ticks and settles it. Off Linux it is ps's lstart, at one-second
-    // resolution: a pid reissued within that second carries the recorded string, and this is the only check standing
-    // between a recycled pid and process.kill. The command line is the second half of it there, and refutes only when
-    // it could be read - a browser whose arguments this user cannot see must not be left running, unmanaged and
-    // holding the profile, while a second one is launched onto it.
-    return process.platform === "linux" || onProfile() !== false;
+    // On Linux the start time is measured in clock ticks and on Windows from the process's own creation, and on
+    // both that settles it. On macOS it is ps's lstart, at one-second resolution: a pid reissued within that second
+    // carries the recorded string, and this is the only check standing between a recycled pid and process.kill. The
+    // command line is the second half of it there, and refutes only when it could be read - a browser whose
+    // arguments this user cannot see must not be left running, unmanaged and holding the profile, while a second
+    // one is launched onto it.
+    return process.platform === "linux" || process.platform === "win32" || onProfile() !== false;
   }
 
   private async reachable(url: string): Promise<{ webSocketDebuggerUrl: string; "User-Agent": string } | undefined> {
@@ -436,7 +482,8 @@ export class BrowserManager {
     try {
       process.kill(rec.pid, "SIGTERM");
     } catch {}
-    for (let i = 0; i < 100 && (this.ownsProcess(rec.pid, rec.start) || this.profileLockPid()); i++) await sleep(100);
+    // Liveness, not identity, for the same reason as in close(): the wait is over when the process is gone.
+    for (let i = 0; i < 100 && (pidAlive(rec.pid) || this.profileLockPid()); i++) await sleep(100);
     removeIfUnchanged(this.recordPath, raw);
   }
 
@@ -590,7 +637,10 @@ export class BrowserManager {
       const s = this.browserSession?.open ? this.browserSession : await this.connectExisting();
       await s?.send("Browser.close", {}, 5000).catch(() => {});
     }
-    for (let i = 0; i < 50 && this.ownsProcess(rec.pid, rec.start); i++) await sleep(100);
+    // Waiting only has to notice the process is gone, and an identity check spawns one off Linux (ps, or 300 ms of
+    // PowerShell on Windows) - fifty of them while a browser takes its time to exit. What authorises the signal is
+    // still the full check, once, below; a pid reused mid-wait is held onto a little longer and then not signalled.
+    for (let i = 0; i < 50 && pidAlive(rec.pid); i++) await sleep(100);
     if (this.ownsProcess(rec.pid, rec.start)) {
       try {
         process.kill(rec.pid);

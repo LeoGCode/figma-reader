@@ -4,7 +4,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { accountCacheDir, accountProfileDir, expandHome, resolveAccount, writeAccountInfo } from "./account.ts";
 import { BrowserManager, defaultExecutable, defaultStateDir } from "./browser.ts";
@@ -63,8 +63,10 @@ function browserKey(cdpUrl: string | undefined, userDataDir: string): string {
 }
 
 export const account = resolveAccount();
+// path.delimiter, because a split on ':' cuts "C:\designs" into "C" and "\designs" on Windows: neither is a
+// directory, so a configured one was never searched and list-files answered that there are no local files at all.
 const localDirs = process.env.FIGMA_FILES_DIRS
-  ? process.env.FIGMA_FILES_DIRS.split(":").filter(Boolean).map(expandHome)
+  ? process.env.FIGMA_FILES_DIRS.split(delimiter).filter(Boolean).map(expandHome)
   : (account.config?.filesDirs ?? [join(homedir(), "Downloads")]);
 // Snapshots are per account: a file exported with one login must not be served to a project using another. A profile
 // or browser given directly, with no account named, gets a cache of its own keyed by that profile or endpoint.

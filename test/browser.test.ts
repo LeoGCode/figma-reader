@@ -25,9 +25,13 @@ after(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-/** A long-running process that is certainly not a browser on our profile: stands in for a reused pid. */
+/**
+ * A long-running process that is certainly not a browser on our profile: stands in for a reused pid. node runs it,
+ * not sleep: Windows has no sleep of its own, and the one the runner happens to have comes from Git's bin directory
+ * being on PATH, which is an accident for these tests to rest on.
+ */
 function bystander(): number {
-  const child = spawn("sleep", ["60"], { stdio: "ignore" });
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { stdio: "ignore" });
   children.push(child.pid!);
   return child.pid!;
 }
@@ -46,15 +50,22 @@ function manager() {
 }
 
 test("a process is recognized by its start time, and a different start time is another process", async () => {
-  // Off Linux the start time is ps's lstart, which resolves to one second: this process and a child spawned in the
+  // On macOS the start time is ps's lstart, which resolves to one second: this process and a child spawned in the
   // same second carry the identical string, which is what the run below asserts. Crossing into the next second
   // first is therefore not tidiness - it is the only way the pair is distinguishable there at all.
-  if (process.platform !== "linux") await new Promise((r) => setTimeout(r, 1050 - (Date.now() % 1000)));
+  if (process.platform === "darwin") await new Promise((r) => setTimeout(r, 1050 - (Date.now() % 1000)));
   const pid = bystander();
   const start = processStart(pid);
   assert.ok(start, "start time readable");
   assert.equal(processStart(pid), start, "stable across reads");
-  if (process.platform === "linux") {
+  if (process.platform === "win32") {
+    // What Windows resolves, stated rather than assumed: Get-Process reports 100 ns ticks counted from when the
+    // process was created, so two started one after another are two identities, and ownsProcess can rest on the
+    // pair as it does on Linux. Five spawned back to back on a runner came out 4.6 to 13 ms apart, none alike.
+    const next = processStart(bystander());
+    assert.notEqual(next, start, "a process started right after has its own start time");
+    assert.ok(Number(next) > Number(start), "and the later of the two is the later tick");
+  } else if (process.platform === "linux") {
     // Reading the wrong field of /proc/<pid>/stat is invisible to any comparison of the value with itself, and a
     // wrong one still looks like a number. This one is ticks since boot (100 Hz, as /proc/uptime confirms), so a
     // process started just now sits at the current uptime; the neighbouring fields are a zero and a memory size.
@@ -77,18 +88,24 @@ test("a process is recognized by its start time, and a different start time is a
   assert.ok(!sameProcess(pid, start));
 });
 
+// pid 1 is init, which every Unix has and no ordinary user may signal. Windows has no pid 1 at all and answers
+// ESRCH for it; what stands for init there is pid 4, the System process, which not even an administrator can open
+// (measured on the windows-latest runner, which runs elevated: pid 4, Secure System, smss, csrss, services and
+// Defender all answer EPERM, and every pid that is simply not running answers ESRCH).
+const UNSIGNALLABLE = process.platform === "win32" ? 4 : 1;
+
 test("a running process this user may not signal is alive", { skip: process.getuid?.() === 0 && "running as root: pid 1 is signallable" }, () => {
-  // pid 1 (init) is always running and, as any other user, unsignallable: the liveness probe comes back EPERM
-  // rather than ESRCH. Reading that as "gone" would drop the export and busy leases of every figma-reader running
-  // under another account on this machine, and would let close() signal a pid that process still holds.
+  // Such a process is running, and the liveness probe comes back EPERM rather than ESRCH on both platforms.
+  // Reading that as "gone" would drop the export and busy leases of every figma-reader running under another
+  // account on this machine, and would let close() signal a pid that process still holds.
   let code: string | undefined;
   try {
-    process.kill(1, 0);
+    process.kill(UNSIGNALLABLE, 0);
   } catch (e: any) {
     code = e.code;
   }
-  assert.equal(code, "EPERM", "pid 1 is running and this user may not signal it");
-  assert.ok(pidAlive(1));
+  assert.equal(code, "EPERM", `pid ${UNSIGNALLABLE} is running and this user may not signal it`);
+  assert.ok(pidAlive(UNSIGNALLABLE));
 });
 
 for (const [label, extra] of [["a mismatching start time", { start: "1" }], ["no start time (older record)", {}]] as const) {
@@ -115,28 +132,31 @@ test("a login record whose pid was reused is stale: no login window is reported,
 
 let b = 0;
 /**
- * A stand-in for a browser of ours: an executable started with the profile on its command line, as a launch writes
- * it. That argument is not decoration - ownsProcess reads it off Linux, where ps's lstart resolves to one second
- * and cannot tell a pid reissued inside that second from the browser that held it. `body` must not be a lone
- * command: sh execs one of those, and the arguments ps then reports are the exec'd program's, not ours.
+ * A stand-in for a browser of ours: a process started with the profile on its command line, as a launch writes it.
+ * That argument is not decoration - ownsProcess reads it on macOS, where ps's lstart resolves to one second and
+ * cannot tell a pid reissued inside that second from the browser that held it.
  *
- * It waits in one-second steps rather than one long sleep so that killing the shell leaves a grandchild behind for
- * at most a second; after() can only reach the pids spawned here.
+ * node runs the body rather than sh: Windows cannot run a shell script at all, and there is no intermediate shell
+ * to exec anything, so the arguments the process reports are the ones written here and nothing is left behind for
+ * after() to miss.
  */
-function ourBrowser(userDataDir: string, body = "while :; do sleep 1; done"): number {
-  const exe = join(root, `browser${b++}`);
-  writeFileSync(exe, `#!/bin/sh\n${body}\n`);
-  chmodSync(exe, 0o755);
-  const child = spawn(exe, [`--user-data-dir=${userDataDir}`], { stdio: "ignore" });
+function ourBrowser(userDataDir: string, body = "setTimeout(() => {}, 60_000)"): number {
+  const script = join(root, `browser${b++}.mjs`);
+  writeFileSync(script, `${body}\n`);
+  const child = spawn(process.execPath, [script, `--user-data-dir=${userDataDir}`], { stdio: "ignore" });
   // A spawn that never started leaves pid undefined, and a record naming no pid is read as no record at all: the
   // tests below would then assert undefined against undefined and pass having stood nothing in for anything.
-  assert.ok(child.pid, `${exe} did not start`);
+  assert.ok(child.pid, `${script} did not start`);
   children.push(child.pid);
   return child.pid;
 }
 
-/** Half a second to die, SIGTERM included, so the wait in close() is real. */
-const DYING = 'trap "" TERM\nsleep 0.5 &\nwait';
+/**
+ * Half a second to live, and on a Unix a SIGTERM it ignores, so the wait in close() is real. Windows gives a
+ * process no say in being terminated, so there it is gone the moment closeLoginWindow signals it; the half second
+ * is what still makes the wait happen, and what the tests below assert is the same either way.
+ */
+const DYING = 'process.on("SIGTERM", () => {});\nsetTimeout(() => {}, 500)';
 
 for (const purpose of ["work", "login"] as const) {
   test(`closing a ${purpose} browser keeps a record another process wrote while it waited`, async () => {
@@ -326,23 +346,24 @@ test("a browser is chosen by what can run, and a confined build only as a last r
     chmodSync(p, mode);
     return p;
   };
-  put("a", "chromium", 0o644); // there, not runnable
-  mkdirSync(join(bin, "a", "google-chrome"));  // a directory of that name
-  const chrome = put("b", "google-chrome-stable", 0o755);
-  const brave = put("b", "brave", 0o755);
-  const env = process.env.PATH;
-  process.env.PATH = `${join(bin, "a")}:${join(bin, "b")}`;
-  try {
-    const found = browserCandidates();
-    // brave before google-chrome-stable is the declared preference; neither of the two unusable files appears.
-    assert.deepEqual(found.slice(0, 2), [brave, chrome]);
-    assert.ok(!found.includes(join(bin, "a", "chromium")), "a file that cannot be executed is not a browser");
-    assert.ok(!found.includes(join(bin, "a", "google-chrome")), "nor is a directory");
-    // Playwright's build is refused by Google sign-in, so it comes last whatever else is installed.
-    assert.ok(found.length === 2 || found[found.length - 1].includes("ms-playwright"), found.join(" "));
-  } finally {
-    process.env.PATH = env;
-  }
+  // The names this platform looks for: Windows has no google-chrome-stable, and looks for an .exe.
+  const win = process.platform === "win32";
+  const [braveName, chromeName, chromiumName] = win ? ["brave.exe", "chrome.exe", "chromium.exe"] : ["brave", "google-chrome-stable", "chromium"];
+  // Windows has no execute bit: fs.access(X_OK) succeeds for every file that exists, so "there, not runnable" is
+  // not a state the picker can recognise there, and such a candidate is dropped by failing to launch instead.
+  if (!win) put("a", chromiumName, 0o644); // there, not runnable
+  mkdirSync(join(bin, "a", chromeName));  // a directory of that name
+  const chrome = put("b", chromeName, 0o755);
+  const brave = put("b", braveName, 0o755);
+  // The directories are handed in rather than arranged behind the code's back: Windows searches the standard
+  // install directories besides PATH, so emptying PATH still left the runner's own Chrome and Edge in front.
+  const found = browserCandidates([join(bin, "a"), join(bin, "b")]);
+  // brave before the Chrome spelling is the declared preference; neither of the two unusable files appears.
+  assert.deepEqual(found.slice(0, 2), [brave, chrome]);
+  if (!win) assert.ok(!found.includes(join(bin, "a", chromiumName)), "a file that cannot be executed is not a browser");
+  assert.ok(!found.includes(join(bin, "a", chromeName)), "nor is a directory");
+  // Playwright's build is refused by Google sign-in, so it comes last whatever else is installed.
+  assert.ok(found.length === 2 || found[found.length - 1].includes("ms-playwright"), found.join(" "));
   // The ordering, which needs paths that no test machine has: a snap is preferred by name (chromium before
   // google-chrome-stable) and must still end up behind it, while staying in the list in case it is all there is.
   assert.deepEqual(
@@ -402,9 +423,15 @@ test("a browser named outright is never quietly swapped for another", { skip: !c
   });
 });
 
-test("a launched headless browser is recorded with its identity and closed by release() from a fresh manager", { skip: !chromium && "no chromium" }, async () => {
+// The two tests above lay out shell scripts, which Windows cannot run, so they stay a Unix affair. This one only
+// needs a browser that starts, and on Windows that is whatever the picker finds in the standard install
+// directories: it is the one place a launch, the record it writes and the close that reads it are tried end to end
+// there, and the identity in that record is what stands between a reused pid and process.kill.
+const launchable = chromium ?? (process.platform === "win32" ? browserCandidates()[0] : undefined);
+
+test("a launched headless browser is recorded with its identity and closed by release() from a fresh manager", { skip: !launchable && "no browser that starts" }, async () => {
   const dir = join(root, "real");
-  const opts = { executablePath: chromium, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") };
+  const opts = { executablePath: launchable, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") };
   const first = new BrowserManager(opts);
   await first.launch(true, "work");
   const rec = first.launchRecord()!;

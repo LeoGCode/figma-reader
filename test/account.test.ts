@@ -3,7 +3,7 @@ import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   accountCacheDir, accountDir, accountProfileDir, CONFIG_FILE, findProjectConfig, resolveAccount, writeProjectAccount,
 } from "../src/account.ts";
@@ -15,6 +15,11 @@ after(() => {
 
 // Resolution walks up to the filesystem root, so a config above the temp dir would leak into every test project.
 const strayConfig = findProjectConfig(tmpdir())?.path;
+
+// Absolute on this platform, not only on a POSIX one: "/abs/figma" is rooted on Windows but names no drive, so
+// resolve() there hangs it off whichever drive the process runs on and it is no longer the path the test wrote.
+const ABS = resolve("/abs/figma");
+const CACHE_ROOT = resolve("/srv/figma-cache");
 
 const project = (config?: object) => {
   const root = mkdtempSync(join(tmpdir(), "figma-reader-test-"));
@@ -46,10 +51,10 @@ test("FIGMA_ACCOUNT overrides the project file", () => {
 });
 
 test("filesDirs resolve against the project file's directory", () => {
-  const { root, nested } = project({ filesDirs: ["design", "/abs/figma"] });
+  const { root, nested } = project({ filesDirs: ["design", ABS] });
   const r = resolveAccount({}, nested);
   assert.equal(r.name, "default");
-  assert.deepEqual(r.config?.filesDirs, [join(root, "design"), "/abs/figma"]);
+  assert.deepEqual(r.config?.filesDirs, [join(root, "design"), ABS]);
 });
 
 test("account names cannot escape the accounts directory", () => {
@@ -80,13 +85,14 @@ test("use creates the project file when there is none", { skip: strayConfig && `
 
 test("use in a subdirectory keeps the settings of the project file above it", () => {
   // The new, nearer file shadows the project's, whose filesDirs used to be dropped here without a word.
-  const { root, nested } = project({ account: "acme", filesDirs: ["design", "/abs/figma", "~/Downloads"], extra: 1 });
+  const { root, nested } = project({ account: "acme", filesDirs: ["design", ABS, "~/Downloads"], extra: 1 });
   const r = writeProjectAccount(nested, "personal");
   assert.deepEqual(r, { path: join(nested, CONFIG_FILE), inheritedFrom: join(root, CONFIG_FILE) });
-  assert.deepEqual(JSON.parse(readFileSync(r.path, "utf8")), { filesDirs: ["../../design", "/abs/figma", "~/Downloads"], extra: 1, account: "personal" });
+  // The rebased entry is written with this platform's separator, which is the spelling resolve() reads back below.
+  assert.deepEqual(JSON.parse(readFileSync(r.path, "utf8")), { filesDirs: [join("..", "..", "design"), ABS, "~/Downloads"], extra: 1, account: "personal" });
   const resolved = resolveAccount({}, nested);
   assert.equal(resolved.name, "personal");
-  assert.deepEqual(resolved.config?.filesDirs, [join(root, "design"), "/abs/figma", join(homedir(), "Downloads")]);
+  assert.deepEqual(resolved.config?.filesDirs, [join(root, "design"), ABS, join(homedir(), "Downloads")]);
   assert.equal(JSON.parse(readFileSync(join(root, CONFIG_FILE), "utf8")).account, "acme", "the project's own file is untouched");
 });
 
@@ -111,8 +117,8 @@ test("FIGMA_READER_CACHE moves the cache root but keeps accounts apart below it"
   // It used to replace the per-account directory, so every account shared one snapshot cache.
   const saved = process.env.FIGMA_READER_CACHE;
   try {
-    process.env.FIGMA_READER_CACHE = "/srv/figma-cache";
-    assert.equal(accountCacheDir("a"), join("/srv/figma-cache", "accounts", "a"));
+    process.env.FIGMA_READER_CACHE = CACHE_ROOT;
+    assert.equal(accountCacheDir("a"), join(CACHE_ROOT, "accounts", "a"));
     assert.notEqual(accountCacheDir("a"), accountCacheDir("b"));
     delete process.env.FIGMA_READER_CACHE;
     assert.equal(accountCacheDir("a"), join(homedir(), ".cache", "figma-reader", "accounts", "a"));

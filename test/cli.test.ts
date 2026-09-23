@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { figBytes, type TestNode } from "./fixtures.ts";
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
@@ -178,7 +178,7 @@ test("use in a subdirectory says which project file it copied", async () => {
   const r = await cli(["use", "personal"], { cwd: sub });
   assert.equal(r.code, 0, r.stderr);
   assert.ok(r.stdout.includes(`copied from ${join(proj, ".figma-reader.json")}`), r.stdout);
-  assert.deepEqual(JSON.parse(readFileSync(join(sub, ".figma-reader.json"), "utf8")), { filesDirs: ["../design"], account: "personal" });
+  assert.deepEqual(JSON.parse(readFileSync(join(sub, ".figma-reader.json"), "utf8")), { filesDirs: [join("..", "design")], account: "personal" });
 });
 
 test("list-files reports how many files there are beyond the limit, and when a query matched none", async () => {
@@ -197,6 +197,12 @@ test("list-files reports how many files there are beyond the limit, and when a q
   assert.deepEqual(JSON.parse(none.stdout).totalUnfiltered, 35);
   const nowhere = JSON.parse((await cli(["list-files"], { env: { FIGMA_FILES_DIRS: join(root, "empty") } })).stdout);
   assert.deepEqual([nowhere.total, nowhere.searchedDirs], [0, [join(root, "empty")]]);
+  // Several directories in one variable, separated the way this platform separates PATH. The split was on ':',
+  // which on Windows cuts "C:\designs" into "C" and "\designs": the directory a user configured was never
+  // searched, and list-files answered that there were no local files without saying why.
+  const two = JSON.parse((await cli(["list-files", "--limit", "100"], { env: { FIGMA_FILES_DIRS: [dir, work].join(delimiter) } })).stdout);
+  assert.deepEqual(two.searchedDirs, [dir, work]);
+  assert.equal(two.total, 36, "the 35 files here and the one in the work directory");
 });
 
 test("the download directory follows the browser profile, not the cache each process was given", async () => {

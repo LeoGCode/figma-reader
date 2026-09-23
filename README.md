@@ -183,7 +183,7 @@ A managed browser is shared by all servers and CLI calls using the same profile 
 | Env | Default | |
 | --- | --- | --- |
 | `FIGMA_ACCOUNT` | from `.figma-reader.json`, else `default` | Account: which Figma login and snapshot cache to use |
-| `FIGMA_FILES_DIRS` | `filesDirs` from `.figma-reader.json`, else `~/Downloads` | Colon-separated dirs scanned (2 levels) for `.fig` files |
+| `FIGMA_FILES_DIRS` | `filesDirs` from `.figma-reader.json`, else `~/Downloads` | Dirs scanned (2 levels) for `.fig` files, separated like `PATH` (`:`, `;` on Windows) |
 | `FIGMA_BROWSER_PATH` | Brave › Chromium › Chrome › Playwright | Browser executable |
 | `FIGMA_USER_DATA_DIR` | `~/.local/share/figma-reader/accounts/<account>/profile-<browser>` | Browser profile holding the Figma login (one per browser: cookie keys differ). Without an account set, a custom profile gets its own cache |
 | `FIGMA_HEADLESS` | `1` | `0` keeps the work browser visible |

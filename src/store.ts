@@ -28,6 +28,35 @@ function beganBefore(name: string, since: number) {
   return !Number.isFinite(began) || began > Date.now() || began <= since;
 }
 
+/**
+ * The .fig at `path` as it stands, or undefined when there is none: mtime and size, the pair fromDisk also keys its
+ * decode by, since a replacement written within the mtime granularity carries the old time. Only a write changes
+ * either, so two readings that differ are two files and the second was written between them - which is what the
+ * cross-process rule below needs, and it takes no clock to say it.
+ */
+function asSeen(path: string): string | undefined {
+  try {
+    const st = statSync(path);
+    return `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A .fig is at `path` and is not the one the reading `seen` stands for, so it was written after that reading. */
+function wroteSince(path: string, seen: string | undefined) {
+  const now = asSeen(path);
+  return now !== undefined && now !== seen;
+}
+
+/** What waiting for the other processes on this cache established; see awaitOtherExport. */
+interface Floor {
+  /** Whether an instant was reached at which no export that may be older than the refresh was still running. */
+  reached: boolean;
+  /** The .fig as it stood at that instant (see asSeen), undefined when there was none: the bar a newer one clears. */
+  file: string | undefined;
+}
+
 interface Inflight {
   promise: Promise<FigDocument>;
   /** It exports the live file, so it can serve a refresh request too. */
@@ -125,35 +154,46 @@ export class SnapshotStore {
   }
 
   /**
-   * Wait while other processes export this key, and report the mtime the file must beat for the export that wrote it
-   * to have provably begun after `since`; undefined when no other export was running. Leases of processes that died
-   * are dropped by liveLeases, so a crashed holder costs one poll interval rather than the whole wait.
+   * Wait while other processes export this key, and report the .fig the file on disk must differ from for the export
+   * that wrote it to have provably begun after `since`; undefined when no other export was running. Leases of
+   * processes that died are dropped by liveLeases, so a crashed holder costs one poll interval rather than the whole
+   * wait.
    *
    * The wait always buys serialization. It buys an answer only when every export that could have begun before
    * `since` was seen gone at a known instant: a lease is dropped only after its export has written the file, so
    * anything written after that instant is another export's, and the only ones left began after `since`.
+   *
+   * What marks that instant is a reading of the file itself, not a reading of this process's clock. The clock that
+   * dates a write is the filesystem's: on NTFS it runs ahead of the Date.now() that follows it by up to a 15.6 ms
+   * timer tick, so a file an export had already written read as newer than the instant its holder was last seen at,
+   * and answered a refresh no export of it could answer - windows-latest failed the test for two exports running
+   * together about one run in four. Comparing the file against itself asks one clock, whichever it is.
    */
-  private async awaitOtherExport(fileKey: string, since: number): Promise<number | undefined> {
+  private async awaitOtherExport(fileKey: string, since: number): Promise<Floor | undefined> {
     const leases = this.leaseDir(fileKey);
+    const path = this.figPath(fileKey);
     const deadline = Date.now() + OTHER_EXPORT_WAIT_MS;
     // Each lease is dated once, the first time it is seen: a clock that stepped back is only visible while this
     // process's clock has not yet passed the stamp it left behind, so re-dating the same name later lets it through.
     const dated = new Map<string, boolean>();
-    let floor = since;
+    let live = liveLeases(leases);
+    // The file is read after that first poll and not before it: an export older than `since` whose lease was already
+    // gone had written the file by then, so this reading holds its work and no later one is taken for someone else's.
+    let floor: Floor = { reached: true, file: asSeen(path) };
     let older = false;
-    for (let live = liveLeases(leases); live.length; live = liveLeases(leases)) {
+    for (; live.length; live = liveLeases(leases)) {
       // The ceiling is reached with an export still running, so whatever it writes from here on is unattributable.
-      if (Date.now() > deadline) return Infinity;
+      if (Date.now() > deadline) return { reached: false, file: undefined };
       for (const name of live) if (!dated.has(name)) dated.set(name, beganBefore(name, since));
       if (live.some((name) => dated.get(name))) older = true;
       else if (older) {
         // Every export older than `since` has gone since the last poll, so it had written the file by now.
-        floor = Math.max(floor, Date.now());
+        floor = { reached: true, file: asSeen(path) };
         older = false;
       }
       await sleep(LEASE_POLL_MS);
     }
-    return dated.size ? (older ? Math.max(floor, Date.now()) : floor) : undefined;
+    return dated.size ? (older ? { reached: true, file: asSeen(path) } : floor) : undefined;
   }
 
   private async load(fileKey: string, refresh: boolean): Promise<FigDocument> {
@@ -169,16 +209,11 @@ export class SnapshotStore {
     if (floor !== undefined) {
       if (!refresh) {
         if (fresh()) return this.fromDisk(fileKey, path);
-      } else if (existsSync(path) && Math.floor(statSync(path).mtimeMs) > floor) {
-        // The rule in get, across processes: the file is newer than every export that could have begun before this
-        // load, so the one that wrote it began after, and it answers this refresh. Two holders at once never clear
-        // that bar together, since either of them may have renamed last; then the wait only bought serialization.
-        //
-        // Whole milliseconds on both sides, because the two clocks are read at different precisions: every floor is a
-        // Date.now(), which truncates, while mtimeMs carries the filesystem's sub-millisecond part. A file written
-        // 0.7 ms before the floor instant therefore read as 0.7 ms after it. The margin between the write and the poll
-        // that sets the floor was measured here at 0.5-1.6 ms, so the sign flipped whenever the two fell in one
-        // millisecond - always on Windows, where both land in a single 15.6 ms timer tick, and sometimes elsewhere.
+      } else if (floor.reached && wroteSince(path, floor.file)) {
+        // The rule in get, across processes: the file on disk is no longer the one that stood there while an export
+        // that could have begun before this load was still running, so the one that wrote it began after, and it
+        // answers this refresh. Two holders at once never clear that bar together, since either of them may have
+        // renamed last; then the wait only bought serialization.
         return this.fromDisk(fileKey, path);
       }
     }

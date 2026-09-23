@@ -2,7 +2,7 @@
 // older copy, so each rule is pinned against a fake exporter that counts its calls.
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { processStamp, takeLease } from "../src/browser.ts";
@@ -273,6 +273,25 @@ describe("SnapshotStore between processes", () => {
   // it stands for another process exporting the key, with the time in its name written by that process's clock.
   const holder = (dir: string, began: number, tag: string) => takeLease(join(dir, "exports", "K"), `${process.pid}-${began}-${tag}`);
   const polls = (n: number) => new Promise((r) => setTimeout(r, n * LEASE_POLL_MS));
+  /**
+   * Wait until the store's wait has read the lease directory once more. liveLeases deletes a lease whose process is
+   * not the one that stamped it and never reports it as live, so a lease planted under pid 1 is a probe that poll
+   * removes and the rule under test never sees. What a poll does with the leases it read happens before it sleeps,
+   * so the probe being gone means that too. The waits below can then be sequenced against the store's polls rather
+   * than against the clock: one poll landing on the wrong side of a lease being dropped is the whole difference
+   * between these rules, and a sleep of n intervals is what slips on a loaded runner.
+   */
+  const polled = async (dir: string) => {
+    const leases = join(dir, "exports", "K");
+    const probe = join(leases, `1-${Date.now()}-probe`);
+    mkdirSync(leases, { recursive: true });
+    writeFileSync(probe, processStamp(process.pid));
+    const deadline = Date.now() + 5_000;
+    while (existsSync(probe)) {
+      if (Date.now() > deadline) throw new Error("the store did not poll for leases within 5s");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  };
 
   it("does not answer a refresh with an export whose lease is stamped after the refresh by a clock that stepped back", async () => {
     const x = exporter();
@@ -282,7 +301,7 @@ describe("SnapshotStore between processes", () => {
     const lease = holder(dir, Date.now() + 60_000, "skew");
     const store = new SnapshotStore(x.web, dir, HOUR);
     const refreshed = store.get("K", true);
-    await polls(2);
+    await polled(dir);
     writeFileSync(join(dir, "K.fig"), fig("pre-refresh"));
     rmSync(lease, { force: true });
     // Serving that file would report what Figma held before the edit as fresh, which is the whole point of the rule.
@@ -294,11 +313,13 @@ describe("SnapshotStore between processes", () => {
     const x = exporter();
     const dir = tempDir();
     // A step back smaller than the export leaves a stamp this process's clock passes within a poll or two; re-dating
-    // the lease then makes the same pre-refresh export look like one that began afterwards.
-    const lease = holder(dir, Date.now() + 30, "small-skew");
+    // the lease then makes the same pre-refresh export look like one that began afterwards. One poll, so that the
+    // lease is first read while the clock is still behind its stamp, then the clock passing it, then another poll.
+    const lease = holder(dir, Date.now() + LEASE_POLL_MS, "small-skew");
     const store = new SnapshotStore(x.web, dir, HOUR);
     const refreshed = store.get("K", true);
-    await polls(4);
+    await polls(2);
+    await polled(dir);
     writeFileSync(join(dir, "K.fig"), fig("pre-refresh"));
     rmSync(lease, { force: true });
     assert.equal(label(await refreshed), "export 1");
@@ -315,7 +336,7 @@ describe("SnapshotStore between processes", () => {
     const lease = takeLease(join(dir, "exports", "K"), `${process.pid}-oldbuild`);
     const store = new SnapshotStore(x.web, dir, HOUR);
     const refreshed = store.get("K", true);
-    await polls(2);
+    await polled(dir);
     writeFileSync(join(dir, "K.fig"), fig("pre-refresh"));
     rmSync(lease, { force: true });
     assert.equal(label(await refreshed), "export 1");
@@ -329,15 +350,39 @@ describe("SnapshotStore between processes", () => {
     await polls(1);
     const store = new SnapshotStore(x.web, dir, HOUR);
     const refreshed = store.get("K", true);
-    await polls(1);
+    await polled(dir);
     // Two holders at once: both found no lease at the same instant. This one began after the refresh was asked for.
     const newer = holder(dir, Date.now(), "newer");
-    await polls(2);
+    await polled(dir);
     // A lease is dropped only once its export has written the file, so nothing written from here on is the older
     // export's, and this refresh can be answered without paying for an export of its own.
     rmSync(older, { force: true });
-    await polls(3);
+    await polled(dir);
     writeFileSync(join(dir, "K.fig"), fig("newer export"));
+    rmSync(newer, { force: true });
+    assert.equal(label(await refreshed), "newer export");
+    assert.deepEqual(x.calls, [], "the wait bought an answer, not only serialization");
+  });
+
+  it("answers a refresh with an export that began after it whose file is dated behind this process's clock", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    const older = holder(dir, Date.now(), "older");
+    await polls(1);
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    const refreshed = store.get("K", true);
+    await polled(dir);
+    const newer = holder(dir, Date.now(), "newer");
+    await polled(dir);
+    rmSync(older, { force: true });
+    await polled(dir);
+    writeFileSync(join(dir, "K.fig"), fig("newer export"));
+    // Nothing was on disk when the older export's lease went, so this file is the newer export's whatever time it
+    // carries: a filesystem dating a write behind the reading of Date.now() that follows it is the same
+    // disagreement as the one below, and a rule comparing the two times refused a file it could have answered with,
+    // paying for an export of its own. The size of the skew is the machine's; it is written in here to be sure of.
+    const behind = new Date(Date.now() - 1000);
+    utimesSync(join(dir, "K.fig"), behind, behind);
     rmSync(newer, { force: true });
     assert.equal(label(await refreshed), "newer export");
     assert.deepEqual(x.calls, [], "the wait bought an answer, not only serialization");
@@ -354,13 +399,13 @@ describe("SnapshotStore between processes", () => {
     await polls(1);
     const store = new SnapshotStore(x.web, dir, HOUR);
     const refreshed = store.get("K", true);
-    await polls(1);
+    await polled(dir);
     const newer = holder(dir, Date.now(), "newer");
-    await polls(1);
+    await polled(dir);
     writeFileSync(join(dir, "K.fig"), fig("older export"));
-    await polls(1);
+    await polled(dir);
     rmSync(older, { force: true });
-    await polls(2);
+    await polled(dir);
     rmSync(newer, { force: true });
     assert.equal(label(await refreshed), "export 1");
     assert.deepEqual(x.calls, ["K"], "one export of its own, the file on disk having answered nothing");
@@ -373,11 +418,35 @@ describe("SnapshotStore between processes", () => {
     await polls(1);
     const store = new SnapshotStore(x.web, dir, HOUR);
     const refreshed = store.get("K", true);
-    await polls(1);
+    await polled(dir);
     const newer = holder(dir, Date.now(), "newer");
-    await polls(2);
+    await polled(dir);
     // Neither lease was dropped before the file appeared, so it may be the older export's, whichever renamed last.
     writeFileSync(join(dir, "K.fig"), fig("either export"));
+    rmSync(older, { force: true });
+    rmSync(newer, { force: true });
+    assert.equal(label(await refreshed), "export 1");
+    assert.deepEqual(x.calls, ["K"]);
+  });
+
+  it("does not answer a refresh from a file dated ahead of this process's clock by the one that wrote it", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    const older = holder(dir, Date.now(), "older");
+    await polls(1);
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    const refreshed = store.get("K", true);
+    await polled(dir);
+    const newer = holder(dir, Date.now(), "newer");
+    await polled(dir);
+    writeFileSync(join(dir, "K.fig"), fig("either export"));
+    // The same two exports running together, and the file they leave dated by the filesystem's clock rather than by
+    // this process's: on NTFS the first runs ahead of the second by up to a 15.6 ms timer tick, so a file already
+    // written reads as newer than the instant both holders were last seen at. windows-latest served it to a refresh
+    // about one run in four. The skew is written in rather than waited for, its size being the machine's, so that
+    // what decides this is the rule and not the margin between two readings.
+    const ahead = new Date(Date.now() + 1000);
+    utimesSync(join(dir, "K.fig"), ahead, ahead);
     rmSync(older, { force: true });
     rmSync(newer, { force: true });
     assert.equal(label(await refreshed), "export 1");

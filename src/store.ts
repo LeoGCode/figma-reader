@@ -169,10 +169,16 @@ export class SnapshotStore {
     if (floor !== undefined) {
       if (!refresh) {
         if (fresh()) return this.fromDisk(fileKey, path);
-      } else if (existsSync(path) && statSync(path).mtimeMs > floor) {
+      } else if (existsSync(path) && Math.floor(statSync(path).mtimeMs) > floor) {
         // The rule in get, across processes: the file is newer than every export that could have begun before this
         // load, so the one that wrote it began after, and it answers this refresh. Two holders at once never clear
         // that bar together, since either of them may have renamed last; then the wait only bought serialization.
+        //
+        // Whole milliseconds on both sides, because the two clocks are read at different precisions: every floor is a
+        // Date.now(), which truncates, while mtimeMs carries the filesystem's sub-millisecond part. A file written
+        // 0.7 ms before the floor instant therefore read as 0.7 ms after it. The margin between the write and the poll
+        // that sets the floor was measured here at 0.5-1.6 ms, so the sign flipped whenever the two fell in one
+        // millisecond - always on Windows, where both land in a single 15.6 ms timer tick, and sometimes elsewhere.
         return this.fromDisk(fileKey, path);
       }
     }

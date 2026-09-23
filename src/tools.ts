@@ -233,7 +233,7 @@ async function open(file: string, refresh?: boolean) {
 const WRITES_PATH = ["out_file", "out_dir", "save_path"];
 /**
  * Tools that write outside our caches without being given a path: figma_status records who an account's profile is
- * logged in as (~/.local/share/figma-reader/accounts/<name>/account.json, via verified()), and figma_login opens a
+ * logged in as (account.json in the account's data directory, via verified()), and figma_login opens a
  * real browser window and signs the profile in. Exporting a snapshot into the cache is our own bookkeeping and stays
  * read-only; openWorldHint, published for every tool, is what says a call may reach figma.com.
  */

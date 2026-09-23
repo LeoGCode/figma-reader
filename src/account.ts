@@ -1,6 +1,7 @@
 // Accounts keep projects that use different Figma logins isolated. Each named account has its own browser profile
 // (the login) and its own snapshot cache, so one project never reuses another account's session or exported files.
 // A project picks its account in .figma-reader.json; FIGMA_ACCOUNT (or the CLI's --account) overrides it.
+// The per-platform roots everything we write hangs off live here too (appRoot), since accounts are most of it.
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -12,10 +13,31 @@ const NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
 const tilde = (p: string) => p.replace(/^~(?=\/|$)/, homedir());
 export const expandHome = (p: string) => resolve(tilde(p));
 
-const dataRoot = () => join(homedir(), ".local", "share", "figma-reader");
+const APP = "figma-reader";
+export type AppRoot = "data" | "cache" | "state";
+/** Linux and macOS: the XDG spelling, which is where every install made before this already keeps its files. */
+const XDG: Record<AppRoot, string[]> = { data: [".local", "share"], cache: [".cache"], state: [".local", "state"] };
+
+/**
+ * Where this platform itself keeps that kind of file. Windows has no XDG directories: %APPDATA% is the half of a
+ * user's profile that follows them between machines (the browser profile holding the login, account.json) and
+ * %LOCALAPPDATA% the half that stays on the machine (snapshots, browser records, downloads). Both are read from the
+ * environment, since a Windows profile may have been redirected elsewhere and only the variables say where.
+ * macOS stays on the XDG paths although ~/Library/Application Support and ~/Library/Caches are its own answer:
+ * those paths work there, and moving them would strand the logins and snapshots of every account that exists today.
+ * env and platform are parameters so that both mappings can be checked from whichever platform runs the tests.
+ */
+export function appRoot(kind: AppRoot, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string {
+  if (platform !== "win32") return join(homedir(), ...XDG[kind], APP);
+  // Cache and state share %LOCALAPPDATA%, so each needs a name of its own below the application's directory.
+  if (kind === "data") return join(env.APPDATA || join(homedir(), "AppData", "Roaming"), APP);
+  return join(env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), APP, kind === "cache" ? "Cache" : "State");
+}
+
+const dataRoot = () => appRoot("data");
 export const accountDir = (name: string) => join(dataRoot(), "accounts", name);
 /** FIGMA_READER_CACHE moves the cache root; accounts stay apart below it, as their snapshots must never mix. */
-export const cacheRoot = () => (process.env.FIGMA_READER_CACHE ? expandHome(process.env.FIGMA_READER_CACHE) : join(homedir(), ".cache", "figma-reader"));
+export const cacheRoot = () => (process.env.FIGMA_READER_CACHE ? expandHome(process.env.FIGMA_READER_CACHE) : appRoot("cache"));
 export const accountCacheDir = (name: string) => join(cacheRoot(), "accounts", name);
 /** One profile per browser binary: cookie encryption keys differ between Brave, Chromium and Chrome. */
 export const accountProfileDir = (name: string, exe: string) =>

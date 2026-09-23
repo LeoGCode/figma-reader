@@ -5,7 +5,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  accountCacheDir, accountDir, accountProfileDir, CONFIG_FILE, findProjectConfig, resolveAccount, writeProjectAccount,
+  accountCacheDir, accountDir, accountProfileDir, appRoot, CONFIG_FILE, findProjectConfig, resolveAccount, writeProjectAccount,
 } from "../src/account.ts";
 
 const roots: string[] = [];
@@ -58,7 +58,10 @@ test("filesDirs resolve against the project file's directory", () => {
 });
 
 test("account names cannot escape the accounts directory", () => {
-  assert.throws(() => resolveAccount({ FIGMA_ACCOUNT: "../other" }, tmpdir()), /invalid account name/);
+  // Backslash and a drive letter are separators too, on the platform whose roots these directories now live in.
+  for (const name of ["../other", "..", ".hidden", "a\\b", "C:\\evil", "a b"]) {
+    assert.throws(() => resolveAccount({ FIGMA_ACCOUNT: name }, tmpdir()), /invalid account name/, `${JSON.stringify(name)} is refused`);
+  }
   const { nested } = project({ account: "a/b" });
   assert.throws(() => resolveAccount({}, nested), /invalid account name/);
 });
@@ -121,7 +124,8 @@ test("FIGMA_READER_CACHE moves the cache root but keeps accounts apart below it"
     assert.equal(accountCacheDir("a"), join(CACHE_ROOT, "accounts", "a"));
     assert.notEqual(accountCacheDir("a"), accountCacheDir("b"));
     delete process.env.FIGMA_READER_CACHE;
-    assert.equal(accountCacheDir("a"), join(homedir(), ".cache", "figma-reader", "accounts", "a"));
+    // Unset falls back to this platform's cache root, whichever that is; test/app-dirs.test.ts pins the roots.
+    assert.equal(accountCacheDir("a"), join(appRoot("cache"), "accounts", "a"));
   } finally {
     if (saved === undefined) delete process.env.FIGMA_READER_CACHE;
     else process.env.FIGMA_READER_CACHE = saved;

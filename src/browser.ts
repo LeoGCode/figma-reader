@@ -5,8 +5,9 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { hostname } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
+import { appRoot } from "./account.ts";
 import { CdpSession, sleep, type TargetInfo } from "./cdp.ts";
 
 export interface BrowserOptions {
@@ -721,4 +722,4 @@ export function profileHasLoginCookie(userDataDir: string, since?: number): bool
   return false;
 }
 
-export const defaultStateDir = () => join(homedir(), ".local", "state", "figma-reader");
+export const defaultStateDir = () => appRoot("state");

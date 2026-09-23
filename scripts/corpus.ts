@@ -2,7 +2,7 @@
 // saved baseline. Prints counts only, never design content, so the output can be shared.
 // Usage: node scripts/corpus.ts [--save baseline.json] [--compare baseline.json] <file.fig | dir>...
 //   A dir is searched like FIGMA_FILES_DIRS (two levels); FIGMA_CORPUS_DIR is used when no path is given.
-//   Snapshots exported by the server are under ~/.cache/figma-reader/accounts/<account>/.
+//   Snapshots exported by the server are under the account's snapshot cache (README, Accounts).
 // Exit code 1 when an invariant fails or a path throws.
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";

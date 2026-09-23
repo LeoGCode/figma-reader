@@ -6,12 +6,22 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import type { Socket } from "node:net";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const root = mkdtempSync(join(tmpdir(), "figma-reader-test-"));
-process.env.HOME = root; // never touch the real ~/.local/state or ~/.cache
+// Never touch the real state, cache or data directories. HOME is not what Windows reads: the roots there are built
+// from APPDATA and LOCALAPPDATA, redirected below and created, as a real profile has them. USERPROFILE, which
+// os.homedir() reads, is deliberately left alone: the launch tests below start a real Chromium, and one started
+// with USERPROFILE pointing into a temp directory never opened a DevTools port at all (measured on a Windows
+// runner: 20 s to the launch ceiling, against 1.3 s beside it). No manager here is left to find its own state
+// directory, so nothing reads homedir() anyway.
+process.env.HOME = root;
+process.env.APPDATA = join(root, "AppData", "Roaming");
+process.env.LOCALAPPDATA = join(root, "AppData", "Local");
+for (const d of [process.env.APPDATA, process.env.LOCALAPPDATA]) mkdirSync(d, { recursive: true });
+const win = process.platform === "win32";
 const { bootId, BrowserManager, browserCandidates, confinedPath, demoteConfined, liveLeases, pidAlive, processStart, profileHasLoginCookie, sameProcess, takeLease } =
   await import("../src/browser.ts");
 
@@ -182,6 +192,17 @@ test("a record of the recorded process itself is kept", () => {
   assert.equal(m.launchRecord()?.pid, pid);
 });
 
+test("a login window whose cookie has not appeared is left open rather than closed", async () => {
+  // This is what closeLoginWindow's SIGTERM rests on: it only ever signals a window whose auth cookie is already
+  // committed to the profile, so the graceful exit it asks for carries nothing. Windows turns that signal into
+  // TerminateProcess, which gives Chromium no chance to flush, and the login still survives because of this check.
+  const { m, record } = manager();
+  const pid = ourBrowser(m.opts.userDataDir);
+  writeFileSync(record, JSON.stringify({ pid, headless: false, purpose: "login", start: processStart(pid), launchedAt: Date.now() }));
+  await assert.rejects(m.session(), /A Figma login window is open/);
+  assert.ok(pidAlive(pid), "the window was left open for the user, not signalled");
+});
+
 const OTHER_BOOT = "0f9c8d2a-other-boot";
 
 test("a record from another boot is stale however well its pid matches", { skip: !bootId() && "no boot id on this platform" }, async () => {
@@ -326,9 +347,19 @@ test("a browser that accepts the socket but never answers the target list fails 
 
 test("a browser executable that cannot be started rejects the launch instead of crashing the process", async () => {
   const dir = join(root, "missing");
+  mkdirSync(dir, { recursive: true });
   const m = new BrowserManager({ executablePath: join(dir, "no-such-browser"), userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") });
   await assert.rejects(m.launch(true, "work"), /Cannot start browser .*no-such-browser.*ENOENT/);
   await assert.rejects(m.launchLoginWindow("about:blank"), /Cannot start browser .*no-such-browser.*ENOENT/);
+  // The second shape of refusal, which only Windows has: Node runs no .bat or .cmd without a shell, and says so by
+  // throwing out of spawn rather than emitting an 'error' event, so this one does not pass through check() at all.
+  if (win) {
+    const cmd = join(dir, "launcher.cmd");
+    writeFileSync(cmd, "@echo off\r\n");
+    const viaScript = new BrowserManager({ executablePath: cmd, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") });
+    await assert.rejects(viaScript.launch(true, "work"), /Cannot start browser .*launcher\.cmd.*EINVAL/);
+    await assert.rejects(viaScript.launchLoginWindow("about:blank"), /Cannot start browser .*launcher\.cmd.*EINVAL/);
+  }
 });
 
 // FIGMA_BROWSER_PATH first, so CI can point this at a browser it knows launches: /usr/bin/chromium exists on a
@@ -347,7 +378,6 @@ test("a browser is chosen by what can run, and a confined build only as a last r
     return p;
   };
   // The names this platform looks for: Windows has no google-chrome-stable, and looks for an .exe.
-  const win = process.platform === "win32";
   const [braveName, chromeName, chromiumName] = win ? ["brave.exe", "chrome.exe", "chromium.exe"] : ["brave", "google-chrome-stable", "chromium"];
   // Windows has no execute bit: fs.access(X_OK) succeeds for every file that exists, so "there, not runnable" is
   // not a state the picker can recognise there, and such a candidate is dropped by failing to launch instead.
@@ -379,41 +409,76 @@ test("a browser is chosen by what can run, and a confined build only as a last r
   }
 });
 
+/**
+ * A browser that starts and exits at once without ever opening a DevTools port, which is what a confined build
+ * does when it cannot reach the profile: the candidate a launch has to pass over. Windows runs no script as an
+ * executable -- libuv spawns a PE image and nothing else, and Node refuses a .cmd outright unless it is given a
+ * shell -- so there it is node itself, which is certainly runnable and rejects browser flags as bad node options.
+ */
+function dudBrowser(dir: string, name: string): string {
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, name);
+  if (!win) {
+    writeFileSync(path, "#!/bin/sh\nexit 1\n");
+    chmodSync(path, 0o755);
+    return path;
+  }
+  // A link, because node.exe is about 100 MB; a hard link cannot cross a volume, and the tool cache a runner keeps
+  // node in need not be on the one holding the temp directory.
+  try {
+    linkSync(process.execPath, path);
+  } catch {
+    copyFileSync(process.execPath, path);
+  }
+  return path;
+}
+
+// brave comes before every other name in the preference order, so a dud under it is what a first launch gets.
+const dudDir = join(root, "fallthrough");
+const dud = dudBrowser(dudDir, win ? "brave.exe" : "brave");
+
 const chromium = [process.env.FIGMA_BROWSER_PATH, "/usr/bin/chromium", "/usr/bin/chromium-browser"].filter((p) => p !== undefined).find(existsSync);
-test("a browser that cannot start is passed over for one that can", { skip: !chromium && "no chromium" }, async () => {
+/**
+ * A browser that really starts, for a launch to land on. A Unix lays out a wrapper around one beside the dud;
+ * Windows can lay out no working stand-in at all (see dudBrowser) and does not need to, since the picker searches
+ * the standard install directories besides PATH: the machine's own browser is the next candidate after the dud.
+ */
+const launchable = chromium ?? (win ? browserCandidates()[0] : undefined);
+
+// A real browser behind the dud, and on Windows every record written and read on the way costs a PowerShell call:
+// measured at 9 s on one runner and 24 s on a slower one, which is too close to the suite's 30 s ceiling.
+test("a browser that cannot start is passed over for one that can", { skip: !launchable && "no browser that starts", timeout: 60_000 }, async () => {
   // The picker used to commit to the first browser that existed, so a snap Chromium was a dead end: it exits
-  // without opening a DevTools port, and nothing tried the working Chrome beside it. Here the first candidate on
-  // PATH exits at once, exactly as that one does, and the launch must end on the real browser rather than on it.
-  const bin = join(root, "fallthrough");
-  mkdirSync(bin, { recursive: true });
-  const dud = join(bin, "brave"); // sorts before chromium in the preference order, so it is tried first
-  writeFileSync(dud, "#!/bin/sh\nexit 1\n");
-  chmodSync(dud, 0o755);
-  const real = join(bin, "chromium");
-  writeFileSync(real, `#!/bin/sh\nexec ${chromium} "$@"\n`);
-  chmodSync(real, 0o755);
+  // without opening a DevTools port, and nothing tried the working Chrome beside it. Here the first candidate
+  // exits at once, exactly as that one does, and the launch must end on the browser behind it.
+  if (!win) {
+    const real = join(dudDir, "chromium");
+    writeFileSync(real, `#!/bin/sh\nexec ${chromium} "$@"\n`);
+    chmodSync(real, 0o755);
+  }
   const env = process.env.PATH;
-  process.env.PATH = bin;
+  process.env.PATH = dudDir;
   const dir = join(root, "fallthrough-state");
   const manager = new BrowserManager({ userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") });
   try {
-    // Playwright's build is on this machine and always comes last; what matters is the order of the two here.
-    assert.deepEqual(browserCandidates().slice(0, 2), [dud, real], "the dud is preferred, so it is what a first launch gets");
+    // Playwright's build is appended whatever else is installed, so what matters here is the first two.
+    const found = browserCandidates();
+    assert.equal(found[0], dud, "the dud is preferred, so it is what a first launch gets");
+    assert.ok(found.length > 1, `nothing behind the dud to fall through to: ${found.join(" ")}`);
     await manager.launch(true, "work");
     const rec = manager.launchRecord()!;
     children.push(rec.pid);
-    assert.equal(rec.exe, real, "the browser that started is the one recorded");
+    assert.equal(rec.exe, found[1], "the browser that started is the one recorded");
   } finally {
     process.env.PATH = env;
     await manager.release();
   }
 });
 
-test("a browser named outright is never quietly swapped for another", { skip: !chromium && "no chromium" }, async () => {
+test("a browser named outright is never quietly swapped for another", async () => {
   // Falling through is for a choice we made; someone who sets FIGMA_BROWSER_PATH made their own, and silently
   // using a different browser would answer about a profile and a login they did not ask for.
   const dir = join(root, "named-state");
-  const dud = join(root, "fallthrough", "brave");
   const manager = new BrowserManager({ executablePath: dud, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") });
   await assert.rejects(manager.launch(true, "work"), (e: Error) => {
     assert.match(e.message, /never opened a DevTools port/);
@@ -423,12 +488,8 @@ test("a browser named outright is never quietly swapped for another", { skip: !c
   });
 });
 
-// The two tests above lay out shell scripts, which Windows cannot run, so they stay a Unix affair. This one only
-// needs a browser that starts, and on Windows that is whatever the picker finds in the standard install
-// directories: it is the one place a launch, the record it writes and the close that reads it are tried end to end
-// there, and the identity in that record is what stands between a reused pid and process.kill.
-const launchable = chromium ?? (process.platform === "win32" ? browserCandidates()[0] : undefined);
-
+// A launch, the record it writes and the close that reads it, end to end on a real browser: the identity in that
+// record is what stands between a reused pid and process.kill.
 test("a launched headless browser is recorded with its identity and closed by release() from a fresh manager", { skip: !launchable && "no browser that starts" }, async () => {
   const dir = join(root, "real");
   const opts = { executablePath: launchable, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") };

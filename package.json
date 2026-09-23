@@ -13,6 +13,7 @@
   "license": "MIT",
   "type": "module",
   "main": "dist/tools.js",
+  "types": "dist/tools.d.ts",
   "bin": {
     "figma-reader-mcp": "dist/mcp.js",
     "figma-reader": "dist/cli.js"
@@ -35,7 +36,8 @@
     "corpus": "node scripts/corpus.ts",
     "test:private": "if ls test/private/*.test.ts >/dev/null 2>&1; then node --test --test-timeout=30000 test/private/*.test.ts; else case \"$FIGMA_PRIVATE_OPTIONAL\" in [1yY]*|[tT][rR][uU][eE]) echo 'test:private: no test files in test/private/, skipped (FIGMA_PRIVATE_OPTIONAL)';; *) echo 'test:private: no test files in test/private/, so this step proves nothing. Set FIGMA_PRIVATE_OPTIONAL=1 if that is on purpose.' >&2; exit 1;; esac; fi",
     "test:private:update": "node --test --test-timeout=30000 --test-update-snapshots test/private/*.test.ts",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "prepublishOnly": "npm test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

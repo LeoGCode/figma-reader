@@ -66,7 +66,13 @@ A dated result names the date after what it dates, because the two are not the s
 Node 22+. For web mode, a Chromium-family browser: the first of Brave, Chromium, Chrome found on `PATH`, or `FIGMA_BROWSER_PATH`. Playwright's "Chrome for Testing" is only a last resort because Google sign-in rejects it as insecure.
 
 ```sh
-git clone <this repo> && cd figma-reader
+npm install -g @leogcode/figma-reader     # puts figma-reader and figma-reader-mcp on PATH
+```
+
+Or without installing, for a one-off: `npx -y @leogcode/figma-reader@latest help`. To work on it instead:
+
+```sh
+git clone https://github.com/LeoGCode/figma-reader && cd figma-reader
 npm install && npm run build
 npm link    # optional: puts figma-reader and figma-reader-mcp on PATH
 ```
@@ -85,7 +91,7 @@ figma-reader screenshot <file> --node-id 8:77 --save-path out/login.png
 
 Arguments are the MCP tool arguments in kebab-case. Required strings are positional (`<file>`, then `<query>` or `<out_dir>`), booleans are bare flags (`--refresh`, `--no-refresh`) or take a value (`--refresh=false`), lists repeat or take commas (`--types FRAME,TEXT`), and `--json '{"node_id":"8:77"}'` passes raw arguments. `--` ends the options, so a query such as `--help` can follow it. Results go to stdout (pipe JSON into `jq`), errors to stderr. Exit code 0 is success, 1 a failed call, 2 bad usage. Images go to `--save-path` or, without it, to a new file in a private per-user temp directory (`$TMPDIR/figma-reader-<uid>/`, mode 0700), whose path is printed.
 
-Without `npm link`, run `node /path/to/figma-reader/dist/cli.js`. The CLI reads the same environment variables as the server (see below).
+Installed from a clone without `npm link`, run `node /path/to/figma-reader/dist/cli.js`. The CLI reads the same environment variables as the server (see below).
 
 Each CLI call is its own process. Local `.fig` files and cached snapshots answer in well under a second, but a call that needs figma.com starts the headless browser and loads the editor, so it takes tens of seconds. The browser closes when the call ends, unless an MCP server on the same profile is still using it. For many web calls in a row, the MCP server is faster.
 
@@ -99,8 +105,10 @@ Register it only in the projects that need it (writes `.mcp.json` in the project
 
 ```sh
 cd /path/to/project
-claude mcp add --scope project figma-reader -- node /path/to/figma-reader/dist/mcp.js
+claude mcp add --scope project figma-reader -- npx -y @leogcode/figma-reader@latest figma-reader-mcp
 ```
+
+Installed globally, `-- figma-reader-mcp` works instead; from a clone, `-- node /path/to/figma-reader/dist/mcp.js`.
 
 or add to the project's `.mcp.json` by hand (Claude Code expands `${VAR}`):
 
@@ -108,8 +116,8 @@ or add to the project's `.mcp.json` by hand (Claude Code expands `${VAR}`):
 {
   "mcpServers": {
     "figma-reader": {
-      "command": "node",
-      "args": ["/path/to/figma-reader/dist/mcp.js"],
+      "command": "npx",
+      "args": ["-y", "@leogcode/figma-reader@latest", "figma-reader-mcp"],
       "env": { "FIGMA_FILES_DIRS": "${PWD}/design:${HOME}/Downloads" }
     }
   }

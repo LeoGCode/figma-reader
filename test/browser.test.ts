@@ -46,6 +46,10 @@ function manager() {
 }
 
 test("a process is recognized by its start time, and a different start time is another process", async () => {
+  // Off Linux the start time is ps's lstart, which resolves to one second: this process and a child spawned in the
+  // same second carry the identical string, which is what the run below asserts. Crossing into the next second
+  // first is therefore not tidiness - it is the only way the pair is distinguishable there at all.
+  if (process.platform !== "linux") await new Promise((r) => setTimeout(r, 1050 - (Date.now() % 1000)));
   const pid = bystander();
   const start = processStart(pid);
   assert.ok(start, "start time readable");
@@ -58,6 +62,11 @@ test("a process is recognized by its start time, and a different start time is a
     const seconds = Number(start) / 100;
     assert.ok(seconds > 0 && seconds <= uptime + 1, `${start} ticks (${seconds}s) is within the uptime of ${uptime}s`);
     assert.ok(uptime - seconds < 60, `${seconds}s in, the child spawned above has just started (uptime ${uptime}s)`);
+  } else {
+    // How much this platform can tell apart, stated rather than assumed: exactly which second a process started in.
+    // Two spawned back to back are one identity, so a pid reissued inside a second is indistinguishable from its
+    // previous holder here, and only the command line in ownsProcess stands between that and process.kill.
+    assert.equal(processStart(bystander()), start, "a process started in the same second has the same start time");
   }
   assert.notEqual(processStart(process.pid), start, "this process started before its child");
   assert.ok(sameProcess(pid, start));

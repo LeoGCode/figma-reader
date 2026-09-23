@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { CdpSession, sleep, type TargetInfo } from "./cdp.ts";
 
 export interface BrowserOptions {
@@ -49,6 +49,10 @@ export function pidAlive(pid: number) {
 /**
  * Opaque start time of a process, stable for its whole life, so a pid can be told apart from a later process that
  * reuses it. Linux: /proc/<pid>/stat field 22 (starttime, clock ticks since boot); elsewhere ps's lstart.
+ *
+ * The two do not resolve alike: a tick is 10 ms, lstart is one second. Off Linux two processes started inside one
+ * second are one identity here - a parent and the child it spawns routinely are - so every check built on this is
+ * that much weaker there. ownsProcess, the one that authorises process.kill, reads the command line as well.
  */
 export function processStart(pid: number): string | undefined {
   if (!pid) return undefined;
@@ -103,7 +107,10 @@ export function sameBoot(boot: string | undefined): boolean {
 function processCmdline(pid: number): string | undefined {
   try {
     if (process.platform === "linux") return readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ");
-    return execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    // -ww, because BSD ps cuts the command at the terminal width and --user-data-dir sits behind the executable's
+    // path, which for a browser is a path inside an .app bundle: two -w mean no limit, so the profile is there to
+    // be read. A truncated line would read as a browser on some other profile, which is the answer that relaunches.
+    return execFileSync("ps", ["-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch {
     return undefined;
   }
@@ -125,7 +132,11 @@ export function processStamp(pid: number): string {
   return boot ? `${boot}|${start}` : start;
 }
 
-/** The process that wrote `stamp` (see processStamp) is still the one holding pid. */
+/**
+ * The process that wrote `stamp` (see processStamp) is still the one holding pid, as sharply as processStart can
+ * tell: off Linux a pid reissued within the same second passes. What that costs is a lease read as live or a tab
+ * left unadopted, never a signal - killing goes through ownsProcess, which does not rest on the start time alone.
+ */
 export function sameStampedProcess(pid: number, stamp: string): boolean {
   const bar = stamp.indexOf("|");
   // Stamps without a boot predate it, or come from a platform with none; they are read as bare start times.
@@ -207,7 +218,9 @@ function linkTarget(path: string): string {
   for (let i = 0; i < 10; i++) {
     try {
       const next = readlinkSync(target);
-      target = next.startsWith("/") ? next : join(dirname(target), next);
+      // isAbsolute, not a leading '/': a Windows link target is "C:\...", which join would hang off the link's own
+      // directory as "C:\...\C:\...", the same doubled drive letter a file URL's pathname produces.
+      target = isAbsolute(next) ? next : join(dirname(target), next);
     } catch {
       return target;
     }
@@ -344,8 +357,15 @@ export class BrowserManager {
    */
   private ownsProcess(pid: number, start?: string): boolean {
     if (!pidAlive(pid)) return false;
-    if (start !== undefined) return processStart(pid) === start;
-    return !!processCmdline(pid)?.includes(`--user-data-dir=${this.opts.userDataDir}`);
+    const onProfile = () => processCmdline(pid)?.includes(`--user-data-dir=${this.opts.userDataDir}`);
+    if (start === undefined) return !!onProfile();
+    if (processStart(pid) !== start) return false;
+    // On Linux the start time is measured in clock ticks and settles it. Off Linux it is ps's lstart, at one-second
+    // resolution: a pid reissued within that second carries the recorded string, and this is the only check standing
+    // between a recycled pid and process.kill. The command line is the second half of it there, and refutes only when
+    // it could be read - a browser whose arguments this user cannot see must not be left running, unmanaged and
+    // holding the profile, while a second one is launched onto it.
+    return process.platform === "linux" || onProfile() !== false;
   }
 
   private async reachable(url: string): Promise<{ webSocketDebuggerUrl: string; "User-Agent": string } | undefined> {

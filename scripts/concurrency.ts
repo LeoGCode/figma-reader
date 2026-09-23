@@ -4,9 +4,10 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { join } from "node:path";
 
 const [fileKey, nodeA, nodeB, mode = "same", count = "4"] = process.argv.slice(2);
-const server = new URL("../src/mcp.ts", import.meta.url).pathname;
+const server = join(import.meta.dirname, "..", "src", "mcp.ts");
 
 async function connect(name: string) {
   const c = new Client({ name, version: "0" });

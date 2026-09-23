@@ -41,11 +41,19 @@ jobs:
       - run: npm run test:docker
 
       # Trusted publishing (OIDC) when the package is configured to trust this repository on npmjs.com, which stores
-      # no token anywhere; NPM_TOKEN is used instead when that secret is set.
+      # no token anywhere; NPM_TOKEN is used instead when that secret is set. A version already on the registry is
+      # left alone rather than failing the run: publishing by hand and pushing the tag is a reasonable way to
+      # release, and the tag should not then report a failure for work that is done.
       - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if npm view "@leogcode/figma-reader@$version" version >/dev/null 2>&1; then
+            echo "$version is already on the registry; nothing to publish"
+            exit 0
+          fi
+          npm publish --provenance --access public
 
       - name: Create the GitHub release
         env:

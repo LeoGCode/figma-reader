@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The lowest version that runs the tests (type stripping) and the current one.
+        node: ["22.18", "24"]
+    name: node ${{ matrix.node }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+
+      # Typechecks src, test and scripts, then runs the suite from the TypeScript source.
+      - run: npm test
+
+      # A few tests skip themselves where the machine cannot answer (no chromium on the runner, no boot id off
+      # Linux, running as root). Print the count so a suite that quietly stops running is visible here.
+      - name: Report skipped tests
+        if: always()
+        run: |
+          skipped=$(node --test --test-timeout=30000 --test-reporter=tap test/*.test.ts 2>/dev/null | grep -c '# SKIP' || true)
+          echo "skipped on this runner: $skipped"
+
+      # The published package is built from src by prepack, so a build that no longer compiles is a release that
+      # cannot be made. npm pack --dry-run catches a files/bin entry pointing at something the build does not emit.
+      - run: npm run build
+      - run: npm pack --dry-run
+
+      # test/private holds real design files and is not in the repository, so the suite that reads them cannot run
+      # here. This asserts the escape hatch works rather than skipping in silence: without it the step exits 1.
+      - name: Private suite opts out cleanly
+        run: FIGMA_PRIVATE_OPTIONAL=1 npm run test:private

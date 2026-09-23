@@ -1,5 +1,7 @@
 # figma-reader
 
+[![CI](https://github.com/LeoGCode/figma-reader/actions/workflows/ci.yml/badge.svg)](https://github.com/LeoGCode/figma-reader/actions/workflows/ci.yml)
+
 Read-only Figma access for AI agents and people. **No Figma plugin, no API token, no Dev Mode seat, no Enterprise plan.**
 
 It ships in two forms that share the same tools and code. Use whichever fits:

@@ -178,7 +178,7 @@ test("use in a subdirectory says which project file it copied", async () => {
   const r = await cli(["use", "personal"], { cwd: sub });
   assert.equal(r.code, 0, r.stderr);
   assert.ok(r.stdout.includes(`copied from ${join(proj, ".figma-reader.json")}`), r.stdout);
-  assert.deepEqual(JSON.parse(readFileSync(join(sub, ".figma-reader.json"), "utf8")), { filesDirs: ["../design"], account: "personal" });
+  assert.deepEqual(JSON.parse(readFileSync(join(sub, ".figma-reader.json"), "utf8")), { filesDirs: [join("..", "design")], account: "personal" });
 });
 
 test("list-files reports how many files there are beyond the limit, and when a query matched none", async () => {

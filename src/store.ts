@@ -1,7 +1,7 @@
 // Snapshot cache: one exported .fig per file key on disk, decoded documents kept in memory.
 import { existsSync, mkdirSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { liveLeases, takeLease } from "./browser.ts";
+import { dropLease, liveLeases, takeLease } from "./browser.ts";
 import { FigDocument } from "./fig-file.ts";
 import type { FigmaWeb } from "./figma-web.ts";
 
@@ -179,7 +179,8 @@ export class SnapshotStore {
    * Wait while other processes export this key, and report the .fig the file on disk must differ from for the export
    * that wrote it to have provably begun after `since`; undefined when no other export was running. Leases of
    * processes that died are dropped by liveLeases, so a crashed holder costs one poll interval rather than the whole
-   * wait.
+   * wait - or, for a holder in another pid namespace, the silence its own stamp asks to be waited out (a minute),
+   * paid once, since its lease is gone for every later refresh too.
    *
    * The wait always buys serialization. It buys an answer only when every export that could have begun before
    * `since` was seen gone at a known instant: a lease is dropped only after its export has written the file, so
@@ -261,7 +262,7 @@ export class SnapshotStore {
     } finally {
       // The lease goes only once the export it announces has written the file, which is what lets another process
       // read the lease being gone as that export's work being on disk.
-      rmSync(lease, { force: true });
+      dropLease(lease);
       rmSync(mine, { force: true });
     }
   }

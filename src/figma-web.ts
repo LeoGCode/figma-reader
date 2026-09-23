@@ -2,7 +2,7 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { bootId, BrowserManager, liveLeases, processStart, sameBoot, sameProcess, takeLease } from "./browser.ts";
+import { bootId, BrowserManager, dropLease, liveLeases, pidNamespace, processStart, sameBoot, sameProcess, takeLease } from "./browser.ts";
 import { CdpSession, MOD, sleep, type TargetInfo } from "./cdp.ts";
 import type { Raw } from "./fig-file.ts";
 
@@ -11,10 +11,13 @@ const ORIGIN = "https://www.figma.com";
 const TAB_PREFIX = "figma-reader";
 // The mark carries our start time as well as our pid, so a tab left by an exited process is not taken for a live
 // one's after its pid is reused, and the boot that start time was measured in: a profile that restores its session
-// brings window.name back across a reboot, where the pair names an unrelated process.
+// brings window.name back across a reboot, where the pair names an unrelated process. The namespace those pids are
+// numbered in comes first, ahead of the '@' and the ':' an older build's mark begins with, so that build reads a
+// mark of ours as no mark of its own and leaves the tab alone - which is the answer that puts one process on a tab.
 const TAB_START = processStart(process.pid);
 const TAB_BOOT = bootId();
-export const TAB_MARK = `${TAB_PREFIX}${TAB_BOOT ? `@${TAB_BOOT}` : ""}:${process.pid}${TAB_START ? `:${TAB_START}` : ""}`;
+const TAB_NS = pidNamespace();
+export const TAB_MARK = `${TAB_PREFIX}${TAB_NS ? `/${TAB_NS}` : ""}${TAB_BOOT ? `@${TAB_BOOT}` : ""}:${process.pid}${TAB_START ? `:${TAB_START}` : ""}`;
 // Copy as PNG parks the image on a window global. It is namespaced per process so that two server
 // processes sharing one tab can never consume each other's capture.
 const PNG_KEY = `__figmaReaderPng_${process.pid}`;
@@ -57,17 +60,32 @@ export class FigmaApiError extends Error {
   }
 }
 
-/** Owner of a marked tab: undefined when not ours at all; pid 0 for legacy marks without one; start/boot when recorded. */
-export function markOwner(name: string): { pid: number; start?: string; boot?: string } | undefined {
+/** Owner of a marked tab: undefined when not ours at all; pid 0 for legacy marks without one; the rest when recorded. */
+export function markOwner(name: string): { pid: number; start?: string; boot?: string; ns?: string } | undefined {
   if (name === TAB_PREFIX) return { pid: 0 };
-  // The boot hangs off the prefix with '@' because a start time may itself contain ':' (ps lstart, off Linux).
-  const m = name.match(/^figma-reader(?:@([^:]+))?:(\d+)(?::(.+))?$/);
-  return m ? { pid: Number(m[2]), start: m[3], boot: m[1] } : undefined;
+  // The boot hangs off the prefix with '@' because a start time may itself contain ':' (ps lstart, off Linux), and
+  // the namespace off the prefix itself for the same reason: it has to sit where a start time cannot swallow it.
+  const m = name.match(/^figma-reader(?:\/(\d+))?(?:@([^:]+))?:(\d+)(?::(.+))?$/);
+  return m ? { pid: Number(m[3]), start: m[4], boot: m[2], ns: m[1] } : undefined;
 }
 
-/** A tab marked by a process that is no longer running (pid gone, pid reused, or another boot entirely) is free. */
-export const abandoned = (owner: { pid: number; start?: string; boot?: string }) =>
-  owner.pid === 0 || !sameBoot(owner.boot) || !sameProcess(owner.pid, owner.start);
+/**
+ * A tab marked by a process that is no longer running (pid gone, pid reused, or another boot entirely) is free.
+ *
+ * A mark from another pid namespace is not free, for the reason sameStampedProcess gives: its pid names one of our
+ * processes or none at all, and a live container's mark was read here as a dead process's. Adopting a tab another
+ * process is driving puts two of them on it, which an earlier review measured caching a file under the wrong key.
+ * What the other answer costs is one editor tab left behind by each foreign process that crashed: a lease has its
+ * heartbeat to be swept by, and window.name has nothing to offer but the mark itself.
+ */
+export function abandoned(owner: { pid: number; start?: string; boot?: string; ns?: string }): boolean {
+  if (owner.pid === 0) return true;
+  // A reboot first: window.name comes back with a restored session, where every other field names another boot's
+  // process. The namespace is an inode number the kernel hands out afresh each boot, so it cannot say that itself.
+  if (!sameBoot(owner.boot)) return true;
+  if (owner.ns !== undefined && owner.ns !== pidNamespace()) return false;
+  return !sameProcess(owner.pid, owner.start);
+}
 
 export interface RecentFile {
   key: string;
@@ -307,12 +325,12 @@ export class FigmaWeb {
 
   /** Wait for login in the window (auth cookie appears, or the window is closed), then verify headless. */
   async waitForLogin(seconds: number) {
-    const deadline = Date.now() + seconds * 1000;
+    const deadline = Date.now() + this.ms(seconds * 1000);
     while (this.browser.launchRecord()?.purpose === "login" && !this.browser.loginCookiePresent()) {
       if (Date.now() > deadline) return null;
-      await sleep(2000);
+      await sleep(this.ms(2000));
     }
-    await sleep(3000); // let the browser persist the fresh cookies before closing it
+    await sleep(this.ms(3000)); // let the browser persist the fresh cookies before closing it
     await this.browser.closeLoginWindow();
     const user = await this.whoami();
     if (!user) await this.openLogin();
@@ -441,7 +459,10 @@ export class FigmaWeb {
         const seen = await s.evaluate<string>("window.name").catch(() => "");
         const owner = markOwner(seen);
         let claimed = false;
-        if (owner !== undefined && (owner.pid === process.pid || abandoned(owner))) {
+        // Our own mark is the whole string, not the pid in it: two containers driving one browser over
+        // FIGMA_CDP_URL both number their server processes from 1, so "the pid is mine" is a thing the other
+        // one's mark says too, and it took a tab that process was driving.
+        if (owner !== undefined && (seen === TAB_MARK || abandoned(owner))) {
           // Write only while the name is still the one that was read. Writing unconditionally and re-reading let
           // two processes that both read the free mark verify their own write and both own the tab, whenever the
           // second write landed after the first process stopped looking: two real processes did exactly that.
@@ -610,7 +631,7 @@ export class FigmaWeb {
         if (g === guid && state === "completed") continue;
         await browser.send("Browser.cancelDownload", { guid: g }).catch(() => {});
       }
-      rmSync(lease, { force: true });
+      dropLease(lease);
       for (const g of seen) rmSync(join(dir, g), { force: true });
       await releaseDownloadBehavior(browser, leases, dir);
     }

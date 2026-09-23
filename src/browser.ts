@@ -4,7 +4,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { appRoot } from "./account.ts";
@@ -30,6 +30,8 @@ interface LaunchRecord {
   start?: string;
   /** bootId() when the record was written: `start` counts from boot, so it means nothing after another one. */
   boot?: string;
+  /** pidNamespace() of the process that launched it, which is the one `pid` is numbered in (see readRecord). */
+  ns?: string;
   /** Unix ms just before the launch; a login window only counts auth cookies written after it. */
   launchedAt?: number;
 }
@@ -181,19 +183,32 @@ function readPidNamespace(): string | undefined {
 }
 
 /**
- * Identity of a process for a file that outlives it: "<boot>|<start>|<ns>", or "<boot>|<start>", or the start time
- * alone where no boot id is readable. The boot belongs in it because processStart counts ticks since boot: on Linux
- * the whole pair is reproduced by unrelated processes after a reboot, and the stamp is what keeps a lease or a
+ * How often a process touches the lease files it holds, and how many missed beats make a holder no pid here can name
+ * dead. The period travels in the stamp rather than being assumed, so a build that changes it does not strand the
+ * leases of one that has not. Twelve of them, a whole minute, because the touching is a timer and the only thing
+ * that keeps it from firing is this process's own synchronous work: an export holds its lease across a 600 s CDP
+ * wait the event loop is free during, and the decode after it is the long block. A minute of silence is a holder
+ * that is gone, not one that is busy.
+ */
+export const LEASE_BEAT_MS = 5_000;
+const LEASE_BEAT_TOLERANCE = 12;
+
+/**
+ * Identity of a process for a file that outlives it: "<boot>|<start>|<ns>|<beat>", or "<boot>|<start>", or the start
+ * time alone where no boot id is readable. The boot belongs in it because processStart counts ticks since boot: on
+ * Linux the whole pair is reproduced by unrelated processes after a reboot, and the stamp is what keeps a lease or a
  * record honest. A Windows start time counts from an absolute epoch instead, so there a bare one already means only
  * one boot. The namespace belongs in it because a pid means nothing outside the one it was issued in (see
- * sameStampedProcess), and two containers sharing a bind-mounted cache have their own.
+ * sameStampedProcess), and two containers sharing a bind-mounted cache have their own. The beat is what is left to
+ * judge such a holder by once the pid is worthless (see declaredBeat), and it is only written where there is a
+ * namespace to make the pid worthless in.
  */
 export function processStamp(pid: number): string {
   const boot = bootId();
   const start = processStart(pid) ?? "";
   const ns = pidNamespace();
   // The boot's place is held even when it is unknown, so that a reader can tell the third field from the second.
-  if (ns) return `${boot ?? ""}|${start}|${ns}`;
+  if (ns) return `${boot ?? ""}|${start}|${ns}|${LEASE_BEAT_MS}`;
   return boot ? `${boot}|${start}` : start;
 }
 
@@ -205,9 +220,9 @@ export function processStamp(pid: number): string {
  *
  * A stamp from another pid namespace passes too, because there is nothing here to judge it by: its pid names one of
  * our processes or none at all, and its start time counts ticks a container's /proc reports from its own pid 1. A
- * container's pid 1 stamped 75516567 ticks while the host's pid 1 read 12, under one boot id, so the host read a
- * live holder as a pid reissued to someone else - and liveLeases then deleted its lease while its export ran. Costs
- * as above, bounded by the caller's own ceiling; the lease of a container that crashed is swept by nothing.
+ * container's pid 1 stamped 75899724 ticks while the host's pid 1 read 12, under one boot id, so the host read a
+ * live holder as a pid reissued to someone else - and liveLeases then deleted its lease while its export ran. Such a
+ * holder is judged by its heartbeat instead, which is what liveLeases asks after this returns.
  */
 export function sameStampedProcess(pid: number, stamp: string): boolean {
   const [first, second, ns] = stamp.split("|");
@@ -234,8 +249,55 @@ function removeIfUnchanged(path: string, seen: string) {
 }
 
 /**
+ * The heartbeat period, in ms, that a stamp naming another pid namespace declares (see processStamp). That is the
+ * one holder sameStampedProcess cannot judge, and so the one whose lease file's own mtime is all the evidence there
+ * is. Undefined for a stamp this process can judge by pid, and for one written before the period was part of it
+ * (0.3.0), which nothing here can tell apart from a holder that simply never touches its lease: those stay live, as
+ * they do under the build that wrote them.
+ */
+function declaredBeat(stamp: string): number | undefined {
+  const [, start, ns, beat] = stamp.split("|");
+  if (start === undefined || ns === undefined || ns === pidNamespace()) return undefined;
+  const ms = Number(beat);
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined;
+}
+
+/** What a lease judged by its heartbeat looked like when this process last read it (see stillBeating). */
+const beats = new Map<string, { mtime: number; since: number }>();
+
+/**
+ * The lease at `path` has been touched within `window` ms of running time as measured here. Every comparison is
+ * between two readings of one clock - an mtime against an mtime, and this process's own elapsed time against itself
+ * - because a cache reached across a pid namespace is reached across machines too, and an mtime held against
+ * Date.now() reads a holder whose filesystem clock runs a minute behind as long dead. A lease this process has not
+ * seen before is live: the first reading is only what the next is measured from, and that way round costs a
+ * duplicate export, where the other way round deletes a live holder's lease and reports its pre-refresh export as
+ * current.
+ *
+ * The span is monotonic running time, not wall time, because the two things wall time would count are exactly the
+ * two that are not missed beats: a clock stepped by chrony or date -s, and a suspended machine, which stops the
+ * holder's timer and this process for the same hour and leaves neither any the wiser.
+ */
+function stillBeating(path: string, window: number): boolean {
+  let mtime: number;
+  try {
+    mtime = statSync(path).mtimeMs;
+  } catch {
+    return false;
+  }
+  const now = performance.now();
+  const seen = beats.get(path);
+  if (!seen || seen.mtime !== mtime) {
+    beats.set(path, { mtime, since: now });
+    return true;
+  }
+  return now - seen.since < window;
+}
+
+/**
  * Presence files named "<pid>[-...]" holding their owner's processStamp(), under dir. Returns the live ones and
- * removes those whose process exited or whose pid now belongs to another process. Empty files predate the stamp.
+ * removes those whose process exited, whose pid now belongs to another process, or - where no pid here can say -
+ * whose heartbeat has stopped. Empty files predate the stamp.
  */
 export function liveLeases(dir: string): string[] {
   const live: string[] = [];
@@ -243,17 +305,48 @@ export function liveLeases(dir: string): string[] {
   try {
     names = readdirSync(dir);
   } catch {}
+  const byBeat = new Set<string>();
   for (const f of names) {
+    const path = join(dir, f);
     let stamp: string;
     try {
-      stamp = readFileSync(join(dir, f), "utf8");
+      stamp = readFileSync(path, "utf8");
     } catch {
       continue;
     }
-    if (sameStampedProcess(Number(f.split("-")[0]), stamp)) live.push(f);
-    else removeIfUnchanged(join(dir, f), stamp);
+    // A holder this process can name by pid is judged by that; one in another pid namespace only by its heartbeat.
+    const beat = declaredBeat(stamp);
+    if (!sameStampedProcess(Number(f.split("-")[0]), stamp) || (beat !== undefined && !stillBeating(path, beat * LEASE_BEAT_TOLERANCE))) {
+      removeIfUnchanged(path, stamp);
+      continue;
+    }
+    if (beat !== undefined) byBeat.add(path);
+    live.push(f);
   }
+  // Forget the readings of leases that are no longer here: a container on a shared cache takes a lease per export,
+  // and a server that runs for weeks would otherwise keep a reading of every one of them.
+  for (const path of beats.keys()) if (!byBeat.has(path) && dirname(path) === dir) beats.delete(path);
   return live;
+}
+
+/** Leases this process holds, the ones beatLeases keeps warm. */
+const held = new Set<string>();
+let beatTimer: NodeJS.Timeout | undefined;
+
+/**
+ * Touch every lease this process holds. This is the whole of what tells a reader in another pid namespace that the
+ * holder is still there: it has no pid of ours it can judge, and an mtime moving needs no identity at all.
+ */
+function beatLeases() {
+  const now = new Date();
+  for (const path of held) {
+    try {
+      utimesSync(path, now, now);
+    } catch {
+      // Gone: swept by a reader that gave up on us, or under a directory someone removed. Nothing left to announce.
+      held.delete(path);
+    }
+  }
 }
 
 /** Create a presence file for this process under dir (see liveLeases); returns its path. */
@@ -261,7 +354,25 @@ export function takeLease(dir: string, name = String(process.pid)): string {
   mkdirSync(dir, { recursive: true });
   const path = join(dir, name);
   writeFileSync(path, processStamp(process.pid));
+  held.add(path);
+  // Only a stamp carrying a namespace declares a beat, and only such a stamp is ever judged by one; off Linux every
+  // reader judges by pid. unref, because a client lease is held for as long as the process runs and a timer holding
+  // the loop open would stop the CLI exiting.
+  if (pidNamespace() && !beatTimer) {
+    beatTimer = setInterval(beatLeases, LEASE_BEAT_MS);
+    beatTimer.unref();
+  }
   return path;
+}
+
+/** Give up a lease this process took: it stops being announced, and stops being touched. */
+export function dropLease(path: string) {
+  held.delete(path);
+  if (!held.size && beatTimer) {
+    clearInterval(beatTimer);
+    beatTimer = undefined;
+  }
+  rmSync(path, { force: true });
 }
 
 const BROWSER_NAMES = ["brave", "brave-browser", "chromium", "chromium-browser", "google-chrome-stable", "google-chrome"];
@@ -426,7 +537,12 @@ export class BrowserManager {
       const rec = JSON.parse(raw) as LaunchRecord;
       // The record outlives reboots (it sits in the state dir) while `start` counts ticks since boot: after a
       // reboot the recorded pair can name an unrelated process, and that pair alone authorises process.kill.
-      if (sameBoot(rec.boot) && this.ownsProcess(rec.pid, rec.start)) return { raw, rec };
+      if (sameBoot(rec.boot) && this.ownsProcess(rec.pid, rec.start, rec.ns)) return { raw, rec };
+      // A record written in another pid namespace is not evidence of anything here, and deleting it is itself an
+      // act: the browser it names goes unmanaged forever, while the process that can manage it looks for a record
+      // that is gone. A live container's record was read as a dead process's and removed - it names pid 1, stamped
+      // 75899724 ticks in, and the host's pid 1 is an init that started at tick 12 - so this leaves it where it is.
+      if (rec.ns !== undefined && rec.ns !== pidNamespace()) return undefined;
     } catch {}
     // The browser exited, or its pid now belongs to an unrelated process that must never be signalled.
     removeIfUnchanged(this.recordPath, raw);
@@ -437,15 +553,20 @@ export class BrowserManager {
     return this.readRecord()?.rec;
   }
 
-  private writeRecord(r: Omit<LaunchRecord, "start" | "boot">) {
-    writeAtomic(this.recordPath, JSON.stringify({ ...r, start: processStart(r.pid), boot: bootId() } satisfies LaunchRecord));
+  private writeRecord(r: Omit<LaunchRecord, "start" | "boot" | "ns">) {
+    writeAtomic(this.recordPath, JSON.stringify({ ...r, start: processStart(r.pid), boot: bootId(), ns: pidNamespace() } satisfies LaunchRecord));
   }
 
   /**
    * pid is a browser on our profile: its start time is the recorded one or, lacking one (older records, the
    * profile lock), its command line names our profile. Anything else is a reused pid.
+   *
+   * A pid numbered in another pid namespace is one of those: it names one of our processes or none at all, and the
+   * start time recorded beside it counts from the same boot, so a collision inside one 10 ms tick is all that
+   * stands between that record and a signal sent to a process we have never heard of. Nothing here can own it.
    */
-  private ownsProcess(pid: number, start?: string): boolean {
+  private ownsProcess(pid: number, start?: string, ns?: string): boolean {
+    if (ns !== undefined && ns !== pidNamespace()) return false;
     if (!pidAlive(pid)) return false;
     const onProfile = () => processCmdline(pid)?.includes(`--user-data-dir=${this.opts.userDataDir}`);
     if (start === undefined) return !!onProfile();
@@ -691,7 +812,7 @@ export class BrowserManager {
     // PowerShell on Windows) - fifty of them while a browser takes its time to exit. What authorises the signal is
     // still the full check, once, below; a pid reused mid-wait is held onto a little longer and then not signalled.
     for (let i = 0; i < 50 && pidAlive(rec.pid); i++) await sleep(100);
-    if (this.ownsProcess(rec.pid, rec.start)) {
+    if (this.ownsProcess(rec.pid, rec.start, rec.ns)) {
       try {
         process.kill(rec.pid);
       } catch {}
@@ -716,7 +837,7 @@ export class BrowserManager {
     try {
       return await fn();
     } finally {
-      rmSync(lease, { force: true });
+      dropLease(lease);
     }
   }
 
@@ -729,7 +850,7 @@ export class BrowserManager {
   /** Unregister this server; close a launched browser when no other live server uses it. */
   async release(): Promise<void> {
     const dir = join(this.stateDir, "clients");
-    rmSync(join(dir, String(process.pid)), { force: true });
+    dropLease(join(dir, String(process.pid)));
     const others = liveLeases(dir);
     const rec = this.record();
     // Keep a login window open for the user; only tear down work browsers.

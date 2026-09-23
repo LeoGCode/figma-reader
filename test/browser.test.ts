@@ -423,9 +423,15 @@ test("a browser named outright is never quietly swapped for another", { skip: !c
   });
 });
 
-test("a launched headless browser is recorded with its identity and closed by release() from a fresh manager", { skip: !chromium && "no chromium" }, async () => {
+// The two tests above lay out shell scripts, which Windows cannot run, so they stay a Unix affair. This one only
+// needs a browser that starts, and on Windows that is whatever the picker finds in the standard install
+// directories: it is the one place a launch, the record it writes and the close that reads it are tried end to end
+// there, and the identity in that record is what stands between a reused pid and process.kill.
+const launchable = chromium ?? (process.platform === "win32" ? browserCandidates()[0] : undefined);
+
+test("a launched headless browser is recorded with its identity and closed by release() from a fresh manager", { skip: !launchable && "no browser that starts" }, async () => {
   const dir = join(root, "real");
-  const opts = { executablePath: chromium, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") };
+  const opts = { executablePath: launchable, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") };
   const first = new BrowserManager(opts);
   await first.launch(true, "work");
   const rec = first.launchRecord()!;

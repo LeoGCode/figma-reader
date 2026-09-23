@@ -390,7 +390,11 @@ export class BrowserManager {
       holder
         ? `Profile ${this.opts.userDataDir} is in use by another browser (pid ${holder}) without a DevTools port. ` +
             `Close it, or start it with --remote-debugging-port and set FIGMA_CDP_URL.`
-        : `Browser ${exe} did not expose a DevTools endpoint.`,
+        // A snap-packaged Chromium is the usual cause: /usr/bin/chromium exists and is picked, but the sandbox it
+        // runs in cannot write the profile directory we hand it, so it exits before opening the port. CI found this
+        // on a GitHub runner, where /usr/bin/chromium is exactly that wrapper.
+        : `Browser ${exe} started but never opened a DevTools port. If it is a snap or flatpak package, it cannot ` +
+          `use a profile outside its sandbox: install a native build, or set FIGMA_BROWSER_PATH to one.`,
     );
   }
 

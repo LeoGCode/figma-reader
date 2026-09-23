@@ -22,6 +22,15 @@ jobs:
           cache: npm
       - run: npm ci
 
+      # /usr/bin/chromium exists on the runner but is a snap wrapper that never opens a DevTools port, so the one
+      # test that launches a real browser would fail there and, guarded only on the file existing, could not skip
+      # either. Playwright's build is a native one and launches; the test prefers FIGMA_BROWSER_PATH.
+      - name: Install a browser the launch test can use
+        run: npx --yes playwright-core install --with-deps chromium
+      - name: Resolve its path
+        run: |
+          echo "FIGMA_BROWSER_PATH=$(node -e "console.log(require('playwright-core').chromium.executablePath())")" >> "$GITHUB_ENV"
+
       # Typechecks src, test and scripts, then runs the suite from the TypeScript source.
       - run: npm test
 

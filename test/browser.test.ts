@@ -284,7 +284,9 @@ test("a browser executable that cannot be started rejects the launch instead of 
   await assert.rejects(m.launchLoginWindow("about:blank"), /Cannot start browser .*no-such-browser.*ENOENT/);
 });
 
-const chromium = ["/usr/bin/chromium", "/usr/bin/chromium-browser"].find(existsSync);
+// FIGMA_BROWSER_PATH first, so CI can point this at a browser it knows launches: /usr/bin/chromium exists on a
+// GitHub runner but is a snap wrapper that never opens a DevTools port, which is a skip that hides the test.
+const chromium = [process.env.FIGMA_BROWSER_PATH, "/usr/bin/chromium", "/usr/bin/chromium-browser"].filter((p) => p !== undefined).find(existsSync);
 test("a launched headless browser is recorded with its identity and closed by release() from a fresh manager", { skip: !chromium && "no chromium" }, async () => {
   const dir = join(root, "real");
   const opts = { executablePath: chromium, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") };

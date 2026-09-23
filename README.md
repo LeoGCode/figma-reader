@@ -24,6 +24,30 @@ Two ways to feed it:
 
 Variables come straight out of the file, so modes, aliases and scopes are available on any plan (the REST variables endpoint is Enterprise-only).
 
+## Install
+
+Pick the line for how you want to use it. Everything below needs Node 22+, and a Chromium-family browser only for the calls that read figma.com.
+
+| You want | Run |
+| --- | --- |
+| The CLI on your PATH | `npm install -g @leogcode/figma-reader` |
+| To try it without installing | `npx -y @leogcode/figma-reader@latest help` |
+| An agent that knows how to drive it | `npx skills add https://github.com/LeoGCode/figma-reader --skill figma-reader` |
+| The MCP server in one project | `claude mcp add --scope project figma-reader -- npx -y @leogcode/figma-reader@latest figma-reader-mcp` |
+| To work on it | `git clone https://github.com/LeoGCode/figma-reader && cd figma-reader && npm install && npm run build` |
+
+The skill line writes `.agents/skills/figma-reader/` and registers it for Claude Code and the other agents that read that directory; it teaches the CLI, so it pairs with either of the first two lines. [`skills/figma-reader/SKILL.md`](skills/figma-reader/SKILL.md) is the file, if you would rather copy it in by hand or paste it into an `AGENTS.md`.
+
+First run on a file key or URL will say it is not logged in and open a normal browser window on the Figma login page. Log in there; the window closes itself and everything after that is headless. `figma-reader login --wait-seconds 300` does the same deliberately and waits for you.
+
+Working with more than one Figma login is the same two commands in each directory:
+
+```sh
+cd ~/work/acme && figma-reader use client-acme && figma-reader login
+```
+
+`use` writes `.figma-reader.json`, which binds that directory and everything below it to its own browser profile and snapshot cache, so accounts never see each other's sessions or files. Nothing is created on disk until you log in. See [Accounts](#accounts-one-figma-login-per-project).
+
 ## Tools
 
 MCP tool names and CLI commands map one to one: `figma_get_tree` is `figma-reader get-tree`.
@@ -65,19 +89,11 @@ A dated result names the date after what it dates, because the two are not the s
 
 ## Setup
 
-Node 22+. For web mode, a Chromium-family browser: the first of Brave, Chromium, Chrome found on `PATH`, or `FIGMA_BROWSER_PATH`. Playwright's "Chrome for Testing" is only a last resort because Google sign-in rejects it as insecure.
+[Install](#install) has the one-liners. This section is what each form needs beyond them.
 
-```sh
-npm install -g @leogcode/figma-reader     # puts figma-reader and figma-reader-mcp on PATH
-```
+Node 22+ throughout. For web mode, a Chromium-family browser: on Linux and macOS the first of Brave, Chromium, Chrome found on `PATH`, on Windows `brave.exe`, `chrome.exe`, `chromium.exe` or `msedge.exe` on `PATH` or in the usual install directories, or whatever `FIGMA_BROWSER_PATH` names. A browser that cannot start is passed over for the next one, and a confined build (snap, flatpak) is tried only after an ordinary one, since it cannot reach a profile outside its own sandbox. Playwright's "Chrome for Testing" is a last resort because Google sign-in rejects it as insecure.
 
-Or without installing, for a one-off: `npx -y @leogcode/figma-reader@latest help`. To work on it instead:
-
-```sh
-git clone https://github.com/LeoGCode/figma-reader && cd figma-reader
-npm install && npm run build
-npm link    # optional: puts figma-reader and figma-reader-mcp on PATH
-```
+From a clone, `npm link` puts `figma-reader` and `figma-reader-mcp` on `PATH`; without it, run `node /path/to/figma-reader/dist/cli.js`.
 
 ### CLI
 

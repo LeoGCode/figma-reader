@@ -16,7 +16,7 @@ process.env.USERPROFILE = root;
 process.env.APPDATA = join(root, "AppData", "Roaming");
 process.env.LOCALAPPDATA = join(root, "AppData", "Local");
 const { abandoned, cleanStaleDownloads, FigmaWeb, markOwner, moveDownload, releaseDownloadBehavior, TAB_MARK } = await import("../src/figma-web.ts");
-const { bootId, processStart, takeLease } = await import("../src/browser.ts");
+const { bootId, pidNamespace, processStart, takeLease } = await import("../src/browser.ts");
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -578,6 +578,22 @@ test("an abandoned tab another process marks between our read and our write stay
   assert.equal(tabs.size, 2);
 });
 
+test("a tab marked by a process of another container is left to it, pid for pid", async () => {
+  // Two containers driving one browser over FIGMA_CDP_URL both number their server processes from 1, so the pid in
+  // the other one's mark is this process's pid as well - and "the pid in it is mine" is what said the tab was ours.
+  const start = processStart(process.pid);
+  const twin = `figma-reader/${Number(pidNamespace() ?? 0) + 1}${bootId() ? `@${bootId()}` : ""}:${process.pid}${start ? `:${start}` : ""}`;
+  assert.notEqual(twin, TAB_MARK);
+  const { tabs, world } = tabWorld();
+  const theirs = await world.newTab(`${ORIGIN}/design/${KEY}/My-App`);
+  theirs.ctx.window.name = twin;
+  const { web } = fakeBrowser(world);
+  const got = await (web as any).editorTab();
+  assert.equal(theirs.ctx.window.name, twin, "the other container's mark is not overwritten");
+  assert.notEqual(got.info.id, theirs.id, "and the tab is left to it");
+  assert.equal(tabs.size, 2);
+});
+
 test("logged out: the work browser is replaced by a login window, unless another process is working in it", async () => {
   respond(401, {});
   const idle = fakeBrowser();
@@ -589,19 +605,52 @@ test("logged out: the work browser is replaced by a login window, unless another
   assert.deepEqual(shared.calls, []);
 });
 
-test("tab marks carry the owner's boot and start time, and older marks still parse", () => {
-  assert.deepEqual(markOwner("figma-reader@0f9c-boot:123:4567"), { pid: 123, start: "4567", boot: "0f9c-boot" });
-  assert.deepEqual(markOwner("figma-reader:123"), { pid: 123, start: undefined, boot: undefined });
+test("the wait for a login goes through the same scale as every other wait here", async () => {
+  // ms() says every wait and deadline in figma-web.ts goes through it. This one did not: it counted the deadline in
+  // real seconds, polled every real 2 s and then sat out a real 3 s, so the login path cost seconds of a test run
+  // that had asked for all of it to be scaled away. Unscaled, each half below takes 30 s, 2 s and 3 s.
+  const waiting = fakeBrowser({ launchRecord: () => ({ purpose: "login" }), loginCookiePresent: () => false }, { timeScale: 0.001 });
+  let began = Date.now();
+  assert.equal(await waiting.web.waitForLogin(30), null, "gave up at its deadline");
+  assert.ok(Date.now() - began < 1_000, `a 30 s deadline polled every 2 s, scaled by 0.001, took ${Date.now() - began} ms`);
+
+  loggedIn();
+  const done = fakeBrowser(
+    { launchRecord: () => ({ purpose: "login" }), loginCookiePresent: () => true, closeLoginWindow: async () => {} },
+    { timeScale: 0.001 },
+  );
+  began = Date.now();
+  assert.deepEqual(await done.web.waitForLogin(30), user, "and the cookie is there");
+  assert.ok(Date.now() - began < 1_000, `letting the browser persist the cookies took ${Date.now() - began} ms`);
+});
+
+test("tab marks carry the owner's namespace, boot and start time, and older marks still parse", () => {
+  assert.deepEqual(markOwner("figma-reader@0f9c-boot:123:4567"), { pid: 123, start: "4567", boot: "0f9c-boot", ns: undefined });
+  assert.deepEqual(markOwner("figma-reader/4026531836@0f9c-boot:123:4567"), { pid: 123, start: "4567", boot: "0f9c-boot", ns: "4026531836" });
+  assert.deepEqual(markOwner("figma-reader:123"), { pid: 123, start: undefined, boot: undefined, ns: undefined });
   // ps lstart (non-Linux) contains spaces and colons.
-  assert.deepEqual(markOwner("figma-reader:123:Mon Sep 22 10:00:00 2026"), { pid: 123, start: "Mon Sep 22 10:00:00 2026", boot: undefined });
+  assert.deepEqual(markOwner("figma-reader:123:Mon Sep 22 10:00:00 2026"), { pid: 123, start: "Mon Sep 22 10:00:00 2026", boot: undefined, ns: undefined });
   assert.deepEqual(markOwner("figma-reader@0f9c-boot:123:Mon Sep 22 10:00:00 2026"), {
     pid: 123,
     start: "Mon Sep 22 10:00:00 2026",
     boot: "0f9c-boot",
+    ns: undefined,
   });
   assert.deepEqual(markOwner("figma-reader"), { pid: 0 });
-  for (const name of ["", "other-app:1", "figma-reader:x", "figma-reader-1", "figma-reader@boot"]) assert.equal(markOwner(name), undefined, name);
-  assert.deepEqual(markOwner(TAB_MARK), { pid: process.pid, start: processStart(process.pid), boot: bootId() }, "our own mark round-trips");
+  for (const name of ["", "other-app:1", "figma-reader:x", "figma-reader-1", "figma-reader@boot", "figma-reader/4026531836"])
+    assert.equal(markOwner(name), undefined, name);
+  assert.deepEqual(
+    markOwner(TAB_MARK),
+    { pid: process.pid, start: processStart(process.pid), boot: bootId(), ns: pidNamespace() },
+    "our own mark round-trips",
+  );
+  // What 0.3.0 makes of a mark of ours, which decides whether the namespace may go here at all: its pattern is
+  // anchored on the prefix followed by '@' or ':', so a mark carrying one does not parse there and markOwner
+  // answers undefined - the answer that leaves the tab alone. Any mark it did parse it would judge by pid alone,
+  // and adopt a live container's tab. Everything it wrote is still parsed here.
+  const v030 = /^figma-reader(?:@([^:]+))?:(\d+)(?::(.+))?$/;
+  assert.equal(v030.test("figma-reader/4026531836@0f9c-boot:123:4567"), false, "0.3.0 does not read a namespaced mark as its own");
+  assert.ok(v030.test("figma-reader@0f9c-boot:123:4567"));
 });
 
 test("a tab is free only when its owner is gone, including when the owner's pid was reused", async (t) => {
@@ -618,6 +667,13 @@ test("a tab is free only when its owner is gone, including when the owner's pid 
   // same pair names an unrelated process after a reboot.
   assert.equal(abandoned({ pid, start, boot: bootId() }), false, "this boot");
   assert.equal(abandoned({ pid, start, boot: "0f9c-another-boot" }), bootId() !== undefined, "another boot");
+  // A mark from another pid namespace names a pid numbered there: one of our processes, or none. A container's
+  // pid 1, alive, reads here as the host's init started 75899712 ticks earlier, so the pair below is exactly what
+  // a live container's mark looks like from outside - and nothing here can tell it from a dead one's.
+  const elsewhere = String(Number(pidNamespace() ?? 0) + 1);
+  assert.equal(abandoned({ pid, start: `${start}0`, ns: elsewhere }), false, "another namespace: nothing here can judge it");
+  assert.equal(abandoned({ pid, start: `${start}0`, ns: pidNamespace() }), true, "our own namespace: the pid still settles it");
+  assert.equal(abandoned({ pid, start, boot: "0f9c-another-boot", ns: elsewhere }), bootId() !== undefined, "a reboot is judged before the namespace");
   child.kill();
   await new Promise((r) => child.once("exit", r));
   assert.equal(abandoned({ pid, start }), true, "the owner exited");

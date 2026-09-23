@@ -11,11 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const root = mkdtempSync(join(tmpdir(), "figma-reader-test-"));
-// Never touch this user's real state, cache or data directories. Which variable that takes differs by platform:
-// os.homedir() reads USERPROFILE on Windows and HOME everywhere else, and the Windows directories are named by
-// APPDATA and LOCALAPPDATA. HOME alone redirected nothing on Windows, where a manager given no stateDir of its
-// own would have written the runner's own profile.
-for (const v of ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"]) process.env[v] = root;
+process.env.HOME = root; // never touch the real ~/.local/state or ~/.cache
 const win = process.platform === "win32";
 const { bootId, BrowserManager, browserCandidates, confinedPath, demoteConfined, liveLeases, pidAlive, processStart, profileHasLoginCookie, sameProcess, takeLease } =
   await import("../src/browser.ts");
@@ -498,25 +494,40 @@ test("a launched headless browser is recorded with its identity and closed by re
 });
 
 // TEMPORARY PROBE - remove before review.
-test("probe: what a running browser leaves in a profile on Windows, and who can be asked about it", { skip: !win && "windows only" }, async () => {
-  await new Promise<void>((r) => {
-    const c = spawn(dud, ["--remote-debugging-port=0", "--user-data-dir=x", "about:blank"], { stdio: "ignore" });
-    c.on("error", (e: any) => (console.log("PROBE node-as-browser error:", e.code, e.message), r()));
-    c.on("exit", (code) => (console.log("PROBE node-as-browser exit:", code), r()));
-  });
+test("probe: which redirected variables a real browser still starts under, and what it leaves in a profile", { skip: !win && "windows only" }, async () => {
   if (!launchable) return;
-  const dir = join(root, "probe-profile");
-  const profile = join(dir, "profile");
-  const m = new BrowserManager({ executablePath: launchable, userDataDir: profile, headless: true, stateDir: join(dir, "state") });
-  await m.launch(true, "work");
-  const pid = m.launchRecord()!.pid;
-  console.log("PROBE profile entries:", JSON.stringify(readdirSync(profile)));
-  console.log("PROBE Default entries:", JSON.stringify(readdirSync(join(profile, "Default"))));
-  const ps = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const expr = `Get-CimInstance Win32_Process -Filter "Name='${launchable.split("\\").pop()}'" | ForEach-Object { "$($_.ProcessId) $($_.CommandLine)" }`;
-  const started = Date.now();
-  const out = execFileSync(ps, ["-NoProfile", "-NonInteractive", "-Command", expr], { encoding: "utf8" });
-  const holders = out.split("\n").filter((l) => l.includes(`--user-data-dir=${profile}`));
-  console.log("PROBE recorded pid:", pid, "processes naming this profile:", JSON.stringify(holders.map((l) => l.trim().split(" ")[0])), `in ${Date.now() - started}ms`);
-  await m.release();
+  // Outside root, so a browser that never comes up cannot hold the temp directory open against after()'s cleanup.
+  const sandbox = mkdtempSync(join(tmpdir(), "figma-reader-probe-"));
+  const redirect = (v: string) => (v === "APPDATA" ? join(sandbox, "AppData", "Roaming") : v === "LOCALAPPDATA" ? join(sandbox, "AppData", "Local") : sandbox);
+  const cases = [[], ["USERPROFILE"], ["APPDATA", "LOCALAPPDATA"], ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"]];
+  for (const [i, vars] of cases.entries()) {
+    const saved = vars.map((v) => [v, process.env[v]] as const);
+    for (const v of vars) {
+      process.env[v] = redirect(v);
+      mkdirSync(redirect(v), { recursive: true });
+    }
+    const dir = join(sandbox, `case${i}`);
+    const profile = join(dir, "profile");
+    const m = new BrowserManager({ executablePath: launchable, userDataDir: profile, headless: true, stateDir: join(dir, "state") });
+    const started = Date.now();
+    try {
+      await m.launch(true, "work");
+      console.log(`PROBE redirect [${vars.join(",")}]: started in ${Date.now() - started}ms`);
+      if (i === 0) {
+        console.log("PROBE profile entries:", JSON.stringify(readdirSync(profile)));
+        console.log("PROBE Default entries:", JSON.stringify(readdirSync(join(profile, "Default"))));
+        const ps = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+        const expr = `Get-CimInstance Win32_Process -Filter "Name='${launchable.split("\\").pop()}'" | ForEach-Object { "$($_.ProcessId) $($_.CommandLine)" }`;
+        const asked = Date.now();
+        const out = execFileSync(ps, ["-NoProfile", "-NonInteractive", "-Command", expr], { encoding: "utf8" });
+        const holders = out.split("\n").filter((l) => l.includes(`--user-data-dir=${profile}`));
+        console.log("PROBE recorded pid:", m.launchRecord()!.pid, "naming this profile:", JSON.stringify(holders.map((l) => l.trim().split(" ")[0])), `in ${Date.now() - asked}ms`);
+      }
+      await m.release();
+    } catch (e) {
+      console.log(`PROBE redirect [${vars.join(",")}]: FAILED in ${Date.now() - started}ms`);
+    } finally {
+      for (const [v, was] of saved) if (was !== undefined) process.env[v] = was;
+    }
+  }
 });

@@ -9,10 +9,12 @@ import { join } from "node:path";
 import vm from "node:vm";
 
 const root = mkdtempSync(join(tmpdir(), "figma-reader-test-"));
-// Never touch this user's real state, cache or data directories. Which variable that takes differs by platform:
-// os.homedir() reads USERPROFILE on Windows and HOME everywhere else, and the Windows directories are named by
-// APPDATA and LOCALAPPDATA. HOME alone redirected nothing on Windows.
-for (const v of ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"]) process.env[v] = root;
+// Never touch the real state, cache or data directories. HOME is not what Windows reads: os.homedir() takes
+// USERPROFILE there, and the roots are built from APPDATA and LOCALAPPDATA.
+process.env.HOME = root;
+process.env.USERPROFILE = root;
+process.env.APPDATA = join(root, "AppData", "Roaming");
+process.env.LOCALAPPDATA = join(root, "AppData", "Local");
 const { abandoned, cleanStaleDownloads, FigmaWeb, markOwner, moveDownload, releaseDownloadBehavior, TAB_MARK } = await import("../src/figma-web.ts");
 const { bootId, processStart, takeLease } = await import("../src/browser.ts");
 

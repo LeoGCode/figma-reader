@@ -88,7 +88,7 @@ test("only the tools that cannot write are published as read-only", async () => 
     "figma_get_variables", // out_file
     "figma_login", // opens a browser window and signs the profile in
     "figma_screenshot", // save_path
-    "figma_status", // records the account's Figma login under ~/.local/share
+    "figma_status", // records the account's Figma login in the data directory
   ]);
   const readOnly = published.filter((t) => t.annotations?.readOnlyHint === true).map((t) => t.name).sort();
   assert.deepEqual(readOnly, [

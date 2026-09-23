@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { pidNamespace, processStamp, takeLease } from "../src/browser.ts";
+import { LEASE_BEAT_MS, pidNamespace, processStamp, takeLease } from "../src/browser.ts";
 import type { FigmaWeb } from "../src/figma-web.ts";
 import { LEASE_POLL_MS, SnapshotStore } from "../src/store.ts";
 import { figBytes } from "./fixtures.ts";
@@ -299,11 +299,31 @@ describe("SnapshotStore between processes", () => {
     }
   };
 
-  /** The same stamp as written by a process whose pids are numbered in another pid namespace (see processStamp). */
-  const inAnotherNamespace = (stamp: string) => {
+  /**
+   * The same stamp as written by a process whose pids are numbered in another pid namespace (see processStamp),
+   * declaring `beat` as the period it touches its lease with. The real period is five seconds and the silence that
+   * buries a holder is twelve of them, which no test can sit through; a small one changes how long that silence
+   * has to last and nothing else about the rule.
+   */
+  const inAnotherNamespace = (stamp: string, beat = LEASE_BEAT_MS) => {
     const [first, second] = stamp.split("|");
     const ns = Number(pidNamespace() ?? 0) + 1;
-    return second === undefined ? `|${first}|${ns}` : `${first}|${second}|${ns}`;
+    return `${second === undefined ? `|${first}` : `${first}|${second}`}|${ns}|${beat}`;
+  };
+
+  /** A lease of a holder in another namespace, as a container exporting this key leaves one. */
+  const foreignHolder = (dir: string, tag: string, beat?: number) => {
+    const leases = join(dir, "exports", "K");
+    mkdirSync(leases, { recursive: true });
+    const lease = join(leases, `1-${Date.now()}-${tag}`);
+    writeFileSync(lease, inAnotherNamespace(processStamp(process.pid), beat));
+    return lease;
+  };
+
+  /** One beat of a holder that is still there, as its own timer sends it (see beatLeases). */
+  const beat = (lease: string) => {
+    const now = new Date();
+    utimesSync(lease, now, now);
   };
 
   /**
@@ -507,10 +527,7 @@ describe("SnapshotStore between processes", () => {
     // clock ticks since boot while the host's pid 1 read 12, under the one boot id, so the host judged a live
     // holder a pid reissued to someone else - and deleted its lease. That takes the floor with a pre-refresh export
     // still writing, whose file then answers the refresh.
-    const leases = join(dir, "exports", "K");
-    mkdirSync(leases, { recursive: true });
-    const lease = join(leases, `1-${Date.now()}-container`);
-    writeFileSync(lease, inAnotherNamespace(processStamp(process.pid)));
+    const lease = foreignHolder(dir, "container");
     const store = new SnapshotStore(x.web, dir, HOUR);
     const refreshed = store.get("K", true);
     // Polls rather than a poll of this test's own: a store that judged the lease dead stops polling at once, and
@@ -520,6 +537,40 @@ describe("SnapshotStore between processes", () => {
     assert.ok(existsSync(lease), "and leaving alone the lease it has nothing to judge by");
     rmSync(lease, { force: true });
     assert.equal(label(await refreshed), "export 1");
+  });
+
+  it("keeps waiting for a holder in another namespace for as long as it keeps touching its lease", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    // The lease of a holder no pid here can judge is aged out by its heartbeat, and this is the holder the age
+    // must not reach: a server in a container is one process for hours, and its client lease is taken once at
+    // startup. Any rule that reads the lease's age instead of its beat collects it while it works.
+    const lease = foreignHolder(dir, "long-lived", 20);
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    const refreshed = store.get("K", true);
+    for (let i = 0; i < 6; i++) {
+      beat(lease); // its own timer, at six times the silence it would be dropped after
+      await polls(1);
+    }
+    assert.deepEqual(x.calls, [], "still waiting for the other container's export");
+    assert.ok(existsSync(lease), "and its lease is still there");
+    rmSync(lease, { force: true });
+    assert.equal(label(await refreshed), "export 1");
+  });
+
+  it("drops the lease of a holder in another namespace whose heartbeat stopped, and leaves it dropped", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    // A container that crashes leaves a lease nothing here can judge, and before this nothing collected one: every
+    // refresh of that key waited out the whole 600 s ceiling before exporting, because the ceiling is per call.
+    // Measured against a real pid namespace, on a lease left by a process that had exited: 2 s of a 2 s ceiling,
+    // three refreshes in a row. What it costs now is one silence, once.
+    const lease = foreignHolder(dir, "crashed", 20);
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    assert.equal(label(await store.get("K", true)), "export 1");
+    assert.ok(!existsSync(lease), "the lease of a holder that stopped saying it was there is gone");
+    assert.equal(label(await store.get("K", true)), "export 2");
+    assert.deepEqual(x.calls, ["K", "K"], "and the refresh after it waits for nothing");
   });
 
   it(

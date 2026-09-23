@@ -2,10 +2,10 @@
 // older copy, so each rule is pinned against a fake exporter that counts its calls.
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { processStamp, takeLease } from "../src/browser.ts";
+import { pidNamespace, processStamp, takeLease } from "../src/browser.ts";
 import type { FigmaWeb } from "../src/figma-web.ts";
 import { LEASE_POLL_MS, SnapshotStore } from "../src/store.ts";
 import { figBytes } from "./fixtures.ts";
@@ -285,13 +285,48 @@ describe("SnapshotStore between processes", () => {
     const leases = join(dir, "exports", "K");
     const probe = join(leases, `1-${Date.now()}-probe`);
     mkdirSync(leases, { recursive: true });
-    writeFileSync(probe, processStamp(process.pid));
+    // Planted by rename, because writeFileSync creates the file and then writes it: a poll landing in between read
+    // an empty stamp, which liveLeases reads as a live holder and never removes, so this waited out its 5 s while
+    // the store's own wait waited for a lease that was never going away - a 30 s timeout instead of an assertion.
+    // The staging name is outside the lease directory, where a poll would judge it a lease and delete it.
+    const staged = join(dir, "exports", "probe.tmp");
+    writeFileSync(staged, processStamp(process.pid));
+    renameSync(staged, probe);
     const deadline = Date.now() + 5_000;
     while (existsSync(probe)) {
       if (Date.now() > deadline) throw new Error("the store did not poll for leases within 5s");
       await new Promise((r) => setTimeout(r, 5));
     }
   };
+
+  /** The same stamp as written by a process whose pids are numbered in another pid namespace (see processStamp). */
+  const inAnotherNamespace = (stamp: string) => {
+    const [first, second] = stamp.split("|");
+    const ns = Number(pidNamespace() ?? 0) + 1;
+    return second === undefined ? `|${first}|${ns}` : `${first}|${second}|${ns}`;
+  };
+
+  /**
+   * The error statSync gives for a path it cannot read for a reason other than there being no file, or undefined
+   * where this platform offers none. The real ones cannot be arranged here - ESTALE on a shared cache whose server
+   * restarted, EIO, the EPERM Windows answers while a delete is pending - so the stand-in is a link that points at
+   * itself, which an unprivileged Windows process may not be allowed to make.
+   */
+  const UNREADABLE_CODE = (() => {
+    const path = join(tempDir(), "K.fig");
+    try {
+      symlinkSync(basename(path), path);
+    } catch {
+      return undefined;
+    }
+    try {
+      statSync(path);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      return code === "ENOENT" ? undefined : code;
+    }
+    return undefined;
+  })();
 
   it("does not answer a refresh with an export whose lease is stamped after the refresh by a clock that stepped back", async () => {
     const x = exporter();
@@ -462,6 +497,168 @@ describe("SnapshotStore between processes", () => {
     const store = new SnapshotStore(x.web, dir, HOUR);
     assert.equal(label(await store.get("K", true)), "export 1");
     assert.deepEqual(x.calls, ["K"]);
+  });
+
+  it("waits for an export held in another pid namespace instead of dropping its lease as dead", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    // Two containers sharing a bind-mounted cache have their own pid namespaces (the download temp name already
+    // says so), and a pid in one names another process in the other, or none. A container's pid 1 stamped 75516567
+    // clock ticks since boot while the host's pid 1 read 12, under the one boot id, so the host judged a live
+    // holder a pid reissued to someone else - and deleted its lease. That takes the floor with a pre-refresh export
+    // still writing, whose file then answers the refresh.
+    const leases = join(dir, "exports", "K");
+    mkdirSync(leases, { recursive: true });
+    const lease = join(leases, `1-${Date.now()}-container`);
+    writeFileSync(lease, inAnotherNamespace(processStamp(process.pid)));
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    const refreshed = store.get("K", true);
+    // Polls rather than a poll of this test's own: a store that judged the lease dead stops polling at once, and
+    // waiting for a poll that is never coming says only that, where these two assertions say what went wrong.
+    await polls(3);
+    assert.deepEqual(x.calls, [], "waiting for the other container's export");
+    assert.ok(existsSync(lease), "and leaving alone the lease it has nothing to judge by");
+    rmSync(lease, { force: true });
+    assert.equal(label(await refreshed), "export 1");
+  });
+
+  it(
+    "does not answer a refresh when the .fig could not be read at the instant the floor was taken",
+    { skip: !UNREADABLE_CODE && "nothing here makes statSync fail for a reason other than the file not being there" },
+    async () => {
+      const x = exporter();
+      const dir = tempDir();
+      // Every statSync error read as "there is no file", and no file is a floor that anything on disk clears: a
+      // reading that failed then answered the refresh with whatever the older export had left. A reading says
+      // nothing unless it was taken.
+      symlinkSync("K.fig", join(dir, "K.fig"));
+      const older = holder(dir, Date.now(), "older");
+      await polls(1);
+      const store = new SnapshotStore(x.web, dir, HOUR);
+      const refreshed = store.get("K", true);
+      await polled(dir);
+      const newer = holder(dir, Date.now(), "newer");
+      await polled(dir);
+      // The floor is taken at the instant the older export is seen gone, and here it cannot be read at all.
+      rmSync(older, { force: true });
+      await polled(dir);
+      rmSync(join(dir, "K.fig"));
+      writeFileSync(join(dir, "K.fig"), fig("older export"));
+      rmSync(newer, { force: true });
+      assert.equal(label(await refreshed), "export 1");
+      assert.deepEqual(x.calls, ["K"]);
+    },
+  );
+
+  it("does not answer a refresh from the file on disk when it gave up waiting for another export", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    writeFileSync(join(dir, "K.fig"), fig("pre-refresh"));
+    // A holder that never goes, and a ceiling of no wait at all: the real one is ten minutes, which no test can
+    // wait out. What the ceiling leaves is an export that is still running and began before this refresh, so the
+    // file on disk is either that export's or the one it is about to rename over - neither answers this refresh.
+    const held = holder(dir, Date.now(), "never-goes");
+    const store = new SnapshotStore(x.web, dir, HOUR, 4, 0);
+    assert.equal(label(await store.get("K", true)), "export 1");
+    assert.deepEqual(x.calls, ["K"]);
+    rmSync(held, { force: true });
+  });
+
+  it("answers with the file its own export wrote, not with whatever stands at the snapshot path", async () => {
+    // Every process on this cache renames its own export onto the one path, so the snapshot read back after an
+    // export is whatever renamed there last: a rival renaming continuously answered 39 of 40 refreshes with a file
+    // this process had not exported, and at the ceiling that rival is the export the wait just gave up on.
+    const dir = tempDir();
+    const calls: string[] = [];
+    const web = {
+      async saveLocalCopy(fileKey: string, path: string) {
+        calls.push(fileKey);
+        writeFileSync(path, fig("mine"));
+        writeFileSync(join(dir, `${fileKey}.fig`), fig("another process"));
+      },
+    } as unknown as FigmaWeb;
+    const store = new SnapshotStore(web, dir, HOUR);
+    assert.equal(label(await store.get("K", true)), "mine");
+    assert.deepEqual(calls, ["K"]);
+    assert.equal(label(store.peek("K")!), "mine", "and leaves its own export as the snapshot");
+  });
+
+  it("does not answer a refresh with a .fig that has gone from the cache since the floor was read", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    // What answers the refresh is a file that differs from the one the floor read, and no file is not one: a cache
+    // being swept, or another process removing a snapshot it could not decode, would otherwise read as an export
+    // that began after the refresh and be answered with a decode of a file that is not there.
+    writeFileSync(join(dir, "K.fig"), fig("pre-refresh"));
+    const older = holder(dir, Date.now(), "older");
+    await polls(1);
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    const refreshed = store.get("K", true);
+    await polled(dir);
+    const newer = holder(dir, Date.now(), "newer");
+    await polled(dir);
+    rmSync(older, { force: true });
+    await polled(dir);
+    rmSync(join(dir, "K.fig"));
+    rmSync(newer, { force: true });
+    assert.equal(label(await refreshed), "export 1");
+    assert.deepEqual(x.calls, ["K"]);
+  });
+
+  it("answers a refresh with an export whose file carries the mtime of the one it replaced", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    // Two readings of the .fig are compared, and mtime alone is not one of them: a replacement written within the
+    // mtime granularity, or by a writer that preserved it, carries the old time and differs only in size. The
+    // floor is a reading of a file that is already there, which is what makes the pair the whole comparison.
+    writeFileSync(join(dir, "K.fig"), fig("pre-refresh"));
+    const kept = new Date(1_000_000_000_000);
+    utimesSync(join(dir, "K.fig"), kept, kept);
+    const before = statSync(join(dir, "K.fig")).size;
+    const older = holder(dir, Date.now(), "older");
+    await polls(1);
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    const refreshed = store.get("K", true);
+    await polled(dir);
+    const newer = holder(dir, Date.now(), "newer");
+    await polled(dir);
+    rmSync(older, { force: true });
+    await polled(dir);
+    writeFileSync(join(dir, "K.fig"), fig("the newer export, at greater length"));
+    utimesSync(join(dir, "K.fig"), kept, kept);
+    const after = statSync(join(dir, "K.fig"));
+    assert.equal(after.mtimeMs, kept.getTime(), "the same mtime");
+    assert.notEqual(after.size, before, "and a different size, which is all there is to tell them apart");
+    rmSync(newer, { force: true });
+    assert.equal(label(await refreshed), "the newer export, at greater length");
+    assert.deepEqual(x.calls, [], "the wait bought an answer, not only serialization");
+  });
+
+  it("answers a refresh with an export whose file is the size of the one it replaced", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    // The other half of the pair: two exports of the same design differ by a byte in a name and not in length, so
+    // size alone says they are one file, and the refresh pays for an export it need not have made.
+    writeFileSync(join(dir, "K.fig"), fig("older export"));
+    const old = new Date(Date.now() - HOUR);
+    utimesSync(join(dir, "K.fig"), old, old);
+    const before = statSync(join(dir, "K.fig"));
+    const older = holder(dir, Date.now(), "older");
+    await polls(1);
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    const refreshed = store.get("K", true);
+    await polled(dir);
+    const newer = holder(dir, Date.now(), "newer");
+    await polled(dir);
+    rmSync(older, { force: true });
+    await polled(dir);
+    writeFileSync(join(dir, "K.fig"), fig("newer export"));
+    const after = statSync(join(dir, "K.fig"));
+    assert.equal(after.size, before.size, "the same size");
+    assert.notEqual(after.mtimeMs, before.mtimeMs, "and a different mtime, which is all there is to tell them apart");
+    rmSync(newer, { force: true });
+    assert.equal(label(await refreshed), "newer export");
+    assert.deepEqual(x.calls, [], "the wait bought an answer, not only serialization");
   });
 });
 

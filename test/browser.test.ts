@@ -332,23 +332,24 @@ test("a browser is chosen by what can run, and a confined build only as a last r
     chmodSync(p, mode);
     return p;
   };
-  put("a", "chromium", 0o644); // there, not runnable
-  mkdirSync(join(bin, "a", "google-chrome"));  // a directory of that name
-  const chrome = put("b", "google-chrome-stable", 0o755);
-  const brave = put("b", "brave", 0o755);
-  const env = process.env.PATH;
-  process.env.PATH = `${join(bin, "a")}:${join(bin, "b")}`;
-  try {
-    const found = browserCandidates();
-    // brave before google-chrome-stable is the declared preference; neither of the two unusable files appears.
-    assert.deepEqual(found.slice(0, 2), [brave, chrome]);
-    assert.ok(!found.includes(join(bin, "a", "chromium")), "a file that cannot be executed is not a browser");
-    assert.ok(!found.includes(join(bin, "a", "google-chrome")), "nor is a directory");
-    // Playwright's build is refused by Google sign-in, so it comes last whatever else is installed.
-    assert.ok(found.length === 2 || found[found.length - 1].includes("ms-playwright"), found.join(" "));
-  } finally {
-    process.env.PATH = env;
-  }
+  // The names this platform looks for: Windows has no google-chrome-stable, and looks for an .exe.
+  const win = process.platform === "win32";
+  const [braveName, chromeName, chromiumName] = win ? ["brave.exe", "chrome.exe", "chromium.exe"] : ["brave", "google-chrome-stable", "chromium"];
+  // Windows has no execute bit: fs.access(X_OK) succeeds for every file that exists, so "there, not runnable" is
+  // not a state the picker can recognise there, and such a candidate is dropped by failing to launch instead.
+  if (!win) put("a", chromiumName, 0o644); // there, not runnable
+  mkdirSync(join(bin, "a", chromeName));  // a directory of that name
+  const chrome = put("b", chromeName, 0o755);
+  const brave = put("b", braveName, 0o755);
+  // The directories are handed in rather than arranged behind the code's back: Windows searches the standard
+  // install directories besides PATH, so emptying PATH still left the runner's own Chrome and Edge in front.
+  const found = browserCandidates([join(bin, "a"), join(bin, "b")]);
+  // brave before the Chrome spelling is the declared preference; neither of the two unusable files appears.
+  assert.deepEqual(found.slice(0, 2), [brave, chrome]);
+  if (!win) assert.ok(!found.includes(join(bin, "a", chromiumName)), "a file that cannot be executed is not a browser");
+  assert.ok(!found.includes(join(bin, "a", chromeName)), "nor is a directory");
+  // Playwright's build is refused by Google sign-in, so it comes last whatever else is installed.
+  assert.ok(found.length === 2 || found[found.length - 1].includes("ms-playwright"), found.join(" "));
   // The ordering, which needs paths that no test machine has: a snap is preferred by name (chromium before
   // google-chrome-stable) and must still end up behind it, while staying in the list in case it is all there is.
   assert.deepEqual(

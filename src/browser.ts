@@ -233,19 +233,25 @@ const sandboxed = (path: string) => confinedPath(linkTarget(path));
 export const demoteConfined = (paths: string[]) => [...paths.filter((p) => !sandboxed(p)), ...paths.filter(sandboxed)];
 
 /**
+ * Every directory a browser is looked for in. One function rather than two reads inside the search, so that a test
+ * can hand in a directory of its own: emptying PATH is no longer enough on Windows, where the install directories
+ * above put the machine's real Chrome and Edge in front of anything a test lays out.
+ */
+export const browserSearchDirs = () => [...pathEntries(), ...(onWindows() ? windowsDirs() : [])];
+
+/**
  * Installed browsers, best first. Existence is not usability -- a file can be there, be a directory, lack the execute
  * bit, or be a confined package that cannot use our profile -- and only launching settles it, so this returns every
  * candidate and launch() works down the list. Playwright's build ("Chrome for Testing") is last whatever else is
  * found: Google sign-in refuses it as insecure, which breaks "Continue with Google" on figma.com.
  */
-export function browserCandidates(): string[] {
+export function browserCandidates(dirs = browserSearchDirs()): string[] {
   const found: string[] = [];
   // One browser is on PATH under several names once directories are merged: on Debian /bin links to /usr/bin, so
   // /bin/chromium and /usr/bin/chromium are one file and trying both is one failed launch paid for twice. The first
   // spelling is what gets reported, since that is the one a user would recognise.
   const seen = new Set<string>();
   const names = onWindows() ? WINDOWS_NAMES : BROWSER_NAMES;
-  const dirs = [...pathEntries(), ...(onWindows() ? windowsDirs() : [])];
   for (const name of names) {
     for (const dir of dirs) {
       const path = join(dir, name);

@@ -12,7 +12,7 @@ import { join } from "node:path";
 
 const root = mkdtempSync(join(tmpdir(), "figma-reader-test-"));
 process.env.HOME = root; // never touch the real ~/.local/state or ~/.cache
-const { bootId, BrowserManager, liveLeases, pidAlive, processStart, profileHasLoginCookie, sameProcess, takeLease } =
+const { bootId, BrowserManager, browserCandidates, confinedPath, demoteConfined, liveLeases, pidAlive, processStart, profileHasLoginCookie, sameProcess, takeLease } =
   await import("../src/browser.ts");
 
 const children: number[] = [];
@@ -286,7 +286,95 @@ test("a browser executable that cannot be started rejects the launch instead of 
 
 // FIGMA_BROWSER_PATH first, so CI can point this at a browser it knows launches: /usr/bin/chromium exists on a
 // GitHub runner but is a snap wrapper that never opens a DevTools port, which is a skip that hides the test.
+test("a browser is chosen by what can run, and a confined build only as a last resort", () => {
+  // existsSync was the only test, so a directory, a file without the execute bit and a snap wrapper all counted as
+  // an installed browser. The snap is the one that bites: on Ubuntu /usr/bin/chromium is usually a link into one,
+  // it was preferred over a native Chrome beside it, and it exits before opening a DevTools port.
+  const bin = join(root, "picker");
+  mkdirSync(join(bin, "a"), { recursive: true });
+  mkdirSync(join(bin, "b"), { recursive: true });
+  const put = (dir: string, name: string, mode: number) => {
+    const p = join(bin, dir, name);
+    writeFileSync(p, "#!/bin/sh\nexit 1\n");
+    chmodSync(p, mode);
+    return p;
+  };
+  put("a", "chromium", 0o644); // there, not runnable
+  mkdirSync(join(bin, "a", "google-chrome"));  // a directory of that name
+  const chrome = put("b", "google-chrome-stable", 0o755);
+  const brave = put("b", "brave", 0o755);
+  const env = process.env.PATH;
+  process.env.PATH = `${join(bin, "a")}:${join(bin, "b")}`;
+  try {
+    const found = browserCandidates();
+    // brave before google-chrome-stable is the declared preference; neither of the two unusable files appears.
+    assert.deepEqual(found.slice(0, 2), [brave, chrome]);
+    assert.ok(!found.includes(join(bin, "a", "chromium")), "a file that cannot be executed is not a browser");
+    assert.ok(!found.includes(join(bin, "a", "google-chrome")), "nor is a directory");
+    // Playwright's build is refused by Google sign-in, so it comes last whatever else is installed.
+    assert.ok(found.length === 2 || found[found.length - 1].includes("ms-playwright"), found.join(" "));
+  } finally {
+    process.env.PATH = env;
+  }
+  // The ordering, which needs paths that no test machine has: a snap is preferred by name (chromium before
+  // google-chrome-stable) and must still end up behind it, while staying in the list in case it is all there is.
+  assert.deepEqual(
+    demoteConfined(["/snap/bin/chromium", "/usr/bin/google-chrome-stable", "/var/lib/flatpak/app/x/chrome", "/usr/bin/brave"]),
+    ["/usr/bin/google-chrome-stable", "/usr/bin/brave", "/snap/bin/chromium", "/var/lib/flatpak/app/x/chrome"],
+  );
+  // The rule itself, on the paths a link resolves to.
+  for (const p of ["/snap/bin/chromium", "/var/lib/snapd/snap/bin/chromium", "/var/lib/flatpak/app/org.chromium.Chromium/current/chrome"]) {
+    assert.equal(confinedPath(p), true, p);
+  }
+  for (const p of ["/usr/bin/chromium", "/usr/lib/brave/brave", "/opt/google/chrome/chrome"]) {
+    assert.equal(confinedPath(p), false, p);
+  }
+});
+
 const chromium = [process.env.FIGMA_BROWSER_PATH, "/usr/bin/chromium", "/usr/bin/chromium-browser"].filter((p) => p !== undefined).find(existsSync);
+test("a browser that cannot start is passed over for one that can", { skip: !chromium && "no chromium" }, async () => {
+  // The picker used to commit to the first browser that existed, so a snap Chromium was a dead end: it exits
+  // without opening a DevTools port, and nothing tried the working Chrome beside it. Here the first candidate on
+  // PATH exits at once, exactly as that one does, and the launch must end on the real browser rather than on it.
+  const bin = join(root, "fallthrough");
+  mkdirSync(bin, { recursive: true });
+  const dud = join(bin, "brave"); // sorts before chromium in the preference order, so it is tried first
+  writeFileSync(dud, "#!/bin/sh\nexit 1\n");
+  chmodSync(dud, 0o755);
+  const real = join(bin, "chromium");
+  writeFileSync(real, `#!/bin/sh\nexec ${chromium} "$@"\n`);
+  chmodSync(real, 0o755);
+  const env = process.env.PATH;
+  process.env.PATH = bin;
+  const dir = join(root, "fallthrough-state");
+  const manager = new BrowserManager({ userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") });
+  try {
+    // Playwright's build is on this machine and always comes last; what matters is the order of the two here.
+    assert.deepEqual(browserCandidates().slice(0, 2), [dud, real], "the dud is preferred, so it is what a first launch gets");
+    await manager.launch(true, "work");
+    const rec = manager.launchRecord()!;
+    children.push(rec.pid);
+    assert.equal(rec.exe, real, "the browser that started is the one recorded");
+  } finally {
+    process.env.PATH = env;
+    await manager.release();
+  }
+});
+
+test("a browser named outright is never quietly swapped for another", { skip: !chromium && "no chromium" }, async () => {
+  // Falling through is for a choice we made; someone who sets FIGMA_BROWSER_PATH made their own, and silently
+  // using a different browser would answer about a profile and a login they did not ask for.
+  const dir = join(root, "named-state");
+  const dud = join(root, "fallthrough", "brave");
+  const manager = new BrowserManager({ executablePath: dud, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") });
+  await assert.rejects(manager.launch(true, "work"), (e: Error) => {
+    assert.match(e.message, /never opened a DevTools port/);
+    assert.ok(e.message.includes(dud), "says which browser failed");
+    assert.ok(!e.message.includes("No installed browser"), "did not fall through to another");
+    return true;
+  });
+});
+
 test("a launched headless browser is recorded with its identity and closed by release() from a fresh manager", { skip: !chromium && "no chromium" }, async () => {
   const dir = join(root, "real");
   const opts = { executablePath: chromium, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") };

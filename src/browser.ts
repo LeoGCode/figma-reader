@@ -4,9 +4,9 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { CdpSession, sleep, type TargetInfo } from "./cdp.ts";
 
 export interface BrowserOptions {
@@ -178,26 +178,68 @@ export function takeLease(dir: string, name = String(process.pid)): string {
   return path;
 }
 
+const BROWSER_NAMES = ["brave", "brave-browser", "chromium", "chromium-browser", "google-chrome-stable", "google-chrome"];
+
 /**
- * First installed real browser. Playwright's build ("Chrome for Testing") is only a last resort:
- * Google sign-in refuses it as insecure, which breaks "Continue with Google" on figma.com.
+ * Whether a path is inside a confined package. Such a build cannot reach a profile directory outside its own
+ * sandbox, so it starts and exits without ever opening the DevTools port we drive it through. On Ubuntu
+ * /usr/bin/chromium is usually a link to one, which is why the list below is an order of preference, not a choice.
  */
-export function defaultExecutable(): string {
-  const candidates = [
-    "brave", "brave-browser", "chromium", "chromium-browser", "google-chrome-stable", "google-chrome",
-  ];
-  for (const name of candidates) {
-    for (const dir of (process.env.PATH ?? "").split(":")) {
-      const path = join(dir, name);
-      if (dir && existsSync(path)) return path;
+export const confinedPath = (path: string) => /^\/(snap|var\/lib\/snapd|var\/lib\/flatpak)\//.test(path) || path.includes("/flatpak/");
+
+/** Where a link chain ends, which is what confinedPath has to judge: /usr/bin/chromium is itself an ordinary path. */
+function linkTarget(path: string): string {
+  let target = path;
+  for (let i = 0; i < 10; i++) {
+    try {
+      const next = readlinkSync(target);
+      target = next.startsWith("/") ? next : join(dirname(target), next);
+    } catch {
+      return target;
     }
   }
-  const { chromium } = createRequire(import.meta.url)("playwright-core");
-  const path = chromium.executablePath();
-  if (!existsSync(path)) {
-    throw new Error("No Chromium-family browser found. Install Brave/Chromium/Chrome or set FIGMA_BROWSER_PATH.");
+  return target;
+}
+const sandboxed = (path: string) => confinedPath(linkTarget(path));
+
+/** Ordinary builds first, confined ones after: kept, since one may be all there is, but never preferred. */
+export const demoteConfined = (paths: string[]) => [...paths.filter((p) => !sandboxed(p)), ...paths.filter(sandboxed)];
+
+/**
+ * Installed browsers, best first. Existence is not usability -- a file can be there, be a directory, lack the execute
+ * bit, or be a confined package that cannot use our profile -- and only launching settles it, so this returns every
+ * candidate and launch() works down the list. Playwright's build ("Chrome for Testing") is last whatever else is
+ * found: Google sign-in refuses it as insecure, which breaks "Continue with Google" on figma.com.
+ */
+export function browserCandidates(): string[] {
+  const found: string[] = [];
+  for (const name of BROWSER_NAMES) {
+    for (const dir of (process.env.PATH ?? "").split(":")) {
+      if (!dir) continue;
+      const path = join(dir, name);
+      try {
+        if (!statSync(path).isFile()) continue;
+        accessSync(path, constants.X_OK);
+      } catch {
+        continue;
+      }
+      if (!found.includes(path)) found.push(path);
+    }
   }
-  return path;
+  const ordered = demoteConfined(found);
+  try {
+    const { chromium } = createRequire(import.meta.url)("playwright-core");
+    const path = chromium.executablePath();
+    if (existsSync(path) && !ordered.includes(path)) ordered.push(path);
+  } catch {}
+  return ordered;
+}
+
+/** The browser a call will use when none is named. Kept for callers that report one rather than launch it. */
+export function defaultExecutable(): string {
+  const first = browserCandidates()[0];
+  if (!first) throw new Error("No Chromium-family browser found. Install Brave/Chromium/Chrome or set FIGMA_BROWSER_PATH.");
+  return first;
 }
 
 /**
@@ -359,8 +401,32 @@ export class BrowserManager {
     return this.opts.executablePath ?? defaultExecutable();
   }
 
+  /**
+   * Launch, trying each installed browser until one opens a DevTools port. Only launching proves a browser usable,
+   * and a browser that cannot start exits at once -- the wait below ends on the child exiting, not on its ceiling --
+   * so working down the list costs a moment rather than a timeout each. A browser named outright by
+   * FIGMA_BROWSER_PATH is never substituted: someone who says which browser to use gets told it failed.
+   */
   async launch(headless: boolean, purpose: LaunchRecord["purpose"], url = "about:blank"): Promise<string> {
-    const exe = this.opts.executablePath ?? defaultExecutable();
+    if (this.opts.executablePath) return this.launchWith(this.opts.executablePath, headless, purpose, url);
+    const candidates = browserCandidates();
+    if (!candidates.length) throw new Error("No Chromium-family browser found. Install Brave/Chromium/Chrome or set FIGMA_BROWSER_PATH.");
+    const failures: string[] = [];
+    for (const exe of candidates) {
+      try {
+        return await this.launchWith(exe, headless, purpose, url);
+      } catch (e) {
+        const message = (e as Error).message;
+        // A profile already held by another browser is about this profile, not this executable: trying a different
+        // browser on the same directory would fail the same way, and the message already says what to do.
+        if (message.includes("is in use by another browser")) throw e;
+        failures.push(`${exe}: ${message}`);
+      }
+    }
+    throw new Error(`No installed browser could be started.\n${failures.map((f) => `  ${f}`).join("\n")}`);
+  }
+
+  private async launchWith(exe: string, headless: boolean, purpose: LaunchRecord["purpose"], url: string): Promise<string> {
     mkdirSync(this.opts.userDataDir, { recursive: true });
     rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
     const args = [

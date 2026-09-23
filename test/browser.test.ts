@@ -113,21 +113,33 @@ test("a login record whose pid was reused is stale: no login window is reported,
   assert.ok(pidAlive(pid));
 });
 
-/** A stand-in for a browser that takes half a second to die, SIGTERM included, so the wait in close() is real. */
-function dying(): number {
-  const child = spawn("sh", ["-c", 'trap "" TERM; sleep 0.5'], { stdio: "ignore" });
+let b = 0;
+/**
+ * A stand-in for a browser of ours: an executable started with the profile on its command line, as a launch writes
+ * it. That argument is not decoration - ownsProcess reads it off Linux, where ps's lstart resolves to one second
+ * and cannot tell a pid reissued inside that second from the browser that held it. `body` must not be a lone
+ * command: sh execs one of those, and the arguments ps then reports are the exec'd program's, not ours.
+ */
+function ourBrowser(userDataDir: string, body = "sleep 60 &\nwait"): number {
+  const exe = join(root, `browser${b++}`);
+  writeFileSync(exe, `#!/bin/sh\n${body}\n`);
+  chmodSync(exe, 0o755);
+  const child = spawn(exe, [`--user-data-dir=${userDataDir}`], { stdio: "ignore" });
   children.push(child.pid!);
   return child.pid!;
 }
 
+/** Half a second to die, SIGTERM included, so the wait in close() is real. */
+const DYING = 'trap "" TERM\nsleep 0.5 &\nwait';
+
 for (const purpose of ["work", "login"] as const) {
   test(`closing a ${purpose} browser keeps a record another process wrote while it waited`, async () => {
-    const old = dying();
     const { m, record } = manager();
+    const old = ourBrowser(m.opts.userDataDir, DYING);
     writeFileSync(record, JSON.stringify({ pid: old, headless: purpose === "work", purpose, start: processStart(old) }));
     const closing = purpose === "work" ? m.close() : m.closeLoginWindow();
     // The other process launches its browser and records it while we are still waiting for ours to exit.
-    const fresh = bystander();
+    const fresh = ourBrowser(m.opts.userDataDir);
     const written = JSON.stringify({ pid: fresh, headless: true, purpose: "work", start: processStart(fresh) });
     writeFileSync(record, written);
     await closing;
@@ -138,8 +150,8 @@ for (const purpose of ["work", "login"] as const) {
 }
 
 test("a record of the recorded process itself is kept", () => {
-  const pid = bystander();
   const { m, record } = manager();
+  const pid = ourBrowser(m.opts.userDataDir);
   writeFileSync(record, JSON.stringify({ pid, headless: true, purpose: "work", start: processStart(pid) }));
   assert.equal(m.launchRecord()?.pid, pid);
 });

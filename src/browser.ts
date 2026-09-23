@@ -107,7 +107,10 @@ export function sameBoot(boot: string | undefined): boolean {
 function processCmdline(pid: number): string | undefined {
   try {
     if (process.platform === "linux") return readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ");
-    return execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    // -ww, because BSD ps cuts the command at the terminal width and --user-data-dir sits behind the executable's
+    // path, which for a browser is a path inside an .app bundle: two -w mean no limit, so the profile is there to
+    // be read. A truncated line would read as a browser on some other profile, which is the answer that relaunches.
+    return execFileSync("ps", ["-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch {
     return undefined;
   }

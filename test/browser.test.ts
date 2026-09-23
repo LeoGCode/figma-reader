@@ -2,7 +2,7 @@
 // it is still the process that was recorded. Tests only ever signal processes they spawned.
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import type { Socket } from "node:net";
@@ -11,7 +11,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const root = mkdtempSync(join(tmpdir(), "figma-reader-test-"));
-process.env.HOME = root; // never touch the real ~/.local/state or ~/.cache
+// Never touch this user's real state, cache or data directories. Which variable that takes differs by platform:
+// os.homedir() reads USERPROFILE on Windows and HOME everywhere else, and the Windows directories are named by
+// APPDATA and LOCALAPPDATA. HOME alone redirected nothing on Windows, where a manager given no stateDir of its
+// own would have written the runner's own profile.
+for (const v of ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"]) process.env[v] = root;
+const win = process.platform === "win32";
 const { bootId, BrowserManager, browserCandidates, confinedPath, demoteConfined, liveLeases, pidAlive, processStart, profileHasLoginCookie, sameProcess, takeLease } =
   await import("../src/browser.ts");
 
@@ -337,12 +342,20 @@ test("a browser that accepts the socket but never answers the target list fails 
 
 test("a browser executable that cannot be started rejects the launch instead of crashing the process", async () => {
   const dir = join(root, "missing");
+  mkdirSync(dir, { recursive: true });
   const m = new BrowserManager({ executablePath: join(dir, "no-such-browser"), userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") });
   await assert.rejects(m.launch(true, "work"), /Cannot start browser .*no-such-browser.*ENOENT/);
   await assert.rejects(m.launchLoginWindow("about:blank"), /Cannot start browser .*no-such-browser.*ENOENT/);
+  // The second shape of refusal, which only Windows has: Node runs no .bat or .cmd without a shell, and says so by
+  // throwing out of spawn rather than emitting an 'error' event, so this one does not pass through check() at all.
+  if (win) {
+    const cmd = join(dir, "launcher.cmd");
+    writeFileSync(cmd, "@echo off\r\n");
+    const viaScript = new BrowserManager({ executablePath: cmd, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") });
+    await assert.rejects(viaScript.launch(true, "work"), /Cannot start browser .*launcher\.cmd.*EINVAL/);
+    await assert.rejects(viaScript.launchLoginWindow("about:blank"), /Cannot start browser .*launcher\.cmd.*EINVAL/);
+  }
 });
-
-const win = process.platform === "win32";
 
 // FIGMA_BROWSER_PATH first, so CI can point this at a browser it knows launches: /usr/bin/chromium exists on a
 // GitHub runner but is a snap wrapper that never opens a DevTools port, which is a skip that hides the test.
@@ -441,7 +454,7 @@ test("a browser that cannot start is passed over for one that can", { skip: !lau
   const dir = join(root, "fallthrough-state");
   const manager = new BrowserManager({ userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") });
   try {
-    // Playwright's build is on this machine and always comes last; what matters is the order of the first two.
+    // Playwright's build is appended whatever else is installed, so what matters here is the first two.
     const found = browserCandidates();
     assert.equal(found[0], dud, "the dud is preferred, so it is what a first launch gets");
     assert.ok(found.length > 1, `nothing behind the dud to fall through to: ${found.join(" ")}`);
@@ -485,23 +498,7 @@ test("a launched headless browser is recorded with its identity and closed by re
 });
 
 // TEMPORARY PROBE - remove before review.
-test("probe: what a Windows runner can execute and what a browser writes into a profile", { skip: !win && "windows only" }, async () => {
-  console.log("PROBE candidates:", JSON.stringify(browserCandidates()));
-  console.log("PROBE execPath:", process.execPath, "tmp:", root);
-  const probeDir = join(root, "probe");
-  mkdirSync(probeDir, { recursive: true });
-  for (const [name, body] of [
-    ["probe.cmd", "@echo off\r\nexit /b 3\r\n"],
-    ["probe.bat", "@echo off\r\nexit /b 3\r\n"],
-  ] as const) {
-    const p = join(probeDir, name);
-    writeFileSync(p, body);
-    await new Promise<void>((r) => {
-      const c = spawn(p, ["--user-data-dir=x"], { stdio: "ignore" });
-      c.on("error", (e: any) => (console.log(`PROBE ${name} error:`, e.code, e.message), r()));
-      c.on("exit", (code) => (console.log(`PROBE ${name} exit:`, code), r()));
-    });
-  }
+test("probe: what a running browser leaves in a profile on Windows, and who can be asked about it", { skip: !win && "windows only" }, async () => {
   await new Promise<void>((r) => {
     const c = spawn(dud, ["--remote-debugging-port=0", "--user-data-dir=x", "about:blank"], { stdio: "ignore" });
     c.on("error", (e: any) => (console.log("PROBE node-as-browser error:", e.code, e.message), r()));
@@ -509,9 +506,17 @@ test("probe: what a Windows runner can execute and what a browser writes into a 
   });
   if (!launchable) return;
   const dir = join(root, "probe-profile");
-  const m = new BrowserManager({ executablePath: launchable, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") });
+  const profile = join(dir, "profile");
+  const m = new BrowserManager({ executablePath: launchable, userDataDir: profile, headless: true, stateDir: join(dir, "state") });
   await m.launch(true, "work");
-  console.log("PROBE profile entries:", JSON.stringify(readdirSync(join(dir, "profile"))));
-  console.log("PROBE default entries:", JSON.stringify(readdirSync(join(dir, "profile", "Default"))));
+  const pid = m.launchRecord()!.pid;
+  console.log("PROBE profile entries:", JSON.stringify(readdirSync(profile)));
+  console.log("PROBE Default entries:", JSON.stringify(readdirSync(join(profile, "Default"))));
+  const ps = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const expr = `Get-CimInstance Win32_Process -Filter "Name='${launchable.split("\\").pop()}'" | ForEach-Object { "$($_.ProcessId) $($_.CommandLine)" }`;
+  const started = Date.now();
+  const out = execFileSync(ps, ["-NoProfile", "-NonInteractive", "-Command", expr], { encoding: "utf8" });
+  const holders = out.split("\n").filter((l) => l.includes(`--user-data-dir=${profile}`));
+  console.log("PROBE recorded pid:", pid, "processes naming this profile:", JSON.stringify(holders.map((l) => l.trim().split(" ")[0])), `in ${Date.now() - started}ms`);
   await m.release();
 });

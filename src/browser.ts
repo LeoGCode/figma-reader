@@ -328,14 +328,23 @@ export function defaultExecutable(): string {
  * event, which would crash the whole server if unhandled; check() rethrows it as a clear launch error instead.
  */
 function spawnBrowser(exe: string, args: string[]) {
-  const child = spawn(exe, args, { detached: true, stdio: "ignore" });
+  const cannotStart = (e: Error) => new Error(`Cannot start browser ${exe}: ${e.message}. Set FIGMA_BROWSER_PATH to a Chromium-family browser.`);
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(exe, args, { detached: true, stdio: "ignore" });
+  } catch (e) {
+    // The other shape a refusal comes in, measured on a Windows runner: Node will not run a .bat or .cmd without a
+    // shell and throws EINVAL from spawn itself rather than emitting it, so FIGMA_BROWSER_PATH on a launcher script
+    // arrived as a bare "spawn EINVAL" with nothing said about what to do.
+    throw cannotStart(e as Error);
+  }
   let failed: Error | undefined;
   child.on("error", (e) => (failed = e));
   child.unref();
   return {
     process: child,
     check() {
-      if (failed) throw new Error(`Cannot start browser ${exe}: ${failed.message}. Set FIGMA_BROWSER_PATH to a Chromium-family browser.`);
+      if (failed) throw cannotStart(failed);
     },
   };
 }

@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { CdpSession, sleep, type TargetInfo } from "./cdp.ts";
 
 export interface BrowserOptions {
@@ -190,11 +190,11 @@ export function takeLease(dir: string, name = String(process.pid)): string {
 }
 
 const BROWSER_NAMES = ["brave", "brave-browser", "chromium", "chromium-browser", "google-chrome-stable", "google-chrome"];
-// Windows spells them with an extension and separates PATH with ';', where a Linux split on ':' would cut every
-// entry at its drive letter. The names differ too: there is no google-chrome-stable, and Brave is brave.exe.
+// Windows spells them with an extension: there is no google-chrome-stable, and Brave is brave.exe.
 const WINDOWS_NAMES = ["brave.exe", "chrome.exe", "chromium.exe", "msedge.exe"];
 const onWindows = () => process.platform === "win32";
-const pathEntries = () => (process.env.PATH ?? "").split(onWindows() ? ";" : ":").filter(Boolean);
+// path.delimiter, because Windows separates PATH with ';' and a split on ':' cuts every entry at its drive letter.
+const pathEntries = () => (process.env.PATH ?? "").split(delimiter).filter(Boolean);
 /**
  * Where Windows keeps browsers when they are not on PATH, which is the normal case: an installer writes to Program
  * Files and registers the app rather than extending PATH.

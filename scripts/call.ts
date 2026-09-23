@@ -8,7 +8,7 @@ import { join } from "node:path";
 
 const [tool, rawArgs = "{}"] = process.argv.slice(2);
 const client = new Client({ name: "call", version: "0" });
-await client.connect(new StdioClientTransport({ command: process.execPath, args: [new URL("../src/mcp.ts", import.meta.url).pathname], env: process.env as Record<string, string>, stderr: "inherit" }));
+await client.connect(new StdioClientTransport({ command: process.execPath, args: [join(import.meta.dirname, "..", "src", "mcp.ts")], env: process.env as Record<string, string>, stderr: "inherit" }));
 if (!tool) {
   const { tools } = await client.listTools();
   console.log(tools.map((t) => t.name).join("\n"));

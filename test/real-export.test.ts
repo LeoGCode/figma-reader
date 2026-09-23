@@ -4,12 +4,15 @@
 // It contains no design work: see test/files/real-export.fig.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { join } from "node:path";
 import { FigDocument, guidId, type Raw } from "../src/fig-file.ts";
 import { scanText } from "../src/instance-text.ts";
 import { Normalizer } from "../src/normalize.ts";
 import { extractVariables, variablesToCss, variablesToDtcg } from "../src/tokens.ts";
 
-const doc = FigDocument.fromFile("real-export", new URL("./files/real-export.fig", import.meta.url).pathname, new Date(0));
+// A file URL's pathname spells a Windows path "/D:/a/...", which every fs call then resolves against the current
+// drive: the fixture was opened as "D:\D:\a\...\real-export.fig" and this whole file failed with ENOENT.
+const doc = FigDocument.fromFile("real-export", join(import.meta.dirname, "files", "real-export.fig"), new Date(0));
 const node = (id: string) => doc.require(id);
 
 describe("a real .fig export", () => {

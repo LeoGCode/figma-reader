@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { CdpSession, sleep, type TargetInfo } from "./cdp.ts";
 
 export interface BrowserOptions {
@@ -207,7 +207,9 @@ function linkTarget(path: string): string {
   for (let i = 0; i < 10; i++) {
     try {
       const next = readlinkSync(target);
-      target = next.startsWith("/") ? next : join(dirname(target), next);
+      // isAbsolute, not a leading '/': a Windows link target is "C:\...", which join would hang off the link's own
+      // directory as "C:\...\C:\...", the same doubled drive letter a file URL's pathname produces.
+      target = isAbsolute(next) ? next : join(dirname(target), next);
     } catch {
       return target;
     }

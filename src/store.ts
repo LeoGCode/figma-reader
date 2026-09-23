@@ -1,5 +1,5 @@
 // Snapshot cache: one exported .fig per file key on disk, decoded documents kept in memory.
-import { existsSync, mkdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { liveLeases, takeLease } from "./browser.ts";
 import { FigDocument } from "./fig-file.ts";
@@ -28,25 +28,35 @@ function beganBefore(name: string, since: number) {
   return !Number.isFinite(began) || began > Date.now() || began <= since;
 }
 
+/** A reading that could not be taken at all, which is neither a file nor the absence of one. */
+const UNREADABLE = Symbol("unreadable");
+
 /**
  * The .fig at `path` as it stands, or undefined when there is none: mtime and size, the pair fromDisk also keys its
  * decode by, since a replacement written within the mtime granularity carries the old time. Only a write changes
  * either, so two readings that differ are two files and the second was written between them - which is what the
  * cross-process rule below needs, and it takes no clock to say it.
+ *
+ * Any error but ENOENT is UNREADABLE rather than "no file": ESTALE on a shared cache whose server restarted, EIO,
+ * the EPERM Windows answers for a file whose delete is still pending (this repo's own windows-latest run
+ * 35874343135 logged one on a cache-shaped temporary path). A failed reading read as "nothing was there" makes
+ * whatever stands there next look newer than it, which is the one direction that answers a refresh with an export
+ * older than it.
  */
-function asSeen(path: string): string | undefined {
+function asSeen(path: string): string | undefined | typeof UNREADABLE {
   try {
     const st = statSync(path);
     return `${st.mtimeMs}:${st.size}`;
-  } catch {
-    return undefined;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException | null)?.code === "ENOENT" ? undefined : UNREADABLE;
   }
 }
 
 /** A .fig is at `path` and is not the one the reading `seen` stands for, so it was written after that reading. */
 function wroteSince(path: string, seen: string | undefined) {
   const now = asSeen(path);
-  return now !== undefined && now !== seen;
+  // A reading that failed is not a file, so it is not a write either: only a string is one.
+  return typeof now === "string" && now !== seen;
 }
 
 /** What waiting for the other processes on this cache established; see awaitOtherExport. */
@@ -55,6 +65,12 @@ interface Floor {
   reached: boolean;
   /** The .fig as it stood at that instant (see asSeen), undefined when there was none: the bar a newer one clears. */
   file: string | undefined;
+}
+
+/** The floor a reading of `path` sets. One that could not be taken bars nothing, so no instant was established. */
+function floorAt(path: string): Floor {
+  const file = asSeen(path);
+  return file === UNREADABLE ? { reached: false, file: undefined } : { reached: true, file };
 }
 
 interface Inflight {
@@ -76,12 +92,18 @@ export class SnapshotStore {
   readonly dir: string;
   private maxAgeMs: number;
   private maxDocs: number;
+  private otherExportWaitMs: number;
 
-  constructor(web: FigmaWeb, dir: string, maxAgeMs: number, maxDocs = 4) {
+  /**
+   * `otherExportWaitMs` is a parameter only so that a test can reach the ceiling: what it leaves behind is an
+   * export still running that this one has to answer around, and no test can wait out the ten real minutes.
+   */
+  constructor(web: FigmaWeb, dir: string, maxAgeMs: number, maxDocs = 4, otherExportWaitMs = OTHER_EXPORT_WAIT_MS) {
     this.web = web;
     this.dir = dir;
     this.maxAgeMs = maxAgeMs;
     this.maxDocs = maxDocs;
+    this.otherExportWaitMs = otherExportWaitMs;
     mkdirSync(dir, { recursive: true });
   }
 
@@ -172,14 +194,14 @@ export class SnapshotStore {
   private async awaitOtherExport(fileKey: string, since: number): Promise<Floor | undefined> {
     const leases = this.leaseDir(fileKey);
     const path = this.figPath(fileKey);
-    const deadline = Date.now() + OTHER_EXPORT_WAIT_MS;
+    const deadline = Date.now() + this.otherExportWaitMs;
     // Each lease is dated once, the first time it is seen: a clock that stepped back is only visible while this
     // process's clock has not yet passed the stamp it left behind, so re-dating the same name later lets it through.
     const dated = new Map<string, boolean>();
     let live = liveLeases(leases);
     // The file is read after that first poll and not before it: an export older than `since` whose lease was already
     // gone had written the file by then, so this reading holds its work and no later one is taken for someone else's.
-    let floor: Floor = { reached: true, file: asSeen(path) };
+    let floor = floorAt(path);
     let older = false;
     for (; live.length; live = liveLeases(leases)) {
       // The ceiling is reached with an export still running, so whatever it writes from here on is unattributable.
@@ -188,12 +210,12 @@ export class SnapshotStore {
       if (live.some((name) => dated.get(name))) older = true;
       else if (older) {
         // Every export older than `since` has gone since the last poll, so it had written the file by now.
-        floor = { reached: true, file: asSeen(path) };
+        floor = floorAt(path);
         older = false;
       }
       await sleep(LEASE_POLL_MS);
     }
-    return dated.size ? (older ? { reached: true, file: asSeen(path) } : floor) : undefined;
+    return dated.size ? (older ? floorAt(path) : floor) : undefined;
   }
 
   private async load(fileKey: string, refresh: boolean): Promise<FigDocument> {
@@ -217,15 +239,31 @@ export class SnapshotStore {
         return this.fromDisk(fileKey, path);
       }
     }
-    const lease = takeLease(this.leaseDir(fileKey), `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    const tag = Math.random().toString(36).slice(2, 8);
+    const lease = takeLease(this.leaseDir(fileKey), `${process.pid}-${Date.now()}-${tag}`);
+    // Export onto a name no other process writes, and swap that onto the snapshot; reading the snapshot back read
+    // whatever stood there. Every process on this cache renames its own export onto the one path, and one landing
+    // between this export's rename and that read answered with a file this process had not exported - 39 answers
+    // in 40 with another process renaming continuously, and the answer above is the export that was still running
+    // when the wait gave up on it, which is the pre-refresh one. The name is the shape moveDownload gives a copy
+    // beside the snapshot, so cleanStaleDownloads sweeps one left behind by a crash between the export and the swap.
+    const mine = `${path}.${process.pid}.${tag}.tmp`;
     try {
-      await this.web.saveLocalCopy(fileKey, path);
+      await this.web.saveLocalCopy(fileKey, mine);
+      const st = statSync(mine);
+      // exportedAt comes from the file's mtime, as for a snapshot read back later, so both agree on its age. The
+      // rename carries that mtime and size onto the snapshot, which is the reading fromDisk keys its decode by, so
+      // reading the snapshot back finds this document rather than decoding the same bytes again.
+      const doc = FigDocument.fromFile(fileKey, mine, st.mtime);
+      this.stamps.set(doc, `${st.mtimeMs}:${st.size}`);
+      renameSync(mine, path);
+      return this.remember(doc);
     } finally {
+      // The lease goes only once the export it announces has written the file, which is what lets another process
+      // read the lease being gone as that export's work being on disk.
       rmSync(lease, { force: true });
+      rmSync(mine, { force: true });
     }
-    // exportedAt comes from the file's mtime, as for a snapshot read back later, so both agree on its age.
-    this.docs.delete(fileKey);
-    return this.fromDisk(fileKey, path);
   }
 
   /** Keep a document, as the most recently used: when over maxDocs, the least recently used is dropped. */

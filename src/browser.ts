@@ -691,14 +691,26 @@ export class BrowserManager {
   }
 
   /**
-   * Drop the tabs the profile would reopen. Brave restores the last session by default, where Chromium and Chrome
-   * do not: every launch reloaded the editor tabs earlier runs left behind, and a login window came up beside a
-   * restored one whose own Figma login page competed with it for the Google sign-in (both measured on Brave 1.95).
-   * The login is in the cookie DB, not in here. A FIGMA_USER_DATA_DIR profile may be someone's everyday browser, and
-   * the tabs saved in it are theirs.
+   * Drop the tabs the profile would reopen. Brave 1.95 restores the last session by default, where Chromium 153 opens
+   * only the URL it was given: every launch reloaded the editor tabs earlier runs left behind, and a login window came
+   * up beside a restored one whose own Figma login page competed with it for the Google sign-in. The session files
+   * hold the windows, tabs and their back/forward history; the login is in the cookie DB. A FIGMA_USER_DATA_DIR
+   * profile may be someone's everyday browser, and the tabs saved in it are theirs.
+   *
+   * Sessions_Encrypted too: Chromium is moving to it (EncryptSessionStorage), and from the stage that reads it first,
+   * Brave 1.95 run with that stage restored everything from it with Sessions gone.
+   *
+   * Best effort. A browser still running on the profile holds its session files open, and Windows refuses to delete
+   * a file Chromium has open without share-delete; the launch that follows reports that browser, which is the
+   * message worth giving rather than an EBUSY about a directory nobody asked about.
    */
   private forgetSession() {
-    if (this.opts.ownsProfile) rmSync(join(this.opts.userDataDir, "Default", "Sessions"), { recursive: true, force: true });
+    if (!this.opts.ownsProfile) return;
+    for (const dir of ["Sessions", "Sessions_Encrypted"]) {
+      try {
+        rmSync(join(this.opts.userDataDir, "Default", dir), { recursive: true, force: true });
+      } catch {}
+    }
   }
 
   private async launchWith(exe: string, headless: boolean, purpose: LaunchRecord["purpose"], url: string): Promise<string> {

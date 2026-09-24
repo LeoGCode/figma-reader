@@ -599,19 +599,60 @@ test("a launch forgets the tabs our own profile would reopen, and never those of
   // Brave restores the last session by default: every launch reloaded the editor tabs earlier runs left open, and a
   // login window came up beside a restored window with a second Figma login page in it. The login itself is in the
   // cookie DB, which must survive; a FIGMA_USER_DATA_DIR profile may be someone's own browser, and keeps its tabs.
+  // Sessions_Encrypted is where Chromium's EncryptSessionStorage restores from once it reads that first.
   for (const ownsProfile of [true, false]) {
     for (const purpose of ["work", "login"] as const) {
       const dir = join(root, `session-${ownsProfile}-${purpose}`);
       const profile = join(dir, "profile");
-      mkdirSync(join(profile, "Default", "Sessions"), { recursive: true });
-      writeFileSync(join(profile, "Default", "Sessions", "Tabs_13434747262928246"), "");
+      for (const s of ["Sessions", "Sessions_Encrypted"]) {
+        mkdirSync(join(profile, "Default", s), { recursive: true });
+        writeFileSync(join(profile, "Default", s, "Tabs_13434747262928246"), "");
+      }
       writeFileSync(join(profile, "Default", "Cookies"), "");
       const m = new BrowserManager({ executablePath: dud, userDataDir: profile, ownsProfile, headless: true, stateDir: join(dir, "state") });
       if (purpose === "work") await assert.rejects(m.launch(true, "work"), /never opened a DevTools port/);
       else await m.launchLoginWindow("about:blank");
-      assert.equal(existsSync(join(profile, "Default", "Sessions")), !ownsProfile, `${purpose} launch, ownsProfile ${ownsProfile}`);
+      for (const s of ["Sessions", "Sessions_Encrypted"]) {
+        assert.equal(existsSync(join(profile, "Default", s)), !ownsProfile, `${s}, ${purpose} launch, ownsProfile ${ownsProfile}`);
+      }
       assert.ok(existsSync(join(profile, "Default", "Cookies")), "the login is kept");
     }
+  }
+});
+
+// The browser reads its session as it starts, so what counts is what the profile holds when it is spawned. A shell
+// script stands in for it, which Windows cannot run (see dudBrowser).
+test("the saved tabs are gone before the browser starts, not after", { skip: win && "no shell script browser on Windows" }, async () => {
+  for (const purpose of ["work", "login"] as const) {
+    const dir = join(root, `session-order-${purpose}`);
+    const profile = join(dir, "profile");
+    const seen = join(dir, "seen");
+    mkdirSync(join(profile, "Default", "Sessions"), { recursive: true });
+    const exe = join(dir, "browser");
+    writeFileSync(exe, `#!/bin/sh\nls '${join(profile, "Default")}' > '${seen}'\nexit 1\n`);
+    chmodSync(exe, 0o755);
+    const m = new BrowserManager({ executablePath: exe, userDataDir: profile, ownsProfile: true, headless: true, stateDir: join(dir, "state") });
+    if (purpose === "work") await assert.rejects(m.launch(true, "work"), /never opened a DevTools port/);
+    else await m.launchLoginWindow("about:blank");
+    assert.doesNotMatch(readFileSync(seen, "utf8"), /Sessions/, `${purpose} launch`);
+  }
+});
+
+// Windows refuses to delete a session file a running browser has open, since Chromium opens them without
+// share-delete (read from its source, not measured). A directory we may not write stands in for that: the launch
+// must go on to its own outcome.
+test("saved tabs that cannot be removed do not stop the launch", { skip: (win || process.getuid?.() === 0) && "permissions do not bind here" }, async () => {
+  const dir = join(root, "session-locked");
+  const profile = join(dir, "profile");
+  mkdirSync(join(profile, "Default", "Sessions"), { recursive: true });
+  chmodSync(join(profile, "Default"), 0o555);
+  try {
+    const m = new BrowserManager({ executablePath: dud, userDataDir: profile, ownsProfile: true, headless: true, stateDir: join(dir, "state") });
+    await assert.rejects(m.launch(true, "work"), /never opened a DevTools port/);
+    await m.launchLoginWindow("about:blank");
+    assert.ok(existsSync(join(profile, "Default", "Sessions")), "could not be removed, and was not");
+  } finally {
+    chmodSync(join(profile, "Default"), 0o755);
   }
 });
 

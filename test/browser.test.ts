@@ -595,6 +595,26 @@ test("a browser named outright is never quietly swapped for another", async () =
   });
 });
 
+test("a launch forgets the tabs our own profile would reopen, and never those of a profile it was given", async () => {
+  // Brave restores the last session by default: every launch reloaded the editor tabs earlier runs left open, and a
+  // login window came up beside a restored window with a second Figma login page in it. The login itself is in the
+  // cookie DB, which must survive; a FIGMA_USER_DATA_DIR profile may be someone's own browser, and keeps its tabs.
+  for (const ownsProfile of [true, false]) {
+    for (const purpose of ["work", "login"] as const) {
+      const dir = join(root, `session-${ownsProfile}-${purpose}`);
+      const profile = join(dir, "profile");
+      mkdirSync(join(profile, "Default", "Sessions"), { recursive: true });
+      writeFileSync(join(profile, "Default", "Sessions", "Tabs_13434747262928246"), "");
+      writeFileSync(join(profile, "Default", "Cookies"), "");
+      const m = new BrowserManager({ executablePath: dud, userDataDir: profile, ownsProfile, headless: true, stateDir: join(dir, "state") });
+      if (purpose === "work") await assert.rejects(m.launch(true, "work"), /never opened a DevTools port/);
+      else await m.launchLoginWindow("about:blank");
+      assert.equal(existsSync(join(profile, "Default", "Sessions")), !ownsProfile, `${purpose} launch, ownsProfile ${ownsProfile}`);
+      assert.ok(existsSync(join(profile, "Default", "Cookies")), "the login is kept");
+    }
+  }
+});
+
 // A launch, the record it writes and the close that reads it, end to end on a real browser: the identity in that
 // record is what stands between a reused pid and process.kill.
 test("a launched headless browser is recorded with its identity and closed by release() from a fresh manager", { skip: !launchable && "no browser that starts" }, async () => {

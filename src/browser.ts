@@ -17,6 +17,8 @@ export interface BrowserOptions {
   executablePath?: string;
   /** Persistent profile directory (cookies = Figma login). */
   userDataDir: string;
+  /** The profile is one we made (not FIGMA_USER_DATA_DIR), so nobody else's tabs are saved in it. */
+  ownsProfile?: boolean;
   headless: boolean;
   stateDir: string;
 }
@@ -619,6 +621,7 @@ export class BrowserManager {
     const exe = this.opts.executablePath ?? defaultExecutable();
     mkdirSync(this.opts.userDataDir, { recursive: true });
     rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
+    this.forgetSession();
     const launchedAt = Date.now();
     const child = spawnBrowser(exe, [`--user-data-dir=${this.opts.userDataDir}`, "--no-first-run", "--no-default-browser-check", "--new-window", url]);
     await sleep(1500);
@@ -687,9 +690,21 @@ export class BrowserManager {
     throw new Error(`No installed browser could be started.\n${failures.map((f) => `  ${f}`).join("\n")}`);
   }
 
+  /**
+   * Drop the tabs the profile would reopen. Brave restores the last session by default, where Chromium and Chrome
+   * do not: every launch reloaded the editor tabs earlier runs left behind, and a login window came up beside a
+   * restored one whose own Figma login page competed with it for the Google sign-in (both measured on Brave 1.95).
+   * The login is in the cookie DB, not in here. A FIGMA_USER_DATA_DIR profile may be someone's everyday browser, and
+   * the tabs saved in it are theirs.
+   */
+  private forgetSession() {
+    if (this.opts.ownsProfile) rmSync(join(this.opts.userDataDir, "Default", "Sessions"), { recursive: true, force: true });
+  }
+
   private async launchWith(exe: string, headless: boolean, purpose: LaunchRecord["purpose"], url: string): Promise<string> {
     mkdirSync(this.opts.userDataDir, { recursive: true });
     rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
+    this.forgetSession();
     const args = [
       "--remote-debugging-port=0",
       `--user-data-dir=${this.opts.userDataDir}`,

@@ -700,15 +700,16 @@ export class BrowserManager {
    * Sessions_Encrypted too: Chromium is moving to it (EncryptSessionStorage), and from the stage that reads it first,
    * Brave 1.95 run with that stage restored everything from it with Sessions gone.
    *
-   * Best effort. A browser still running on the profile holds its session files open, and Windows refuses to delete
-   * a file Chromium has open without share-delete; the launch that follows reports that browser, which is the
-   * message worth giving rather than an EBUSY about a directory nobody asked about.
+   * Best effort, each directory on its own. Chromium opens its session files with no sharing at all, so on Windows
+   * a browser still running on the profile makes the delete fail, and so can anything else holding one for a moment
+   * (a scanner, the indexer), which is what the retries are for: Node retries EBUSY and EPERM only when asked. What
+   * still fails leaves the launch to its own outcome, rather than an EBUSY about a directory nobody asked about.
    */
   private forgetSession() {
     if (!this.opts.ownsProfile) return;
     for (const dir of ["Sessions", "Sessions_Encrypted"]) {
       try {
-        rmSync(join(this.opts.userDataDir, "Default", dir), { recursive: true, force: true });
+        rmSync(join(this.opts.userDataDir, "Default", dir), { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
       } catch {}
     }
   }

@@ -17,6 +17,8 @@ export interface BrowserOptions {
   executablePath?: string;
   /** Persistent profile directory (cookies = Figma login). */
   userDataDir: string;
+  /** The profile is one we made (not FIGMA_USER_DATA_DIR), so nobody else's tabs are saved in it. */
+  ownsProfile?: boolean;
   headless: boolean;
   stateDir: string;
 }
@@ -619,6 +621,7 @@ export class BrowserManager {
     const exe = this.opts.executablePath ?? defaultExecutable();
     mkdirSync(this.opts.userDataDir, { recursive: true });
     rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
+    this.forgetSession();
     const launchedAt = Date.now();
     const child = spawnBrowser(exe, [`--user-data-dir=${this.opts.userDataDir}`, "--no-first-run", "--no-default-browser-check", "--new-window", url]);
     await sleep(1500);
@@ -687,9 +690,34 @@ export class BrowserManager {
     throw new Error(`No installed browser could be started.\n${failures.map((f) => `  ${f}`).join("\n")}`);
   }
 
+  /**
+   * Drop the tabs the profile would reopen. Brave 1.95 restores the last session by default, where Chromium 153 opens
+   * only the URL it was given: every launch reloaded the editor tabs earlier runs left behind, and a login window came
+   * up beside a restored one whose own Figma login page competed with it for the Google sign-in. The session files
+   * hold the windows, tabs and their back/forward history; the login is in the cookie DB. A FIGMA_USER_DATA_DIR
+   * profile may be someone's everyday browser, and the tabs saved in it are theirs.
+   *
+   * Sessions_Encrypted too: Chromium is moving to it (EncryptSessionStorage), and from the stage that reads it first,
+   * Brave 1.95 run with that stage restored everything from it with Sessions gone.
+   *
+   * Best effort, each directory on its own. Chromium opens its session files with no sharing at all, so on Windows
+   * a browser still running on the profile makes the delete fail, and so can anything else holding one for a moment
+   * (a scanner, the indexer), which is what the retries are for: Node retries EBUSY and EPERM only when asked. What
+   * still fails leaves the launch to its own outcome, rather than an EBUSY about a directory nobody asked about.
+   */
+  private forgetSession() {
+    if (!this.opts.ownsProfile) return;
+    for (const dir of ["Sessions", "Sessions_Encrypted"]) {
+      try {
+        rmSync(join(this.opts.userDataDir, "Default", dir), { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
+      } catch {}
+    }
+  }
+
   private async launchWith(exe: string, headless: boolean, purpose: LaunchRecord["purpose"], url: string): Promise<string> {
     mkdirSync(this.opts.userDataDir, { recursive: true });
     rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
+    this.forgetSession();
     const args = [
       "--remote-debugging-port=0",
       `--user-data-dir=${this.opts.userDataDir}`,

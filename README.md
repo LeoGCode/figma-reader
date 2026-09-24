@@ -200,6 +200,8 @@ macOS keeps the Linux paths rather than `~/Library`: they work there, and moving
 
 Login flow (managed): the first web call checks the session cookies. If the profile is not logged in, the headless browser is closed and the same profile opens in a **normal visible window on figma.com/login, with no DevTools port** (Google and others refuse sign-in in remotely controlled browsers). Log in and retry: once Figma's auth cookie shows up in the profile's cookie DB (read-only, no DevTools needed) the window is closed gracefully and the login is verified headless; if verification fails the login window reopens. `figma_login` with `wait_seconds` blocks until then. The login persists in the profile.
 
+Tabs the profile would reopen are dropped before each launch (Brave restores the last session by default), so neither the work browser nor the login window comes up with Figma tabs left by earlier runs. The login is untouched: it lives in the cookies, not the session. A profile named by `FIGMA_USER_DATA_DIR` keeps its tabs, since it may be one you browse with.
+
 Headless needs two workarounds, applied automatically: the user agent's `HeadlessChrome` is rewritten (CloudFront answers 403 otherwise) and focus is emulated (Figma ignores shortcuts without it).
 
 A managed browser is shared by all servers and CLI calls using the same profile (found via Chromium's `DevToolsActivePort`) and closed when the last of them exits. A profile can be open in only one browser process: if you have it open normally (without a DevTools port) the server reports it instead of launching.

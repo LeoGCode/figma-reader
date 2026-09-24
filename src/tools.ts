@@ -87,6 +87,7 @@ const browser = new BrowserManager({
   userDataDir: process.env.FIGMA_USER_DATA_DIR
     ? expandHome(process.env.FIGMA_USER_DATA_DIR)
     : accountProfileDir(account.name, executablePath ?? "chromium"),
+  ownsProfile: !process.env.FIGMA_USER_DATA_DIR,
   headless: !/^(0|false|no)$/i.test(process.env.FIGMA_HEADLESS ?? "1"),
   stateDir: defaultStateDir(),
 });

@@ -133,7 +133,7 @@ if (handled) await quit(0);
 
 // Loading the tools resolves the account. A command that reaches the browser registers this process with the shared
 // browser state when it does (a local read or help never does), so from here on always release before exiting.
-const { account, release, tools } = await import("./tools.ts").catch((e) => fatal((e as Error).message, 1));
+const { account, AccountNotChosen, release, tools } = await import("./tools.ts").catch((e) => fatal((e as Error).message, 1));
 const byCommand = new Map(tools.map((t) => [commandName(t.name), t]));
 
 function overview() {
@@ -205,5 +205,8 @@ try {
   await exit(result.isError ? 1 : 0);
 } catch (e) {
   console.error(`${BIN} ${cmd}: ${e instanceof Error ? e.message : String(e)}`);
-  await exit(1);
+  // A call refused for want of an account is bad usage, not a failure: nothing was tried, and the same command fails
+  // the same way every time until --account or the working directory changes, which is what 2 tells a script or an
+  // agent apart from a figma.com call that failed and may succeed on a retry. A bad --account name is 2 as well.
+  await exit(e instanceof AccountNotChosen ? 2 : 1);
 }

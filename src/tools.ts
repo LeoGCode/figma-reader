@@ -15,7 +15,7 @@ import { BrowserManager, defaultExecutable, defaultStateDir } from "./browser.ts
 import { changesSince, diffDocuments, parseSince } from "./changes.ts";
 import { componentUsage, componentUses } from "./component-usage.ts";
 import { DEV_STATUS_FILTERS, devStatusList, neverMarked } from "./dev-status.ts";
-import type { Raw } from "./fig-file.ts";
+import type { FigDocument, Raw } from "./fig-file.ts";
 import { cleanStaleDownloads, FigmaWeb, parseFileRef } from "./figma-web.ts";
 import { groupUnresolved, scanText } from "./instance-text.ts";
 import { imageExt, localFigFiles, outPath } from "./local-files.ts";
@@ -670,6 +670,36 @@ tool(
   },
 );
 
+/**
+ * The pages a call leaves out, for the tools that take exclude_pages: the ones it names, each a page of `pages` (a
+ * name it lacks is a typo, refused as page refuses one), or else, when the call names neither a page nor a node to
+ * scope to, the project's excludePages - of which a file without one of those pages has nothing to skip, the list
+ * being for all of the project's files. [] leaves none out. `from` is the project file when the list came from it.
+ * Excluding the one page asked about answers "nothing" about a page nobody looked at, so that is refused too.
+ */
+function pagesLeftOut(pages: string[], args: { page?: string; exclude_pages?: string[]; scoped?: boolean; asked?: string }) {
+  const { page, exclude_pages, scoped, asked = "asked for" } = args;
+  const noPage = (name: string, what = "") => new Error(`no page named ${JSON.stringify(name)}${what}; pages: ${pages.map((p) => JSON.stringify(p)).join(", ")}`);
+  if (page !== undefined && !pages.includes(page)) throw noPage(page);
+  for (const name of exclude_pages ?? []) if (!pages.includes(name)) throw noPage(name, " to exclude");
+  const fromProject = exclude_pages === undefined && page === undefined && !scoped ? account.config?.excludePages : undefined;
+  const excluded = new Set(exclude_pages ?? fromProject ?? []);
+  if (page !== undefined && excluded.has(page)) throw new Error(`page ${JSON.stringify(page)} is both ${asked} and in exclude_pages`);
+  return { excluded, from: fromProject ? account.config!.path : undefined };
+}
+/** What a result says it left out, in the shape figma_search gave it first: the pages, and the project file they came from. */
+const leftOut = (names: Iterable<string>, from: string | undefined) => {
+  const list = [...names];
+  return list.length ? { excludedPages: list, ...(from ? { excludedPagesFrom: from } : {}) } : {};
+};
+
+/** exclude_pages as figma_diff and figma_changes take it; figma_search words its own. */
+const excludePagesArg = z.array(z.string()).optional().describe(
+  "Pages to leave out, by name, before the limit: their changes neither fill a list nor count in counts, and byPage " +
+    "still counts them. Default: excludePages in the project's .figma-reader.json, unless page is given; an empty list " +
+    "covers every page",
+);
+
 tool(
   "figma_search",
   "Find nodes by name (and optionally text content). The query is a literal substring, case-insensitive unless case_sensitive: " +
@@ -717,19 +747,10 @@ tool(
     const { re, as } = searchPattern(query, { regex, caseSensitive: case_sensitive });
     // An empty list means no filter: as a filter it would match nothing.
     const typeSet = types?.length ? new Set(types.map((t) => t.toUpperCase())) : undefined;
-    const noPage = (name: string, what = "") =>
-      new Error(`no page named ${JSON.stringify(name)}${what}; pages: ${doc.pages().map((p) => JSON.stringify(p.name)).join(", ")}`);
-    if (page && !doc.pages().some((p) => p.name === page)) throw noPage(page);
     // Agents left archive and template pages out with jq after the limit, by which time the walk had stopped
     // collecting: a query with 1,737 matches and limit 300 showed the first 300 in page order, and hits on later pages
-    // were never seen. So pages are skipped here, before a hit is counted. A name this call gives that the file does not
-    // have is a typo, refused as page refuses one; the project's list is for all of its files, and a file without one of
-    // those pages has nothing to skip.
-    const fromProject = exclude_pages === undefined && !page && !scope ? account.config?.excludePages : undefined;
-    for (const name of exclude_pages ?? []) if (!doc.pages().some((p) => p.name === name)) throw noPage(name, " to exclude");
-    const excluded = new Set(exclude_pages ?? fromProject ?? []);
-    // Excluding the one page searched would answer "no hits" about a page nobody looked at.
-    if (page && excluded.has(page)) throw new Error(`page ${JSON.stringify(page)} is both searched and in exclude_pages`);
+    // were never seen. So pages are skipped here, before a hit is counted.
+    const { excluded, from } = pagesLeftOut(doc.pages().map((p) => p.name), { page: page || undefined, exclude_pages, scoped: !!scope, asked: "searched" });
     if (scope && scopePage && excluded.has(scopePage.name)) {
       throw new Error(`node ${scope.id} is on page ${JSON.stringify(scopePage.name)}, which exclude_pages leaves out`);
     }
@@ -793,7 +814,7 @@ tool(
       ...(scope ? { searchedNode: scope.id } : {}),
       // Leaving pages out is never silent, least of all when this call did not ask for it: the result names them, and
       // where the default came from.
-      ...(excludedPages.size ? { excludedPages: [...excludedPages], ...(fromProject ? { excludedPagesFrom: account.config!.path } : {}) } : {}),
+      ...leftOut(excludedPages, from),
       returned: results.length,
       total,
       truncated: total > results.length,
@@ -1140,11 +1161,15 @@ tool(
     "what is the same layer: pages added, removed or renamed; top-level layers (a page's children, and the children of " +
     "its sections) added, removed, renamed (same id, other name) or moved (same id, other parent, so a move to another " +
     "page shows in from.page/to.page; a layer carried inside a moved section keeps its parent and is not listed); and " +
-    "removedNodes, every node gone from the visible pages at any depth with the page and path it had, the topmost of " +
-    "each removed subtree first and the rest naming it in removedWith. Only ids, names and parents are compared: an " +
-    "edit to text, fills, sizes or any other property is reported nowhere. Every list stops at limit, counts has each " +
-    "total, and truncated says whether any list was cut. A node created and deleted between the two snapshots is in " +
-    "neither. old may be the word previous: the snapshot this account's cache held for new's key before its latest " +
+    "removedNodes, the topmost node of each subtree gone from the visible pages, with the page and path it had and " +
+    "removedCount, how many nodes went with it (itself included); figma_locate on old and new answers for any id under " +
+    "it. Only ids, names and parents are compared: an edit to text, fills, sizes or any other property is reported " +
+    "nowhere. byPage counts each page's added, removed, renamed, moved (moved in; movedOut, moved from it to another " +
+    "page) and removedNodes, every page counted, excluded ones too: read it, then pass page for the one you need. page " +
+    "or exclude_pages (default: the project's excludePages, echoed as excludedPages) narrow the lists before the " +
+    "limit. Every list stops at limit, shared between the pages it covers so a page with many changes cannot crowd out " +
+    "the rest; counts has each total, and truncated says whether any list was cut. A node created and deleted between " +
+    "the two snapshots is in neither. old may be the word previous: the snapshot this account's cache held for new's key before its latest " +
     "export (one per key, kept by every export that replaces a snapshot). new is then read from that cache, never from " +
     "a local copy, and refresh exports it again first, which keeps the snapshot it replaces as previous: so " +
     "'previous <key>' with refresh compares the last export with the live file. old and new are each dated as the " +
@@ -1153,21 +1178,29 @@ tool(
   {
     old: z.string().describe("The older file: a .fig path, file key or figma.com URL, or the word previous for the snapshot that new's latest export replaced"),
     new: z.string().describe("The newer file: a .fig path, file key or figma.com URL; a key or URL when old is previous. A node-id in a URL is ignored"),
+    page: z.string().optional().describe("Only changes on this page, by its name in either file; a name neither has is an error listing the pages"),
+    exclude_pages: excludePagesArg,
     limit: z.number().int().positive().optional().describe("Most entries in each list (default 100)"),
     refresh: z.boolean().optional().describe(
       "Export new again through the browser first (old is never refreshed). Has no effect when new is a path to a .fig, " +
         "and the result's new carries refreshIgnored",
     ),
   },
-  async ({ old, new: next, limit, refresh }) => {
+  async ({ old, new: next, page, exclude_pages, limit, refresh }) => {
     const max = limit ?? 100;
+    // The pages of both files: a page only the old one has is where its removals were.
+    const diff = (o: FigDocument, n: FigDocument) => {
+      const names = [...new Set([...n.pages(), ...o.pages()].map((p) => p.name))];
+      const { excluded, from } = pagesLeftOut(names, { page, exclude_pages });
+      return { ...leftOut(names.filter((p) => excluded.has(p)), from), ...diffDocuments(o, n, max, { page, exclude: excluded }) };
+    };
     if (old.trim().toLowerCase() !== PREVIOUS) {
       // Both settled before either is read, so a key on either side is refused before the other side is decoded.
       const sides = [resolveFile(next, refresh), resolveFile(old)];
       const n = await read(sides[0]);
       const o = await read(sides[1]);
       const side = (s: typeof n) => ({ key: s.key, source: s.source, path: s.path, ...s.dated });
-      return json({ old: side(o), new: side(n), ...diffDocuments(o.doc, n.doc, max) });
+      return json({ old: side(o), new: side(n), ...diff(o.doc, n.doc) });
     }
     const ref = parseFileRef(next);
     if (ref.path) {
@@ -1194,7 +1227,7 @@ tool(
     return json({
       old: { key: ref.key, source: PREVIOUS, path: store.previousPath(ref.key), exportedAt: prev.exportedAt.toISOString(), account: accountRef },
       new: { key: ref.key, source: "web", exportedAt: doc.exportedAt.toISOString(), account: accountRef },
-      ...diffDocuments(prev, doc, max),
+      ...diff(prev, doc),
     });
   },
 );
@@ -1207,7 +1240,10 @@ tool(
     "itself was; page and path say where it is. Newest first; the editedNodes beside the list counts each such node " +
     "once. This is edit metadata from one snapshot: it shows nothing deleted (figma_diff lists removals) and never what " +
     "an edit was, only when. A node that records no time counts only where Figma also moved an ancestor's; " +
-    "undatedNodes counts those, and text layers are among them in every export seen. " +
+    "undatedNodes counts those, and text layers are among them in every export seen. byPage counts each page's layers " +
+    "and editedNodes, every page counted, excluded ones too; page or exclude_pages (default: the project's " +
+    "excludePages, echoed as excludedPages) narrow the list and its counts before the limit, which is shared between " +
+    "pages so one page cannot crowd out the rest. " +
     EXPORTED_AT_NOTE,
   {
     file: fileArg,
@@ -1215,14 +1251,18 @@ tool(
       "An ISO-8601 date (2026-10-01, midnight UTC) or date and time (2026-10-01T09:30:00Z; local time without an offset), " +
         "or a duration back from now: 30m, 12h, 7d, 2w. The result's since is the instant it was read as",
     ),
+    page: z.string().optional().describe("Only layers on this page; a name no page has is an error listing the pages"),
+    exclude_pages: excludePagesArg,
     limit: z.number().int().positive().optional().describe("Default 50"),
     refresh: refreshArg,
   },
-  async ({ file, since, limit, refresh }) => {
+  async ({ file, since, page, exclude_pages, limit, refresh }) => {
     // Read before the file, so a typo is reported without waiting for an export.
     const at = parseSince(since);
     const { doc, dated } = await open(file, refresh);
-    return json({ ...dated, ...changesSince(doc, at, limit ?? 50) });
+    const names = doc.pages().map((p) => p.name);
+    const { excluded, from } = pagesLeftOut(names, { page, exclude_pages });
+    return json({ ...dated, ...leftOut(names.filter((p) => excluded.has(p)), from), ...changesSince(doc, at, limit ?? 50, { page, exclude: excluded }) });
   },
 );
 

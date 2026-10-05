@@ -53,7 +53,10 @@ export interface ProjectConfig {
   account?: string;
   /** Absolute; relative entries in the file are resolved against the file's directory. */
   filesDirs?: string[];
-  /** Pages figma_search leaves out by default, by name: archives, templates, a copied design system. */
+  /**
+   * Pages figma_search, figma_diff and figma_changes leave out by default, by name: archives, templates, a copied
+   * design system.
+   */
   excludePages?: string[];
 }
 

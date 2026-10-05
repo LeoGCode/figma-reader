@@ -3,7 +3,7 @@
 // happened, or to cite an id that is gone - both happened by hand before these tools existed.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { changesSince, diffDocuments, parseSince, topLevelLayers } from "../src/changes.ts";
+import { changesSince, diffDocuments, parseSince, sharedByPage, topLevelLayers } from "../src/changes.ts";
 import { figDoc, internalPage, type TestNode } from "./fixtures.ts";
 
 const ids = (l: Record<string, any>[]) => l.map((e) => e.id);
@@ -109,22 +109,44 @@ describe("diffDocuments", () => {
     assert.equal(d.layers.moved.find((m) => m.id === "4:1")!.to.path, "Screens v2 / Sign in / Settings");
   });
 
-  it("lists every node removed from the visible pages, the top of each removed subtree first", () => {
-    // 1:3 went from inside a frame that is still there: the cited-id case a top-level comparison cannot see.
-    assert.deepEqual(d.removedNodes.map((r) => [r.id, r.page, r.path, r.removedWith]), [
-      ["1:3", "Screens", "Screens / Login / Form / Password hint", undefined],
-      ["2:1", "Screens", "Screens / Signup", undefined],
-      ["7:2", "Screens", "Screens / Popover / Arrow", undefined],
-      ["2:2", "Screens", "Screens / Signup / Header", "2:1"],
-      ["2:3", "Screens", "Screens / Signup / Header / Logo", "2:1"],
+  it("lists the top of every subtree removed from the visible pages, with how many nodes went with it", () => {
+    // 1:3 went from inside a frame that is still there: the cited-id case a top-level comparison cannot see. 2:1 took
+    // its header and logo with it, which are counted on it rather than listed: on two real snapshots 28 roots took
+    // 5,404 nodes, and listing them all spent the limit inside the first root.
+    assert.deepEqual(d.removedNodes.map((r) => [r.id, r.page, r.path, r.removedCount]), [
+      ["1:3", "Screens", "Screens / Login / Form / Password hint", 1],
+      ["2:1", "Screens", "Screens / Signup", 3],
+      ["7:2", "Screens", "Screens / Popover / Arrow", 1],
     ]);
     assert.ok(!d.removedNodes.some((r) => r.id === "8:1"), "the internal-only page holds library copies, not layers");
     assert.deepEqual(d.counts, {
       pagesAdded: 1, pagesRemoved: 0, pagesRenamed: 1,
       layersAdded: 2, layersRemoved: 1, layersRenamed: 1, layersMoved: 4,
-      removedNodes: 5,
+      removedRoots: 3, removedNodes: 5,
     });
     assert.equal(d.truncated, false);
+  });
+
+  it("counts each page's changes in byPage, under the name the new file gives the page", () => {
+    // Screens was renamed Screens v2: its removals are counted there, and the two layers that left for Archive are
+    // moved in on Archive and moved out on the page they left.
+    assert.deepEqual(d.byPage, {
+      "Screens v2": { removedNodes: 5, added: 2, removed: 1, renamed: 1, moved: 2, movedOut: 2 },
+      Archive: { moved: 2 },
+    });
+  });
+
+  it("narrows every list to a page, or leaves pages out, before the limit, and byPage still counts them all", () => {
+    const archive = diffDocuments(before, after, 100, { page: "Archive" });
+    assert.deepEqual([ids(archive.layers.added), ids(archive.layers.removed), ids(archive.layers.moved), ids(archive.removedNodes)], [[], [], ["3:1", "6:1"], []]);
+    assert.deepEqual([archive.counts.layersMoved, archive.counts.removedNodes, archive.counts.pagesRenamed], [2, 0, 0]);
+    assert.deepEqual(archive.byPage, d.byPage);
+    // A layer that moved between an excluded page and a kept one is the kept page's news too.
+    const kept = diffDocuments(before, after, 100, { exclude: new Set(["Screens v2"]) });
+    assert.deepEqual([ids(kept.layers.added), ids(kept.layers.moved), kept.counts.removedRoots], [[], ["3:1", "6:1"], 0]);
+    // The page renamed is covered by either name.
+    assert.equal(diffDocuments(before, after, 100, { page: "Screens v2" }).counts.pagesRenamed, 1);
+    assert.equal(diffDocuments(before, after, 100, { page: "Screens v2" }).counts.removedNodes, 5);
   });
 
   it("stops every list at the limit, and says so while counts keeps the totals", () => {
@@ -146,6 +168,20 @@ describe("diffDocuments", () => {
     const gone = diffDocuments(after, figDoc([{ ...pageA, name: "Screens v2" }, internalPage]), 100);
     assert.deepEqual(gone.pages.removed, [{ id: "0:2", name: "Archive" }, { id: "0:3", name: "New page" }]);
     assert.deepEqual(ids(gone.layers.removed).sort(), ["1:1", "3:1", "5:1", "5:2", "5:3", "6:1", "6:2", "7:1", "9:1", "9:2"]);
+  });
+});
+
+describe("sharedByPage", () => {
+  const list = [...Array(10).fill("A"), "B", "B", ...Array(5).fill("C")].map((page, i) => ({ page, i }));
+  const pages = (l: { page: string }[]) => l.map((e) => e.page).join("");
+
+  it("shows a page with few entries whole, and shares the rest evenly, in the list's own order", () => {
+    // In list order the first page took the whole limit and the later ones showed nothing.
+    assert.equal(pages(sharedByPage(list, (e) => e.page, 6)), "AABBCC");
+    assert.equal(pages(sharedByPage(list, (e) => e.page, 7)), "AAABBCC", "one more for the first page still cut");
+    assert.equal(pages(sharedByPage(list, (e) => e.page, 11)), "AAAAABBCCCC");
+    assert.deepEqual(sharedByPage(list, (e) => e.page, 17), list, "all of it when it fits");
+    assert.ok(sharedByPage(list, (e) => e.page, 7).every((e, i, l) => !i || l[i - 1].i < e.i), "in order");
   });
 });
 
@@ -231,6 +267,24 @@ describe("changesSince", () => {
   it("stops at the limit and says how many there were", () => {
     const r = changesSince(doc, since, 2);
     assert.deepEqual([r.returned, r.total, r.truncated, ids(r.layers)], [2, 5, true, ["1:1", "3:1"]]);
+  });
+
+  it("shares its limit between pages, narrows to pages before it, and counts every page in byPage", () => {
+    const two = figDoc([
+      { id: "0:1", type: "CANVAS", parent: "0:0", name: "Product" },
+      { id: "1:1", type: "FRAME", parent: "0:1", name: "Checkout", ...at(T + 10) },
+      { id: "1:2", type: "FRAME", parent: "0:1", name: "Cart", ...at(T + 20) },
+      { id: "0:2", type: "CANVAS", parent: "0:0", name: "Design system" },
+      // Ten newer edits on another page: newest first, they took the whole limit.
+      ...Array.from({ length: 10 }, (_, i): TestNode => ({ id: `2:${i + 1}`, type: "SYMBOL", parent: "0:2", name: `Icon ${i}`, ...at(T + 100 + i) })),
+    ]);
+    const r = changesSince(two, since, 4);
+    assert.deepEqual([ids(r.layers), r.total, r.truncated], [["2:10", "2:9", "1:2", "1:1"], 12, true]);
+    assert.deepEqual(r.byPage, { Product: { editedNodes: 2, layers: 2 }, "Design system": { editedNodes: 10, layers: 10 } });
+    const product = changesSince(two, since, 4, { exclude: new Set(["Design system"]) });
+    assert.deepEqual([ids(product.layers), product.total, product.truncated, product.editedNodes], [["1:2", "1:1"], 2, false, 2]);
+    assert.deepEqual(product.byPage, r.byPage);
+    assert.deepEqual(ids(changesSince(two, since, 50, { page: "Design system" }).layers).length, 10);
   });
 
   it("lists nothing when nothing is that recent", () => {

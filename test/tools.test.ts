@@ -829,6 +829,37 @@ describe("figma_diff", () => {
     assert.deepEqual([r.old.refreshIgnored, r.new.refreshIgnored], [undefined, true]);
   });
 
+  it("leaves out the project's excludePages before the limit, says so, and takes page and exclude_pages as search does", async () => {
+    // This test's project file excludes Archive (and Gone, which no file here has). An archive page full of moves
+    // would otherwise take the list's place, and its changes are still counted in byPage.
+    const ids = (l: { id: string }[]) => l.map((e) => e.id);
+    const edited = { editInfo: { createdAt: Date.parse("2026-10-01T00:00:00Z") / 1000, lastEditedAt: Date.parse("2026-10-02T00:00:00Z") / 1000 } };
+    const screens = { id: "0:1", type: "CANVAS", parent: "0:0", name: "Screens" } as TestNode;
+    const archive = { id: "0:2", type: "CANVAS", parent: "0:0", name: "Archive" } as TestNode;
+    const was = figFile("diff-pages-before", [screens, archive, ...many(5, (i) => ({ id: `2:${i + 1}`, type: "FRAME", parent: "0:2", name: `old ${i}` }))]);
+    const is = figFile("diff-pages-after", [
+      screens, archive,
+      { id: "1:1", type: "FRAME", parent: "0:1", name: "Paywall", ...edited },
+      ...many(5, (i) => ({ id: `3:${i + 1}`, type: "FRAME", parent: "0:2", name: `archived ${i}`, ...edited })),
+    ]);
+    const r = await call("figma_diff", { old: was, new: is });
+    assert.deepEqual([r.excludedPages, r.excludedPagesFrom], [["Archive"], projectFile]);
+    assert.deepEqual([ids(r.layers.added), ids(r.layers.removed), r.counts.layersAdded, r.counts.removedNodes], [["1:1"], [], 1, 0]);
+    assert.deepEqual(r.byPage, { Archive: { removedNodes: 5, added: 5, removed: 5 }, Screens: { added: 1 } });
+    // [] covers every page; a page asked for sets the default aside; a name neither file has is refused.
+    const every = await call("figma_diff", { old: was, new: is, exclude_pages: [], limit: 2 });
+    assert.deepEqual([every.excludedPages, ids(every.layers.added), every.truncated], [undefined, ["1:1", "3:1"], true], "shared between the two pages");
+    assert.deepEqual(ids((await call("figma_diff", { old: was, new: is, page: "Archive" })).layers.removed).length, 5);
+    await assert.rejects(body("figma_diff", { old: was, new: is, page: "Archiv" }), /no page named "Archiv"; pages: "Screens", "Archive"/);
+    await assert.rejects(body("figma_diff", { old: was, new: is, exclude_pages: ["Old"] }), /no page named "Old" to exclude/);
+    await assert.rejects(body("figma_diff", { old: was, new: is, page: "Archive", exclude_pages: ["Archive"] }), /page "Archive" is both asked for and in exclude_pages/);
+    // changes takes the same, over one file.
+    const c = await call("figma_changes", { file: is, since: "2026-09-30" });
+    assert.deepEqual([c.excludedPages, c.excludedPagesFrom, ids(c.layers), c.editedNodes], [["Archive"], projectFile, ["1:1"], 1]);
+    assert.deepEqual(c.byPage, { Screens: { editedNodes: 1, layers: 1 }, Archive: { editedNodes: 5, layers: 5 } });
+    await assert.rejects(body("figma_changes", { file: is, since: "7d", page: "Nope" }), /no page named "Nope"/);
+  });
+
   describe("against previous", () => {
     const key = "PREVKEY12345";
     const cache = join(root, "cache", "accounts", "tools-test");

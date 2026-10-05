@@ -38,8 +38,8 @@ JSON on stdout unless marked text. Shapes name the keys you need, not every key;
 | `get-styles` | json: `[{name, type, value}]`, `value` by type `{paints}`, font fields, `{effects}` or `{grids}`; css: `:root` properties and a class per text style |
 | `get-components` | `{D, componentSets[{id, name, page, variants[{id, name, instances, swapInstances}]}], components[{id, name, page, size, instances, swapInstances}], libraryComponentsUsed[{name, variantsUsed?, instances, swapInstances}]}` |
 | `dev-status` | `{D, returned, total, truncated, neverMarked?, nodes[{id, type, name, page, path, status, raw, previous, previousRaw, changedAt, by?, note?}]}`; `status` is `ready_for_dev`, `completed`, `none` or `unknown`, `raw` what Figma stores (`BUILD`); `neverMarked` counts the never-marked records the default left out, which `--status any` lists |
-| `diff` | `{old{key?, source, path?, D}, new{…}, limit, truncated, counts, pages{added, removed, renamed}, layers{added, removed, renamed, moved}, removedNodes[{id, type, name, page, path, removedWith?}]}` |
-| `changes` | `{D, since, returned, total, truncated, limit, editedNodes, undatedNodes, layers[{id, name, type, page, path, lastEditedAt, created, editedNodes}]}` |
+| `diff` | `{old{key?, source, path?, D}, new{…}, excludedPages?, limit, truncated, counts, byPage{<page>: {added?, removed?, renamed?, moved?, movedOut?, removedNodes?}}, pages{added, removed, renamed}, layers{added, removed, renamed, moved}, removedNodes[{id, type, name, page, path, removedCount}]}`: `removedNodes` holds the top of each removed subtree; read `byPage`, then `--page` |
+| `changes` | `{D, excludedPages?, since, returned, total, truncated, limit, editedNodes, undatedNodes, byPage{<page>: {layers, editedNodes}}, layers[{id, name, type, page, path, lastEditedAt, created, editedNodes}]}` |
 | `token-usage` | `{D, colors, typography, cornerRadii, gaps, paddings, strokeWidths, effects, textWithoutTypography?}`: colors `[{value, roles{fill\|text\|stroke: n}, count, variables?, styles?}]`, typography `[{<font fields>, count, styles?}]`, effects `[{type, color?, offset?, radius?, spread?, count}]`, the other four `[{value, count}]` |
 | `screenshot` | Text: `image written to <path>`, then `node <id>: <w>x<h>` (`page (all top-level layers) <id>: …` for a page); with `--save-path`, only that line, ending `saved to <path>` |
 | `export-image-fills` | `[{hash, path, bytes, usedBy, usedByTotal?}]`, one per image; `{hash, missing: true, usedBy}` where the export lacks it |
@@ -55,7 +55,7 @@ Lists take commas (`--types FRAME,TEXT`), booleans are bare; `figma-reader help 
 - `get-text`: `--node-id`, `--include-hidden`, `--limit` (500); `token-usage`: `--node-id`, `--include-hidden`, `--min-count`
 - `get-variables`: `--format json|css|dtcg`, `--collection`, `--no-include-remote`, `--out-file`; `get-styles`: `--type FILL|STROKE|TEXT|EFFECT|GRID`, `--format json|css`, `--out-file`; `get-components`: `--query`
 - `screenshot`: `--node-id`, `--save-path`, `--max-dimension` (1568); `export-image-fills <file> <out_dir>`: `--node-id`
-- `locate`: `--node-ids` (required); `dev-status`: `--page`, `--status ready_for_dev|completed|none|any`, `--limit` (100); `diff <old> <new>`: `--limit` (100); `changes <file> <since>`: `--limit` (50)
+- `locate`: `--node-ids` (required); `dev-status`: `--page`, `--status ready_for_dev|completed|none|any`, `--limit` (100); `diff <old> <new>`: `--page`, `--exclude-page`, `--limit` (100); `changes <file> <since>`: `--page`, `--exclude-page`, `--limit` (50)
 
 ## Rules
 

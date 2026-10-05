@@ -251,6 +251,11 @@ export function datingRule(name = (tool: string) => tool, arg = (a: string) => a
 const EXPORTED_AT_NOTE =
   "Dated by exportedAt and account, or fileModifiedAt for a file read from disk, as the server's instructions say " +
   "(figma-reader help on the command line).";
+/**
+ * Said in the description of every tool whose entries carry path, which cannot always be split back into its layers:
+ * see FigDocument.pathFields.
+ */
+const PATH_NOTE = "Where a name in path holds ' / ' itself, pathIds follows it: one id per name, page first.";
 /** Missing components listed by figma_get_text; the rest are counted, never dropped silently. */
 const MAX_UNRESOLVED_GROUPS = 20;
 
@@ -616,7 +621,7 @@ tool(
     "markdown, category, the properties pinned) and measurements (from/to node ids and sides; the distance itself is not " +
     "stored). devStatus is absent on a node never marked: a record that is none and was none, with no user or note on " +
     "it, is one Figma keeps on components nobody marked, and only figma_dev_status with status none or any lists it. " +
-    EXPORTED_AT_NOTE,
+    `${PATH_NOTE} ${EXPORTED_AT_NOTE}`,
   {
     file: fileArg,
     node_id: z.string().optional(),
@@ -630,7 +635,7 @@ tool(
     const n = doc.require(id);
     const parent = n.parentId ? doc.get(n.parentId) : undefined;
     const data = new Normalizer(doc).node(n, depth ?? 3, parent);
-    const out = JSON.stringify({ ...dated, page: doc.pageOf(n)?.name, path: doc.path(n), ...data }, null, 1);
+    const out = JSON.stringify({ ...dated, page: doc.pageOf(n)?.name, ...doc.pathFields(n), ...data }, null, 1);
     if (out.length > 200_000) throw new Error(`result is ${Math.round(out.length / 1000)}KB; use a smaller depth or a deeper node_id`);
     return text(out);
   },
@@ -658,7 +663,7 @@ tool(
     "for a node the file has (path from the page down, as figma_get_node gives it), {id, found: false} for one it has " +
     "not, and {id, error} for a string that is not a node id. found, missing and invalid count the entries. found: false " +
     "is said only of a file that was read: one that cannot be read fails the whole call. " +
-    EXPORTED_AT_NOTE,
+    `${PATH_NOTE} ${EXPORTED_AT_NOTE}`,
   {
     file: fileArg,
     node_ids: z.array(z.string()).min(1).describe("The node ids to look up, like 12:34 (or 12-34)"),
@@ -679,7 +684,7 @@ tool(
         return { id, found: false };
       }
       count.found++;
-      return { id, found: true, type: displayType(n), name: n.name, page: doc.pageOf(n)?.name, path: doc.path(n) };
+      return { id, found: true, type: displayType(n), name: n.name, page: doc.pageOf(n)?.name, ...doc.pathFields(n) };
     });
     return json({ ...dated, ...count, results });
   },
@@ -992,7 +997,7 @@ tool(
     "none or any unless a user or note on it says a person left it. With no status given, neverMarked counts those " +
     "records the listing left out (absent when it left none out); status any lists them. " +
     "Internal-only pages, soft-deleted nodes and superseded library copies are left out. " +
-    EXPORTED_AT_NOTE,
+    `${PATH_NOTE} ${EXPORTED_AT_NOTE}`,
   {
     file: fileArg,
     page: z.string().optional().describe("Only nodes on this page; a name no page has is an error listing the pages"),
@@ -1189,7 +1194,8 @@ tool(
     "that cache, never from " +
     "a local copy, and refresh exports it again first, which keeps the snapshot it replaces as previous: so " +
     "'previous <key>' with refresh compares the last export with the live file. old and new are each dated, as the " +
-    "server's instructions say: report the changes as between those two times.",
+    "server's instructions say: report the changes as between those two times. " +
+    PATH_NOTE,
   {
     old: z.string().describe("The older file: a .fig path, file key or figma.com URL, or the word previous for the snapshot that new's latest export replaced"),
     new: z.string().describe("The newer file: a .fig path, file key or figma.com URL; a key or URL when old is previous. A node-id in a URL is ignored"),
@@ -1259,7 +1265,7 @@ tool(
     "and editedNodes, every page counted, excluded ones too; page or exclude_pages (default: the project's " +
     "excludePages, echoed as excludedPages) narrow the list and its counts before the limit, which is shared between " +
     "pages so one page cannot crowd out the rest. " +
-    EXPORTED_AT_NOTE,
+    `${PATH_NOTE} ${EXPORTED_AT_NOTE}`,
   {
     file: fileArg,
     since: z.string().describe(

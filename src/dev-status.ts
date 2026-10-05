@@ -12,6 +12,8 @@ export interface DevStatusEntry extends DevStatus {
   name: string;
   page: string;
   path: string;
+  /** Only where a name in path holds " / " (see FigDocument.pathFields). */
+  pathIds?: string[];
 }
 
 /**
@@ -31,7 +33,7 @@ export function devStatusList(doc: FigDocument, opts: { page?: string; status?: 
     const wanted = opts.status === "any" || (opts.status ? d.status === opts.status : devStatusShown(d));
     if (!wanted) continue;
     found.push({
-      entry: { id: n.id, type: displayType(n), name: n.name, page: page.name, path: doc.path(n), ...d },
+      entry: { id: n.id, type: displayType(n), name: n.name, page: page.name, ...doc.pathFields(n), ...d },
       at: n.sectionStatusInfo.lastUpdateUnixTimestamp ?? 0,
     });
   }

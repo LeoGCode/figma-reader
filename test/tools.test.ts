@@ -426,6 +426,7 @@ describe("figma_get_text", () => {
     assert.equal(r.unresolvedComponentsOmitted, 5);
     assert.match(r.unresolved[0].reason, /main component is not present in this file/);
   });
+
 });
 
 // A handoff called 12 node ids "gone" after looking up 5 of them, one process per id: 5 of the other 7 were there.
@@ -466,6 +467,24 @@ describe("figma_locate", () => {
     assert.match(r.results[0].error, /not a node id: .*only the instance, 1:1, is a node of the file/);
     for (const e of r.results.slice(1, 4)) assert.match(e.error, /^not a node id: node ids look like 12:34 \(or 12-34\)$/, e.id);
     assert.equal(r.results[4].found, false);
+  });
+
+  it("gives the ids of a path's names where a name holds the separator, as figma_get_node does", async () => {
+    // "Page / Button / Primary / Label" reads as a layer Button holding a layer Primary.
+    const slashed = figFile("locate-slashed", [
+      page,
+      { id: "1:1", type: "FRAME", parent: "0:1", name: "Button / Primary" },
+      { id: "1:2", type: "TEXT", parent: "1:1", name: "Label", textData: { characters: "Buy" } },
+      { id: "1:3", type: "FRAME", parent: "0:1", name: "Card" },
+    ]);
+    const r = await call("figma_locate", { file: slashed, node_ids: ["1:2", "1:3"] });
+    assert.deepEqual(r.results, [
+      { id: "1:2", found: true, type: "TEXT", name: "Label", page: "Page", path: "Page / Button / Primary / Label", pathIds: ["0:1", "1:1", "1:2"] },
+      { id: "1:3", found: true, type: "FRAME", name: "Card", page: "Page", path: "Page / Card" },
+    ]);
+    const node = await call("figma_get_node", { file: slashed, node_id: "1:2", depth: 0 });
+    assert.deepEqual([node.path, node.pathIds], ["Page / Button / Primary / Label", ["0:1", "1:1", "1:2"]]);
+    assert.ok(!("pathIds" in (await call("figma_get_node", { file: slashed, node_id: "1:3", depth: 0 }))));
   });
 
   it("needs at least one id", () => {

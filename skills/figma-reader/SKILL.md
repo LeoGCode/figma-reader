@@ -31,7 +31,7 @@ Read-only CLI: `figma-reader <command> <file> [flags]`. `<file>` is a local `.fi
 
 ## Output
 
-JSON on stdout unless marked text; exit 0 ok, 1 failed (message on stderr), 2 bad usage or no account chosen. `D` is the date field (Rules). Keys you need, not every key:
+JSON on stdout unless marked text; exit 0 ok, 1 failed (message on stderr), 2 bad usage or no account chosen. `D` is the date field (Rules). A name in a `path` may hold ` / `: then `pathIds` has one id per name. Keys you need, not every key:
 
 - `get-tree` (**text**: `grep`, not `jq`): line 1 `# {D}`, then `- <id> <TYPE> "<name>" <w>x<h> (<hints>)`, two spaces per level. Hints: `hidden`, `of "<component>"`, a text preview, `ready for dev`, `<n> children` (not opened), `<n> vectors`. A cut branch ends `- ... N more children`; a last line `level N not shown` names the `--max-nodes` that shows it.
 - `get-node`: one flat object, no wrapper: `{D, page, path, id, name, type, width, height, fills, layout, component, devStatus?, children[] or childCount}`. On TEXT, `characters` is the string and `text` the **style**.

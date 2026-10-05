@@ -164,3 +164,29 @@ test("a parent cycle in a corrupt file does not hang path, pageOf or walk", () =
   assert.equal(doc.pageOf(doc.require("2:1")), undefined);
   assert.deepEqual([...doc.walk(doc.require("2:1"))].map((n) => n.id), ["2:1", "2:2"]);
 });
+
+test("a path that cannot be split back into its names carries the ids of the layers it names, and only then", () => {
+  // Component naming puts " / " in names, and "Checkout / Button / Primary" then reads as three layers where there are
+  // two. pathIds says which: one id per name, page first, so the last is the node itself.
+  const doc = figDoc([
+    { id: "0:1", type: "CANVAS", parent: "0:0", name: "Checkout" },
+    { id: "1:1", type: "FRAME", parent: "0:1", name: "Button / Primary" },
+    { id: "1:2", type: "TEXT", parent: "1:1", name: "Label" },
+    { id: "2:1", type: "FRAME", parent: "0:1", name: "Icons/Arrow" },
+    { id: "2:2", type: "FRAME", parent: "2:1", name: "Left" },
+    // "Cart /" then "Total" joins to "Checkout / Cart / / Total", which splits into as many parts as there are names
+    // and names a layer "/ Total" that is not there: counting the parts would not have caught it.
+    { id: "3:1", type: "FRAME", parent: "0:1", name: "Cart /" },
+    { id: "3:2", type: "FRAME", parent: "3:1", name: "Total" },
+    { id: "0:2", type: "CANVAS", parent: "0:0", name: "Archive / 2025" },
+  ]);
+  const at = (id: string) => doc.pathFields(doc.require(id));
+  assert.deepEqual(at("1:2"), { path: "Checkout / Button / Primary / Label", pathIds: ["0:1", "1:1", "1:2"] });
+  assert.deepEqual(at("1:1"), { path: "Checkout / Button / Primary", pathIds: ["0:1", "1:1"] });
+  assert.deepEqual(at("3:2"), { path: "Checkout / Cart / / Total", pathIds: ["0:1", "3:1", "3:2"] });
+  assert.deepEqual(at("0:2"), { path: "Archive / 2025", pathIds: ["0:2"] });
+  // A slash with no spaces around it separates nothing: that path splits back into its names, and carries no ids.
+  assert.deepEqual(at("2:2"), { path: "Checkout / Icons/Arrow / Left" });
+  assert.deepEqual(at("0:1"), { path: "Checkout" });
+  assert.equal(doc.path(doc.require("1:2")), at("1:2").path);
+});

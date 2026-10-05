@@ -33,8 +33,8 @@ test("each line carries id, type, name, size and the hints that identify a layer
 
 test("the document root lists visible pages, and nodes below the depth are counted, not listed", () => {
   assert.equal(outline(doc, root(doc), 0, 100), [
-    '- 0:1 PAGE "Screens" (1 children)',
-    '- 0:2 PAGE "Components" (1 children)',
+    '- 0:1 PAGE "Screens" (1 child)',
+    '- 0:2 PAGE "Components" (1 child)',
   ].join("\n"));
 });
 
@@ -72,11 +72,13 @@ test("output stops at max_nodes and says so, but only when something was left ou
     "  - ... 2 more children",
     "... truncated at 3 nodes; use a node_id or smaller depth",
   ]);
-  // No room for a child and its marker: the frame says how many children it has instead, as it does at the depth.
+  // No room for a child and its marker: the frame says how many children it has instead, as it does at the depth,
+  // and the last line says which level did not start and what it would take, since nothing above it was cut.
   assert.deepEqual(outline(doc, doc.require("1:1"), 1, 2).split("\n"), [
     '- 1:1 FRAME "Login" 390x844 (auto-layout vertical, 3 children)',
-    "... truncated at 2 nodes; use a node_id or smaller depth",
+    "... level 1 not shown: 1 layer has children, 1 of 2 lines left; open one with node_id, or pass max_nodes 3",
   ]);
+  assert.equal(outline(doc, doc.require("1:1"), 1, 3).split("\n")[1], '  - 1:2 TEXT "Title" ("Welcome back")', "and 3 starts it");
   // Exactly max_nodes nodes fit: nothing was cut, so no truncation note.
   assert.doesNotMatch(outline(doc, doc.require("1:1"), 1, 4), /truncated|more/);
 });
@@ -97,7 +99,7 @@ test("prints what fits in tree order, exactly as depth-first did, when nothing i
   const expected = [
     '- 0:1 PAGE "A"',
     '  - 1:1 FRAME "a1"',
-    '    - 1:2 FRAME "a1.1" (1 children)',
+    '    - 1:2 FRAME "a1.1" (1 child)',
     '    - 1:4 FRAME "a1.2"',
     '  - 1:5 FRAME "a2"',
     '- 0:2 PAGE "B"',
@@ -161,12 +163,31 @@ test("parents on one level share it evenly, and a level that cannot give each on
     "0:1 PAGE", "1:1 FRAME", "10:1 FRAME", "10:2 FRAME", "10:3 FRAME", "1:2 FRAME", "20:1 FRAME", "20:2 FRAME", "... 8", "truncated at",
   ]);
   // 4 lines leave one for the level under the frames: not enough for a child each, so each frame counts its own.
+  // Nothing shown was cut, so "truncated, use a smaller depth" would be false: the last line says the level did not
+  // start, and the max_nodes that starts it - a child and a marker for each of the two frames, 3 + 4.
   assert.deepEqual(outline(two, root(two), 2, 4).split("\n"), [
     '- 0:1 PAGE "P"',
     '  - 1:1 FRAME "first" (10 children)',
     '  - 1:2 FRAME "second" (10 children)',
-    "... truncated at 4 nodes; use a node_id or smaller depth",
+    "... level 2 not shown: 2 layers have children, 1 of 4 lines left; open one with node_id, or pass max_nodes 7",
   ]);
+  assert.deepEqual(outline(two, root(two), 2, 7).split("\n").slice(1, 4), ['  - 1:1 FRAME "first"', '    - 10:1 FRAME "10.1"', "    - ... 9 more children"]);
+  assert.match(outline(two, root(two), 2, 6), /level 2 not shown/, "and one less does not");
+});
+
+test("a parent with one child needs no marker line to start a level", () => {
+  // The needed max_nodes counts one line for an only child and two (a child and its marker) for more.
+  const mixed = figDoc([
+    { id: "0:1", type: "CANVAS", parent: "0:0", name: "P" },
+    { id: "1:1", type: "FRAME", parent: "0:1", name: "only" },
+    ...kids("1:1", "10", 1),
+    { id: "1:2", type: "FRAME", parent: "0:1", name: "many" },
+    ...kids("1:2", "20", 5),
+  ]);
+  assert.equal(outline(mixed, root(mixed), 2, 3).split("\n").at(-1), "... level 2 not shown: 2 layers have children, 0 of 3 lines left; open one with node_id, or pass max_nodes 6");
+  assert.match(outline(mixed, root(mixed), 2, 6), /- 10:1 FRAME "10\.1"\n.*- 20:1 FRAME "20\.1"\n.*- \.\.\. 4 more children\n\.\.\. truncated at 6 nodes/s);
+  // The only child counts as one, and says so in the singular.
+  assert.match(outline(mixed, root(mixed), 1, 10), /- 1:1 FRAME "only" \(1 child\)/);
 });
 
 test("more pages than max_nodes are cut like any other level", () => {

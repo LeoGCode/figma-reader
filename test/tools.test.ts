@@ -1000,8 +1000,8 @@ describe("the defaults", () => {
     // Three levels from a document start, not two: with no node_id the pages themselves are level 0.
     assert.deepEqual(tree.map((l) => l.trim().split(" ")[1]), ["0:1", "1:1", "1:2"]);
     // The layer the cut-off stopped at says what is under it, so nothing is missing in silence.
-    assert.match(tree[2], /- 1:2 FRAME "level 2" \(1 children\)/);
-    assert.equal((await body("figma_get_tree", { file, node_id: "1:1", depth: 0 })).split("\n")[1], '- 1:1 FRAME "level 1" (1 children)');
+    assert.match(tree[2], /- 1:2 FRAME "level 2" \(1 child\)/);
+    assert.equal((await body("figma_get_tree", { file, node_id: "1:1", depth: 0 })).split("\n")[1], '- 1:1 FRAME "level 1" (1 child)');
   });
 
   it("give a node three levels of children, and refuse to answer with 200 KB", async () => {

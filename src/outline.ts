@@ -96,8 +96,17 @@ export function outline(doc: FigDocument, start: FigNode, depth: number, maxNode
   let level: { parent: FigNode | null; kids: FigNode[] }[] = [{ parent: null, kids: roots }];
   let budget = maxNodes;
   let truncated = false;
+  /** The level that could not start, if one could not: where it is, and what it would have taken. */
+  let unstarted: { level: number; parents: number; left: number; need: number } | undefined;
   for (let l = 0; level.length && !truncated; l++) {
-    const take = share(level.map((g) => g.kids.length), budget);
+    const counts = level.map((g) => g.kids.length);
+    const take = share(counts, budget);
+    // Every parent on the level got nothing (share starts a level for all of them or for none): the outline stops at
+    // the level above in full, and "truncated, use a smaller depth" was false of it. To start the level, every parent
+    // needs one child shown, and one with more children a marker line besides.
+    if (take.every((t) => !t)) {
+      unstarted = { level: l, parents: level.length, left: budget, need: maxNodes - budget + counts.reduce((sum, c) => sum + linesFor(c, 1), 0) };
+    }
     const next: typeof level = [];
     level.forEach((g, i) => {
       shown.set(g.parent, take[i]);
@@ -132,7 +141,7 @@ export function outline(doc: FigDocument, start: FigNode, depth: number, maxNode
     const list = listed(n, level);
     const count = list.length ? (shown.get(n) ?? 0) : 0;
     if (drawing(n, kids)) extra.push(`${kids.length} ${kids.length === 1 ? "vector" : "vectors"}`);
-    else if (kids.length && !count) extra.push(`${kids.length} children`);
+    else if (kids.length && !count) extra.push(`${kids.length} ${kids.length === 1 ? "child" : "children"}`);
     lines.push(`${"  ".repeat(level)}- ${n.id} ${displayType(n)} "${n.name}"${size}${extra.length ? ` (${extra.join(", ")})` : ""}`);
     for (const c of list.slice(0, count)) visit(c, level + 1);
     if (count && count < list.length) more(level + 1, list.length - count, "children");
@@ -140,6 +149,14 @@ export function outline(doc: FigDocument, start: FigNode, depth: number, maxNode
   const top = shown.get(null) ?? 0;
   for (const r of roots.slice(0, top)) visit(r, 0);
   if (top < roots.length) more(0, roots.length - top, "pages");
-  if (truncated) lines.push(`... truncated at ${maxNodes} nodes; use a node_id or smaller depth`);
+  if (unstarted) {
+    const { level: l, parents, left, need } = unstarted;
+    // On a large file the default stopped here with 186 of its 400 lines, every page and top-level layer shown, and
+    // said it was truncated and to use a smaller depth: it read as a cut in the middle, and the way on was not that.
+    lines.push(
+      `... level ${l} not shown: ${parents} ${parents === 1 ? "layer has" : "layers have"} children, ${left} of ${maxNodes} lines left; ` +
+        `open one with node_id, or pass max_nodes ${need}`,
+    );
+  } else if (truncated) lines.push(`... truncated at ${maxNodes} nodes; use a node_id or smaller depth`);
   return lines.join("\n");
 }

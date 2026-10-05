@@ -1,7 +1,8 @@
 // skills/figma-reader/SKILL.md is what agents read instead of `help`, so a flag or command it names that the CLI does
 // not have costs a failed call and a guess, and agents were seen guessing already. The parts of it a machine can check
-// are checked here against the tools themselves: the frontmatter `npx skills add` parses, the version it pins, and
-// every command and flag it names.
+// are checked here against the tools themselves: the frontmatter `npx skills add` parses, the version it pins, its
+// size, and every command and flag it names - in it and in references/output.md, the file it sends agents to for the
+// shapes and flags it leaves out.
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -30,10 +31,21 @@ after(async () => {
 });
 
 const repo = join(import.meta.dirname, "..");
-const skill = readFileSync(join(repo, "skills", "figma-reader", "SKILL.md"), "utf8");
+const skillDir = join(repo, "skills", "figma-reader");
+const skill = readFileSync(join(skillDir, "SKILL.md"), "utf8");
+/** Where SKILL.md sends an agent for every shape and flag it leaves out, as SKILL.md names it. */
+const REFERENCE = "references/output.md";
+const reference = readFileSync(join(skillDir, REFERENCE), "utf8");
+const docs = [["SKILL.md", skill], [REFERENCE, reference]] as const;
 const byCommand = new Map(tools.map((t) => [commandName(t.name), t]));
-/** The section under a "## " heading, up to the next one. */
-const section = (title: string) => skill.split(/^## /m).find((s) => s.startsWith(`${title}\n`)) ?? "";
+/** The section of `text` under a "## " heading, up to the next one. */
+const section = (text: string, title: string) => text.split(/^## /m).find((s) => s.startsWith(`${title}\n`)) ?? "";
+/**
+ * The skill is loaded once and then re-read with the context on every later turn of the agent, about 110 of them in
+ * a median main session: each kilobyte is paid that often. 14 KB is what every lane's lines added up to before the
+ * rewrite; what does not fit here goes into the reference, which an agent reads once when the skill names it.
+ */
+const SKILL_BUDGET = 7_500;
 
 describe("the agent skill", () => {
   it("keeps its frontmatter to one-line `key: plain value` pairs of the keys a skill declares", () => {
@@ -71,15 +83,31 @@ describe("the agent skill", () => {
     assert.deepEqual(new Set(pins), new Set([version]), "update the npx pin in SKILL.md to the package version");
   });
 
-  it("names only commands the CLI has", () => {
+  it(`stays within ${SKILL_BUDGET} bytes, and names the reference it leaves the rest to, which the package ships`, () => {
+    const size = Buffer.byteLength(skill);
+    assert.ok(size <= SKILL_BUDGET, `SKILL.md is ${size} bytes: move shapes and flags to ${REFERENCE}`);
+    // An agent opens a skill's other files only when the skill names them; none was read in any transcript otherwise.
+    assert.ok(skill.includes(`\`${REFERENCE}\``), `SKILL.md names ${REFERENCE}`);
+    const { files } = JSON.parse(readFileSync(join(repo, "package.json"), "utf8")) as { files: string[] };
+    const shipped = `skills/figma-reader/${REFERENCE}`;
+    assert.ok(files.some((f) => shipped === f || shipped.startsWith(`${f.replace(/\/$/, "")}/`)), `package.json files ships ${shipped}`);
+  });
+
+  it("names only commands the CLI has, and the reference gives every command its shape", () => {
     // Commands of the CLI that are not tools: help, the account commands, and batch, which runs tools.
     const others = new Set(["help", "accounts", "use", "batch"]);
-    const named = [
-      ...[...skill.matchAll(/`figma-reader ([a-z][a-z-]*)/g)].map((m) => m[1]),
-      ...[...section("Output").matchAll(/^\| `([a-z-]+)`/gm)].map((m) => m[1]),
-    ];
-    assert.ok(named.length > 10);
-    for (const c of named) assert.ok(byCommand.has(c) || others.has(c), `SKILL.md names "${c}", which is no command`);
+    for (const [file, text] of docs) {
+      const named = [
+        ...[...text.matchAll(/`figma-reader ([a-z][a-z-]*)/g)].map((m) => m[1]),
+        // A code span that starts with a command word and goes on with a placeholder or a flag: `get-tree <file>`.
+        ...[...text.matchAll(/`([a-z][a-z-]*) (?:<file>|<key-or-url>|<old[^>]*>|--)[^`]*`/g)].map((m) => m[1]).filter((c) => c !== "figma-reader"),
+        ...[...section(text, "Shapes").matchAll(/^\| `([a-z-]+)`/gm)].map((m) => m[1]),
+      ];
+      assert.ok(named.length > 10, `${file} names ${named.length} commands`);
+      for (const c of named) assert.ok(byCommand.has(c) || others.has(c), `${file} names "${c}", which is no command`);
+    }
+    const shapes = new Set([...section(reference, "Shapes").matchAll(/^\| `([a-z-]+)`/gm)].map((m) => m[1]));
+    assert.deepEqual([...byCommand.keys()].filter((c) => !shapes.has(c)), [], `${REFERENCE} has a shape for every command`);
   });
 
   // Every check below asks the CLI's own parser, so what passes here is what `figma-reader` accepts: a reading of the
@@ -87,7 +115,7 @@ describe("the agent skill", () => {
   it("gives each command in its flags list only flags it takes, with values it takes", () => {
     // "- `get-tree`: `--node-id`, `--depth` (default 2); `get-node`: `--node-id`", one command per segment.
     let checked = 0;
-    for (const line of section("Flags").split("\n").filter((l) => l.startsWith("- "))) {
+    for (const line of section(reference, "Flags").split("\n").filter((l) => l.startsWith("- "))) {
       for (const segment of line.slice(2).split("; ")) {
         const m = segment.match(/^`([a-z-]+)[^`]*`: (.*)$/);
         assert.ok(m, `unreadable flags entry: ${segment}`);
@@ -108,7 +136,7 @@ describe("the agent skill", () => {
     // `get-node <file> --node-id <id> --depth 0` in a rule, and `search --include-text`, which leaves its positionals
     // out: a command word followed by a <file> or a flag. Placeholders become "1", which every argument takes.
     let checked = 0;
-    for (const [, span] of skill.matchAll(/`([^`\n]+)`/g)) {
+    for (const [, span] of docs.flatMap(([, text]) => [...text.matchAll(/`([^`\n]+)`/g)])) {
       const words = (span.match(/<[^>]*>|"[^"]*"|'[^']*'|\S+/g) ?? []).filter((w, i) => i || w !== "figma-reader");
       const [command, next] = words;
       if (!/^[a-z][a-z-]*$/.test(command) || !next || !(next.startsWith("--") || ["<file>", "<key-or-url>"].includes(next))) continue;
@@ -124,7 +152,7 @@ describe("the agent skill", () => {
     // "Scope with `--node-id`, `--page`, `--types`": not tied to one command, but each must be an option of one. The
     // value it would want does not matter here, only that the parser does not call it an unknown option.
     // --account is taken by every command before its own options are parsed (cli.ts), so no tool's schema has it.
-    for (const [, flag] of skill.matchAll(/`(--[a-z-]+)/g)) {
+    for (const [, flag] of docs.flatMap(([, text]) => [...text.matchAll(/`(--[a-z-]+)/g)])) {
       if (flag === "--account") continue;
       const known = (c: string) => !usageError(c, [...stand(c), flag])?.startsWith(`unknown option ${flag}`);
       assert.ok([...byCommand.keys()].some(known), `no command takes ${flag}`);

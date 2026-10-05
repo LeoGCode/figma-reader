@@ -8,7 +8,8 @@ import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import {
-  accountCacheDir, accountProfileDir, CONFIG_FILE, DEFAULT_ACCOUNT, expandHome, otherAccounts, resolveAccount, writeAccountInfo,
+  AccountNotChosen, accountCacheDir, accountProfileDir, CONFIG_FILE, DEFAULT_ACCOUNT, expandHome, otherAccounts, resolveAccount,
+  writeAccountInfo,
 } from "./account.ts";
 import { BrowserManager, defaultExecutable, defaultStateDir } from "./browser.ts";
 import { changesSince, diffDocuments, parseSince } from "./changes.ts";
@@ -272,8 +273,8 @@ const accountRef = {
 const accountLabel = () =>
   `account "${accountRef.name}" (source: ${accountRef.source}${accountRef.profileOverride ? `, profileOverride: ${accountRef.profileOverride}` : ""})`;
 
-/** A call refused before it began because nothing chose its account; the CLI exits 2 on it (see cli.ts). */
-export class AccountNotChosen extends Error {}
+// The CLI exits 2 on it (see cli.ts).
+export { AccountNotChosen };
 
 /**
  * Who serves these tools, which decides how a refusal tells its reader to choose an account: a CLI call takes
@@ -356,10 +357,25 @@ async function attributed(run: () => Promise<ToolResult>): Promise<ToolResult> {
   }
 }
 
-async function open(file: string, refresh?: boolean) {
+/**
+ * Where a file argument will be read from: the path given, a local '<name> [<key>].fig' for its key, or else this
+ * account's snapshot cache - which is where a call nothing chose an account for is refused (useAccount), before
+ * anything at all is read. Apart from open so that a tool taking two files settles both before it reads either:
+ * figma_diff decoded a local new file, and only then refused the key it was given as old.
+ */
+function resolveFile(file: string, refresh?: boolean) {
   const ref = parseFileRef(file);
   const path = ref.path ?? (refresh ? undefined : localFileForKey(ref.key));
   if (!path) useAccount();
+  return { ref, path, refresh };
+}
+
+async function open(file: string, refresh?: boolean) {
+  return read(resolveFile(file, refresh));
+}
+
+/** Read a file resolveFile has settled, and date the answer by the copy it came from. */
+async function read({ ref, path, refresh }: ReturnType<typeof resolveFile>) {
   const doc = path ? await store.getLocal(path) : await store.get(ref.key, refresh);
   const key = ref.path ? (ref.keyInName ? ref.key : undefined) : ref.key;
   const source = path ? "local" : "web";
@@ -1123,8 +1139,10 @@ tool(
   async ({ old, new: next, limit, refresh }) => {
     const max = limit ?? 100;
     if (old.trim().toLowerCase() !== PREVIOUS) {
-      const n = await open(next, refresh);
-      const o = await open(old);
+      // Both settled before either is read, so a key on either side is refused before the other side is decoded.
+      const sides = [resolveFile(next, refresh), resolveFile(old)];
+      const n = await read(sides[0]);
+      const o = await read(sides[1]);
       const side = (s: typeof n) => ({ key: s.key, source: s.source, path: s.path, ...s.dated });
       return json({ old: side(o), new: side(n), ...diffDocuments(o.doc, n.doc, max) });
     }
@@ -1135,6 +1153,8 @@ tool(
           `(${ref.path}); to compare two .fig files, pass both paths`,
       );
     }
+    // Both snapshots are this account's, read from its cache: refused, like any key, before the cache is read.
+    useAccount();
     // new first: an export it makes is what decides which snapshot is the previous one.
     const doc = await store.get(ref.key, refresh);
     // The one this snapshot replaced, read with it as one pair: it throws rather than pair it with another one.
@@ -1147,9 +1167,10 @@ tool(
       );
     }
     // A snapshot this tool exported, like the current one, and dated the same way: the link kept that export's time.
+    // Both name the account whose cache held them, as every answer read through it does.
     return json({
-      old: { key: ref.key, source: PREVIOUS, path: store.previousPath(ref.key), exportedAt: prev.exportedAt.toISOString() },
-      new: { key: ref.key, source: "web", exportedAt: doc.exportedAt.toISOString() },
+      old: { key: ref.key, source: PREVIOUS, path: store.previousPath(ref.key), exportedAt: prev.exportedAt.toISOString(), account: accountRef },
+      new: { key: ref.key, source: "web", exportedAt: doc.exportedAt.toISOString(), account: accountRef },
       ...diffDocuments(prev, doc, max),
     });
   },

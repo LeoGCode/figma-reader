@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { z } from "zod";
 import { findProjectConfig } from "../src/account.ts";
 import { BrowserManager } from "../src/browser.ts";
 import { FigmaWeb } from "../src/figma-web.ts";
@@ -67,6 +68,7 @@ const stray = findProjectConfig(work)?.path;
 const startedIn = process.cwd();
 process.chdir(work);
 const { AccountNotChosen, release, tools } = await import("../src/tools.ts");
+const { runBatch } = await import("../src/batch.ts");
 after(async () => {
   process.chdir(startedIn);
   await release();
@@ -74,6 +76,16 @@ after(async () => {
 });
 const byName = new Map(tools.map((t) => [t.name, t]));
 const textOf = (r: { content: { type: string; text?: string }[] }) => r.content[0].text!;
+
+/**
+ * The arguments of a tool that name a file it reads: file, and figma_diff's old and new. Told apart by what they say
+ * they take (a .fig path, a key or a URL), so a tool added later with a file argument of another name is held to the
+ * same rule without this list being remembered.
+ */
+const fileArgs = (t: (typeof tools)[number]) =>
+  Object.entries((z.toJSONSchema(z.object(t.shape)) as { properties: Record<string, { type?: string; description?: string }> }).properties)
+    .filter(([, p]) => p.type === "string" && /\.fig\b/.test(p.description ?? ""))
+    .map(([k]) => k);
 
 /** Run a call and return what it touched; it must be refused for want of an account. */
 async function refused(name: string, args: Record<string, unknown>, why: RegExp) {
@@ -84,16 +96,25 @@ async function refused(name: string, args: Record<string, unknown>, why: RegExp)
 
 describe("a call nothing chose an account for, with another account on this machine", { skip: stray && `${stray} is above the temp dir` }, () => {
   it("is refused before it reaches the cache or the browser, for every tool that takes a file", async () => {
-    // Every tool with a file argument, so that one added later is held to the same rule. node_id is given because
+    // Every file argument of every tool, so that one added later is held to the same rule. node_id is given because
     // figma_screenshot asks for it before anything else, and since because figma_changes reads it before the file (a
-    // typo is reported without an export); the other tools reach the refusal before they look at either.
-    const fileTools = tools.filter((t) => "file" in t.shape).map((t) => t.name);
-    assert.ok(fileTools.length >= 11, fileTools.join(", "));
-    for (const name of fileTools) {
-      for (const file of [KEY, `https://www.figma.com/design/${KEY}/App?node-id=1-1`]) {
-        assert.deepEqual(await refused(name, { file, node_id: "1:1", since: "7d" }, /other accounts exist \(acme\)/), [], `${name} on ${file}`);
+    // typo is reported without an export); the other tools reach the refusal before they look at either. Any other
+    // file argument is a local .fig, which needs no account: the refusal has to come before that one is read too, so
+    // figma_diff given a key as old is refused before it decodes the path given as new.
+    const fileTools = tools.filter((t) => fileArgs(t).length);
+    assert.ok(fileTools.length >= 15, fileTools.map((t) => t.name).join(", "));
+    assert.deepEqual(fileArgs(byName.get("figma_diff")!), ["old", "new"]);
+    for (const t of fileTools) {
+      for (const arg of fileArgs(t)) {
+        const others = Object.fromEntries(fileArgs(t).filter((k) => k !== arg).map((k) => [k, plain]));
+        for (const file of [KEY, `https://www.figma.com/design/${KEY}/App?node-id=1-1`]) {
+          const args = { node_id: "1:1", since: "7d", ...others, [arg]: file };
+          assert.deepEqual(await refused(t.name, args, /other accounts exist \(acme\)/), [], `${t.name} with ${arg} ${file}`);
+        }
       }
     }
+    // previous names a snapshot in this account's cache as surely as a key does.
+    assert.deepEqual(await refused("figma_diff", { old: "previous", new: KEY }, /acme/), []);
     // A refresh asks for the live file however the key would otherwise be served.
     assert.deepEqual(await refused("figma_get_tree", { file: KEY, refresh: true }, /acme/), []);
     // A screenshot from a local path whose name carries the key is a screenshot of that key: the browser renders it,
@@ -101,6 +122,25 @@ describe("a call nothing chose an account for, with another account on this mach
     assert.deepEqual(await refused("figma_screenshot", { file: keyed, node_id: "0:1" }, /acme/), []);
     assert.deepEqual(await refused("figma_list_files", { source: "web" }, /acme/), []);
     assert.deepEqual(await refused("figma_login", {}, /acme/), []);
+  });
+
+  it("refuses a batch line the way it refuses the call, and answers the lines that need no account", async () => {
+    // The batch goes on past a refused line, as past any failed one, and says which were refused: those exit 2.
+    const lines = [
+      JSON.stringify({ tool: "get-tree", args: { file: KEY } }),
+      JSON.stringify({ tool: "get-tree", args: { file: plain } }),
+      JSON.stringify({ tool: "diff", args: { old: KEY, new: plain } }),
+      JSON.stringify({ tool: "dev-status", args: { file: `https://www.figma.com/design/${KEY}/App` } }),
+    ];
+    const out: { i: number; ok: boolean; error?: string }[] = [];
+    touched.length = 0;
+    const summary = await runBatch([lines[0], lines[2], lines[3]], tools, async (l) => (out.push(JSON.parse(l)), true));
+    assert.deepEqual(touched, [], "a refused line reaches neither the cache nor the browser");
+    assert.deepEqual(summary, { answered: 3, failed: [0, 1, 2], refused: [0, 1, 2] });
+    for (const o of out) assert.match(o.error!, /^no Figma account chosen: .*other accounts exist \(acme\)/);
+    out.length = 0;
+    const mixed = await runBatch(lines, tools, async (l) => (out.push(JSON.parse(l)), true));
+    assert.deepEqual([mixed.failed, mixed.refused, out.map((o) => o.ok)], [[0, 2, 3], [0, 2, 3], [false, true, false, false]]);
   });
 
   it("reads a local .fig all the same, through the store the count watches", async () => {

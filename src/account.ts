@@ -111,6 +111,13 @@ export function resolveAccount(env: NodeJS.ProcessEnv = process.env, cwd = proce
 }
 
 /**
+ * A call refused before it began because nothing chose its account (see otherAccounts; tools.ts decides and words the
+ * refusal). The CLI exits 2 on it, a single call and a batch alike. Kept here, with nothing to load, so that batch.ts
+ * can tell a refused line from a failed one without importing the tools.
+ */
+export class AccountNotChosen extends Error {}
+
+/**
  * The accounts that make the fallback to "default" a guess: nothing chose an account here, and these exist besides
  * it. "default" is then whichever login was set up first, often a personal one, and a call from a directory outside
  * the project (an agent's scratch directory) read client files through it with nothing in the answer to say so.

@@ -3,6 +3,7 @@
 // node ids, and spent 805 s of an 18 minute run inside figma-reader. A batch runs its calls in one process, where the
 // store keeps the four decoded files used last for the next call, and every web call shares one browser launch. Kept
 // free of side effects, like cli-args.ts, so it can be tested on its own: the tools are passed in.
+import { AccountNotChosen } from "./account.ts";
 import { checkArgs, commandName } from "./cli-args.ts";
 import { outPath, writePrivateTemp } from "./local-files.ts";
 import type { Tool } from "./tools.ts";
@@ -32,7 +33,8 @@ function value(text: string): unknown {
   }
 }
 
-type Outcome = { ok: true; result: unknown; images?: string[] } | { ok: false; error: string };
+/** refused marks a call turned away because no account was chosen; it is not part of the line written for it. */
+type Outcome = { ok: true; result: unknown; images?: string[] } | { ok: false; error: string; refused?: true };
 const fail = (error: string): Outcome => ({ ok: false, error });
 
 async function answer(line: string, byName: Map<string, Tool>): Promise<Outcome> {
@@ -74,15 +76,22 @@ async function answer(line: string, byName: Map<string, Tool>): Promise<Outcome>
     });
     return { ok: true, result: value(text), ...(images.length ? { images } : {}) };
   } catch (e) {
-    return fail(e instanceof Error ? e.message : String(e));
+    // Its line says what a single call would on stderr; whether it was refused is the batch's exit code to say.
+    const error = e instanceof Error ? e.message : String(e);
+    return e instanceof AccountNotChosen ? { ok: false, error, refused: true } : fail(error);
   }
 }
 
 export interface BatchSummary {
   /** Calls answered: every line but the blank ones, up to where the batch stopped. */
   answered: number;
-  /** The i of each call that failed, in order. */
+  /** The i of each call that failed, in order, the refused ones included. */
   failed: number[];
+  /**
+   * The i of each call refused because nothing chose an account (see AccountNotChosen): nothing was tried on that
+   * line, and the same line is refused every time until the account or the working directory changes.
+   */
+  refused: number[];
 }
 
 /**
@@ -93,12 +102,14 @@ export interface BatchSummary {
 export async function runBatch(lines: AsyncIterable<string> | Iterable<string>, tools: Tool[], write: (line: string) => Promise<boolean>): Promise<BatchSummary> {
   const byName = new Map<string, Tool>();
   for (const t of tools) byName.set(t.name, t).set(commandName(t.name), t);
-  const summary: BatchSummary = { answered: 0, failed: [] };
+  const summary: BatchSummary = { answered: 0, failed: [], refused: [] };
   for await (const line of lines) {
     if (!line.trim()) continue;
     const i = summary.answered++;
-    const out: BatchAnswer = { i, ...(await answer(line, byName)) };
-    if (!out.ok) summary.failed.push(i);
+    const got = await answer(line, byName);
+    const out: BatchAnswer = got.ok ? { i, ...got } : { i, ok: false, error: got.error };
+    if (!got.ok) summary.failed.push(i);
+    if (!got.ok && got.refused) summary.refused.push(i);
     if (!(await write(JSON.stringify(out)))) break;
   }
   return summary;
@@ -131,7 +142,9 @@ export function batchUsage(bin: string): string {
     "arguments fails alone; the rest still run. login is refused: it waits for a person, so run it on its own first.",
     `Every call uses the account the batch runs as (${bin} --account <name> batch).`,
     "",
-    "Exit code 0 when every call succeeded, 1 when any failed (stderr says which), 2 for bad usage of batch itself.",
+    "Exit code 0 when every call succeeded, 1 when any failed (stderr says which), 2 for bad usage of batch itself or",
+    "when any call was refused because no Figma account was chosen: its line holds the refusal, nothing was tried on",
+    "it, and running the batch again is refused the same way until the account is chosen.",
     "",
     "Example:",
     "  printf '%s\\n' \\",

@@ -549,6 +549,22 @@ test("a key or URL is refused when nothing chose an account and another exists, 
   assert.match(s.webCallsRefused, /^no Figma account chosen: .*other accounts exist \(acme\)/);
 });
 
+test("a batch whose line was refused for want of an account exits 2, as that call alone does", strayNote, async () => {
+  // Nothing was tried on that line and running it again is refused the same way, which 1 (a call that failed and may
+  // not next time) would not say. The other lines still run, and each line says what happened to it.
+  const env = machine("batch-refused", ["acme", "default"], ["default"]);
+  const lines = [{ tool: "get-tree", args: { file: KEY } }, { tool: "get-tree", args: { file: smallFig } }, { tool: "get-node", args: { file: smallFig, node_id: "9:9" } }];
+  const r = await cli(["batch"], { env, input: lines.map((l) => JSON.stringify(l)).join("\n") });
+  assert.equal(r.code, 2, r.stderr);
+  const out = r.stdout.trimEnd().split("\n").map((l) => JSON.parse(l));
+  assert.deepEqual(out.map((o) => o.ok), [false, true, false]);
+  assert.match(out[0].error, /^no Figma account chosen: .*other accounts exist \(acme\)/);
+  assert.equal(r.stderr, "figma-reader batch: 2 of 3 calls failed (i = 0, 2), 1 of them refused because no Figma account was chosen (i = 0)\n");
+  // Without the refused line, the failed one alone is a 1.
+  const failedOnly = await cli(["batch"], { env, input: lines.slice(1).map((l) => JSON.stringify(l)).join("\n") });
+  assert.equal(failedOnly.code, 1, failedOnly.stderr);
+});
+
 test("with default the only account, a key is answered as it always was, and says which account it was", async () => {
   for (const accounts of [[], ["default"]]) {
     const env = machine(`only-default-${accounts.length}`, accounts, ["default"]);

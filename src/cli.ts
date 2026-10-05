@@ -191,12 +191,17 @@ if (cmd === "batch") {
   // there (EPIPE, the reader is gone) is what stops the batch.
   const write = (line: string) => new Promise<boolean>((done) => process.stdout.write(`${line}\n`, (e) => done(!e)));
   try {
-    const { answered, failed } = await runBatch(createInterface({ input: process.stdin, crlfDelay: Infinity }), tools, write);
+    const { answered, failed, refused } = await runBatch(createInterface({ input: process.stdin, crlfDelay: Infinity }), tools, write);
+    const which = (is: number[]) => (is.length > 20 ? `${is.slice(0, 20).join(", ")}, ...` : is.join(", "));
     if (failed.length) {
-      const which = failed.length > 20 ? `${failed.slice(0, 20).join(", ")}, ...` : failed.join(", ");
-      console.error(`${BIN} batch: ${failed.length} of ${answered} calls failed (i = ${which})`);
+      console.error(
+        `${BIN} batch: ${failed.length} of ${answered} calls failed (i = ${which(failed)})` +
+          (refused.length ? `, ${refused.length} of them refused because no Figma account was chosen (i = ${which(refused)})` : ""),
+      );
     }
-    await exit(failed.length ? 1 : 0);
+    // A refused line is what a refused single call is, so it exits as one: 2, since nothing was tried and a retry is
+    // refused the same way, where 1 says that something failed and might not next time.
+    await exit(refused.length ? 2 : failed.length ? 1 : 0);
   } catch (e) {
     // Only reading stdin can throw here, every call's own failure being its line's answer; the browser is released.
     console.error(`${BIN} batch: ${e instanceof Error ? e.message : String(e)}`);

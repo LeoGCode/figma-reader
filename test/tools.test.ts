@@ -614,11 +614,17 @@ describe("an answer through the account's snapshot cache", () => {
       ["figma_get_text", {}],
       ["figma_token_usage", {}],
       ["figma_get_components", {}],
+      ["figma_dev_status", {}],
+      ["figma_locate", { node_ids: ["1:1"] }],
+      ["figma_changes", { since: "7d" }],
     ] as [string, Record<string, unknown>][]) {
       const r = await call(name, { file: key, ...args });
       assert.equal(r.exportedAt, exported.toISOString(), name);
       assert.deepEqual(r.account, named, name);
     }
+    // figma_diff dates each of its two sides, and each side read through the account names it.
+    const d = await call("figma_diff", { old: key, new: key });
+    assert.deepEqual([d.old.exportedAt, d.old.account, d.new.exportedAt, d.new.account], [exported.toISOString(), named, exported.toISOString(), named]);
     assert.deepEqual((await call("figma_load_file", { file: `https://www.figma.com/design/${key}/Cached` })).account, named, "a URL is the same key");
   });
 
@@ -797,8 +803,10 @@ describe("figma_diff", () => {
       try {
         for (const old of ["previous", "Previous"]) {
           const r = await call("figma_diff", { old, new: `https://www.figma.com/design/${key}/Diff?node-id=1-1` });
-          assert.deepEqual(r.old, { key, source: "previous", path: join(cache, `${key}.previous.fig`), exportedAt: "2026-09-25T13:44:10.000Z" });
-          assert.deepEqual(r.new, { key, source: "web", exportedAt: current });
+          // Both from this account's cache, so both name it, as any answer read through the account does.
+          const account = { name: "tools-test", source: "FIGMA_ACCOUNT" };
+          assert.deepEqual(r.old, { key, source: "previous", path: join(cache, `${key}.previous.fig`), exportedAt: "2026-09-25T13:44:10.000Z", account });
+          assert.deepEqual(r.new, { key, source: "web", exportedAt: current, account });
           assert.deepEqual([r.counts.layersRenamed, r.counts.removedNodes], [1, 101]);
         }
       } finally {

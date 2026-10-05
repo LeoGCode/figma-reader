@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { LEASE_BEAT_MS, pidNamespace, processStamp, takeLease } from "../src/browser.ts";
 import { FigDocument } from "../src/fig-file.ts";
-import type { FigmaWeb } from "../src/figma-web.ts";
+import { cleanStaleDownloads, type FigmaWeb } from "../src/figma-web.ts";
 import { LEASE_POLL_MS, SnapshotStore } from "../src/store.ts";
 import { figBytes } from "./fixtures.ts";
 
@@ -1106,6 +1106,84 @@ describe("SnapshotStore previous snapshot", () => {
     assert.equal(label(store.peek("K")!), "export 2");
     assert.ok(statSync(store.previousPath("K")).isDirectory(), "left as it was");
     assert.deepEqual(readdirSync(dir).sort(), ["K.fig", "K.previous.fig", "exports"], "and nothing staged left behind");
+  });
+});
+
+// Every call that reaches the browser first sweeps the cache for what crashed exports left behind (cleanStaleDownloads),
+// judging a file by its age. The store's own staging files have the swept shape and are older than the sweep while in
+// use, so each test below runs that sweep, as another process starting meanwhile would, at the moment it hurt.
+describe("SnapshotStore beside another process's sweep", () => {
+  /** Run `fn` with the sweep run right after each hard link it makes, and count them. */
+  const sweptAtEveryLink = async <T>(dir: string, fn: () => Promise<T>): Promise<T> => {
+    const fs = createRequire(import.meta.url)("node:fs");
+    const real = fs.linkSync;
+    let sweeps = 0;
+    fs.linkSync = (from: string, to: string) => {
+      real(from, to);
+      sweeps++;
+      cleanStaleDownloads(dir);
+    };
+    syncBuiltinESMExports();
+    try {
+      const result = await fn();
+      assert.ok(sweeps > 0, "a link was made, so the sweep ran");
+      return result;
+    } finally {
+      fs.linkSync = real;
+      syncBuiltinESMExports();
+    }
+  };
+
+  it("keeps an export's own file while it is decoded", async () => {
+    // The file is the download moved into place, written before the decode began, so a sweep starting during the
+    // decode (seconds, on a large file) found it older than itself and deleted it: the rename onto the snapshot failed.
+    const dir = tempDir();
+    const downloaded = new Date(Date.now() - 60_000);
+    const web = {
+      async saveLocalCopy(_key: string, path: string) {
+        writeFileSync(path, fig("export 1"));
+        utimesSync(path, downloaded, downloaded);
+      },
+    } as unknown as FigmaWeb;
+    const fromFile = FigDocument.fromFile;
+    const decode = mock.method(FigDocument, "fromFile", (key: string, path: string, at: Date) => {
+      if (path.endsWith(".tmp")) cleanStaleDownloads(dir);
+      return fromFile.call(FigDocument, key, path, at);
+    });
+    try {
+      assert.equal(label(await new SnapshotStore(web, dir, HOUR).get("K")), "export 1");
+      assert.equal(decode.mock.callCount(), 1, "the sweep ran during the decode");
+    } finally {
+      decode.mock.restore();
+    }
+    assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".tmp")), [], "and nothing staged is left behind");
+  });
+
+  it("keeps the previous snapshot when the sweep lands between the link that keeps it and its rename", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    // The snapshot being replaced is older than the sweep, as it always is, and its link carries that time.
+    const old = new Date(Date.now() - 2 * HOUR);
+    utimesSync(store.figPath("K"), old, old);
+    assert.equal(label(await sweptAtEveryLink(dir, () => store.get("K", true))), "export 2");
+    assert.equal(prevLabel(store), "export 1");
+  });
+
+  it("reads diff previous's pair under its own names while the sweep runs", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    await store.get("K", true);
+    // Exported twenty and ten minutes ago: still fresh, and older than any sweep, as is every pair diff previous reads.
+    const at = (minutes: number) => new Date(Date.now() - minutes * 60_000);
+    utimesSync(store.previousPath("K"), at(20), at(20));
+    utimesSync(store.figPath("K"), at(10), at(10));
+    const current = await store.get("K");
+    assert.equal(label((await sweptAtEveryLink(dir, () => store.previousOf("K", current)))!), "export 1");
+    assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".tmp")), [], "and its own names are gone");
   });
 });
 

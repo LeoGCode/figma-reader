@@ -19,6 +19,38 @@ const OTHER_EXPORT_WAIT_MS = 600_000;
 /** How often a held publish lock is looked at again: it is held for a few file operations (see underPublishLock). */
 const PUBLISH_POLL_MS = 10;
 
+/** Where the processes sharing the snapshot directory `dir` announce that they are exporting a key (see awaitOtherExport). */
+const exportLeases = (dir: string, fileKey: string) => join(dir, "exports", fileKey);
+/** Where a process reading the key's pair under names of its own announces it until those names are gone (see previousOf). */
+const readerLeases = (dir: string, fileKey: string) => join(dir, "exports", `${fileKey}.reading`);
+
+/**
+ * The key, pid and tag a staging file's name carries: "<key>.fig.<pid>.<tag>.tmp" for an export's own file and for
+ * diff previous's link to the snapshot, "<key>.previous.fig.<pid>.<tag>.tmp" for the links that keep and read the
+ * previous one. moveDownload's copy of an export's file is named after that file, so it begins the same way.
+ */
+const STAGED = /^([A-Za-z0-9]+)\.(?:previous\.)?fig\.(\d+)\.([a-z0-9]+)\.tmp/;
+
+/**
+ * Whether the staging file `name` in the snapshot directory `dir` is still in use by the process that made it, which
+ * is what cleanStaleDownloads asks before it sweeps one by its age. Every such file is made under a lease whose name
+ * carries the same pid and tag - the export's own, or previousOf's - held for as long as the file is in use, so a live
+ * one says it is in use however old the file looks, judged by liveLeases by the rules every lease here is judged by.
+ *
+ * Age alone was the rule, and no age can tell: an export's file carries the mtime of the download it was moved from,
+ * a link carries the snapshot's, and both are older than any sweep that begins while they are used. A process that
+ * reached the browser while another was decoding its export deleted the file under it, and the rename onto the
+ * snapshot then failed. A name with no tag (an older build's), or one no live lease claims, is left to its age.
+ */
+export function stagedByLiveOwner(dir: string, name: string): boolean {
+  const m = STAGED.exec(name);
+  if (!m) return false;
+  const [, fileKey, pid, tag] = m;
+  return [exportLeases(dir, fileKey), readerLeases(dir, fileKey)].some((leases) =>
+    liveLeases(leases).some((lease) => lease.split("-")[0] === pid && lease.endsWith(`-${tag}`)),
+  );
+}
+
 /**
  * An export whose lease name says it began at or before `since`, so it may be exporting the file as it was before
  * then. The time in the name is the holder's own Date.now(): one in the future means the clock stepped back between
@@ -211,7 +243,7 @@ export class SnapshotStore {
 
   /** Where the processes sharing this cache announce that they are exporting a key (see awaitOtherExport). */
   private leaseDir(fileKey: string) {
-    return join(this.dir, "exports", fileKey);
+    return exportLeases(this.dir, fileKey);
   }
 
   /**
@@ -292,7 +324,9 @@ export class SnapshotStore {
     // between this export's rename and that read answered with a file this process had not exported - 39 answers
     // in 40 with another process renaming continuously, and the answer above is the export that was still running
     // when the wait gave up on it, which is the pre-refresh one. The name is the shape moveDownload gives a copy
-    // beside the snapshot, so cleanStaleDownloads sweeps one left behind by a crash between the export and the swap.
+    // beside the snapshot, so cleanStaleDownloads sweeps one left behind by a crash between the export and the swap;
+    // it carries the lease's pid and tag, which is what keeps that sweep off it while this export runs (see
+    // stagedByLiveOwner).
     const mine = `${path}.${process.pid}.${tag}.tmp`;
     try {
       await this.web.saveLocalCopy(fileKey, mine);
@@ -331,7 +365,7 @@ export class SnapshotStore {
    * Best effort past the swap: an export is never failed for its history. Without hard links (FAT, some network
    * mounts) nothing is kept; where the old previous cannot be replaced it stays as it was, older than it should be but
    * dated by its own time, which figma_diff reports. The staging name is the shape cleanStaleDownloads sweeps, for a
-   * crash in between.
+   * crash in between, with the export's pid and tag, so its lease keeps the sweep off it until then.
    */
   private publish(fileKey: string, mine: string, tag: string) {
     const staged = `${this.previousPath(fileKey)}.${process.pid}.${tag}.tmp`;
@@ -368,9 +402,16 @@ export class SnapshotStore {
    */
   async previousOf(fileKey: string, current: FigDocument): Promise<FigDocument | undefined> {
     const tag = Math.random().toString(36).slice(2, 8);
-    // The shape cleanStaleDownloads sweeps, for a crash before they are removed below.
+    // The shape cleanStaleDownloads sweeps, for a crash before they are removed below. A link carries the mtime of the
+    // snapshot it names, older than any sweep, so this lease, taken first and given up last, is what keeps a sweep
+    // in another process off them while they are read (see stagedByLiveOwner). None can be taken in a cache this
+    // process may not write, and then no link is made either.
     const now = `${this.figPath(fileKey)}.${process.pid}.${tag}.tmp`;
     const was = `${this.previousPath(fileKey)}.${process.pid}.${tag}.tmp`;
+    let lease: string | undefined;
+    try {
+      lease = takeLease(readerLeases(this.dir, fileKey), `${process.pid}-${Date.now()}-${tag}`);
+    } catch {}
     try {
       const kept = await this.underPublishLock(fileKey, () => {
         try {
@@ -401,6 +442,7 @@ export class SnapshotStore {
     } finally {
       rmSync(now, { force: true });
       rmSync(was, { force: true });
+      if (lease) dropLease(lease);
     }
   }
 

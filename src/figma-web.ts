@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { bootId, BrowserManager, dropLease, liveLeases, pidNamespace, processStart, sameBoot, sameProcess, takeLease } from "./browser.ts";
 import { CdpSession, MOD, sleep, type TargetInfo } from "./cdp.ts";
 import type { Raw } from "./fig-file.ts";
+import { stagedByLiveOwner } from "./store.ts";
 
 const ORIGIN = "https://www.figma.com";
 // Each server process owns one editor tab, marked through window.name with its pid.
@@ -783,8 +784,12 @@ export class FigmaWeb {
   }
 }
 
-/** A half-copied snapshot moveDownload left behind: "<key>.fig.<pid>.tmp" before the random suffix, and after it. */
-const HALF_COPIED = /\.fig\.\d+(?:\.[a-z0-9]+)?\.tmp$/;
+/**
+ * A half-copied snapshot moveDownload left behind: "<key>.fig.<pid>.tmp" before the random suffix, and after it. The
+ * store stages an export as such a name and moves the download onto that, so a copy across filesystems is named after
+ * it, "<key>.fig.<pid>.<tag>.tmp.<pid>.<tag>.tmp", which nothing swept: a crash mid-copy leaked a whole .fig.
+ */
+const HALF_COPIED = /\.fig\.\d+(?:\.[a-z0-9]+)?\.tmp(?:\.\d+\.[a-z0-9]+\.tmp)?$/;
 
 /**
  * Remove leftovers of exports that never finished: old per-export dirs, half-copied snapshots, and downloads/
@@ -799,8 +804,12 @@ export function cleanStaleDownloads(dir: string) {
     // A crash between moveDownload's copy and its rename leaves a full-size partial beside the snapshot. Nothing
     // reads those names - localFigFiles and store.peek both ignore them - so they were pure leaked disk, up to
     // one .fig per crash. Same rule as below: an export in progress keeps writing, so only an untouched one goes.
+    // But the store's own staging files have that shape too, and they sit untouched while in use: an export's while
+    // it is decoded, the links that keep and read the previous snapshot. Those go only once no live lease claims
+    // them, which liveLeases decides after the listing above, so a file listed while its owner was using it is seen
+    // with that owner's lease.
     for (const f of names) {
-      if (!HALF_COPIED.test(f)) continue;
+      if (!HALF_COPIED.test(f) || stagedByLiveOwner(dir, f)) continue;
       const st = statSync(join(dir, f), { throwIfNoEntry: false });
       if (st && st.mtimeMs < checked) rmSync(join(dir, f), { force: true });
     }

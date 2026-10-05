@@ -16,7 +16,7 @@ process.env.USERPROFILE = root;
 process.env.APPDATA = join(root, "AppData", "Roaming");
 process.env.LOCALAPPDATA = join(root, "AppData", "Local");
 const { abandoned, cleanStaleDownloads, FigmaWeb, markOwner, moveDownload, releaseDownloadBehavior, TAB_MARK } = await import("../src/figma-web.ts");
-const { bootId, pidNamespace, processStart, takeLease } = await import("../src/browser.ts");
+const { bootId, dropLease, pidNamespace, processStamp, processStart, takeLease } = await import("../src/browser.ts");
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -418,14 +418,83 @@ test("a half-copied snapshot left by a crash is swept", () => {
   mkdirSync(join(cache, "downloads"), { recursive: true });
   const partial = join(cache, `${KEY}.fig.4242.ab12cd.tmp`);
   const legacy = join(cache, `${KEY}.fig.4242.tmp`); // the name before the random suffix
+  // The store stages an export as a name of the first shape and the download is moved onto that, so a copy across
+  // filesystems is named after it. Nothing swept this one, a whole .fig per crash mid-copy.
+  const copied = join(cache, `${KEY}.fig.4242.ab12cd.tmp.4242.ef34gh.tmp`);
   const snapshot = join(cache, `${KEY}.fig`);
-  for (const f of [partial, legacy, snapshot]) writeFileSync(f, "bytes");
+  for (const f of [partial, legacy, copied, snapshot]) writeFileSync(f, "bytes");
   const past = new Date(Date.now() - 60_000);
-  for (const f of [partial, legacy]) utimesSync(f, past, past);
+  for (const f of [partial, legacy, copied]) utimesSync(f, past, past);
   cleanStaleDownloads(cache);
   assert.deepEqual(readdirSync(cache).filter((f) => f.endsWith(".tmp")), []);
   assert.ok(existsSync(snapshot), "the snapshot itself is not a leftover");
 
+});
+
+test("a staging file whose owner is still using it is never swept for its age, and one whose owner is gone still is", () => {
+  // Every staging file the store makes carries the pid and tag of a lease held while it is in use: the export's own
+  // for its file, the copy made of it and the link that keeps the previous snapshot; one of their own for diff
+  // previous's two links. All are older than any sweep while in use - a download's mtime, a snapshot's - and age was
+  // the whole rule: a call that reached the browser while another process decoded its export deleted the file under it.
+  const cache = mkdtempSync(join(root, "owned-"));
+  const past = new Date(Date.now() - 3_600_000);
+  const staged = (name: string) => {
+    const path = join(cache, name);
+    writeFileSync(path, "bytes");
+    utimesSync(path, past, past);
+    return path;
+  };
+  const exports = join(cache, "exports");
+  const held = [
+    takeLease(join(exports, KEY), `${process.pid}-${Date.now()}-ab12cd`),
+    takeLease(join(exports, `${KEY}.reading`), `${process.pid}-${Date.now()}-ef34gh`),
+  ];
+  try {
+    const inUse = [
+      staged(`${KEY}.fig.${process.pid}.ab12cd.tmp`),
+      staged(`${KEY}.fig.${process.pid}.ab12cd.tmp.${process.pid}.zz99zz.tmp`),
+      staged(`${KEY}.previous.fig.${process.pid}.ab12cd.tmp`),
+      staged(`${KEY}.fig.${process.pid}.ef34gh.tmp`),
+      staged(`${KEY}.previous.fig.${process.pid}.ef34gh.tmp`),
+    ];
+    // pid 1 is alive but did not write this stamp, which is how liveLeases tells a holder that died.
+    const crashed = join(exports, KEY, `1-${Date.now()}-ij56kl`);
+    writeFileSync(crashed, processStamp(process.pid));
+    const gone = [
+      staged(`${KEY}.fig.1.ij56kl.tmp`),
+      // A live lease claims only the files that carry its own pid and tag, under its own key.
+      staged(`${KEY}.fig.${process.pid}.mn78op.tmp`),
+      staged(`OtherKey12345.fig.${process.pid}.ab12cd.tmp`),
+    ];
+    cleanStaleDownloads(cache);
+    assert.deepEqual(inUse.filter((f) => !existsSync(f)), [], "deleted while their owner was using them");
+    assert.deepEqual(gone.filter((f) => existsSync(f)), [], "kept with no live owner");
+    assert.ok(!existsSync(crashed), "and the dead holder's lease is gone with them");
+  } finally {
+    held.forEach(dropLease);
+  }
+});
+
+test("a staging file of a holder in another pid namespace is judged by that holder's heartbeat", { skip: !pidNamespace() && "no pid namespace on this platform" }, async () => {
+  // A container sharing the cache has pids that mean nothing here: 999999 names no process of ours, or an unrelated
+  // one, and judged by it the file of a live export there would be swept. Its lease's heartbeat is what says, and
+  // silence is measured on this process's own running time, which a suspended machine does not advance.
+  const cache = mkdtempSync(join(root, "foreign-"));
+  const file = join(cache, `${KEY}.fig.999999.ab12cd.tmp`);
+  writeFileSync(file, "bytes");
+  const past = new Date(Date.now() - 3_600_000);
+  utimesSync(file, past, past);
+  const [first, second] = processStamp(process.pid).split("|");
+  const beat = 20;
+  const stamp = `${second === undefined ? `|${first}` : `${first}|${second}`}|${Number(pidNamespace()) + 1}|${beat}`;
+  mkdirSync(join(cache, "exports", KEY), { recursive: true });
+  writeFileSync(join(cache, "exports", KEY, `999999-${Date.now()}-ab12cd`), stamp);
+  cleanStaleDownloads(cache);
+  assert.ok(existsSync(file), "a holder first seen is live");
+  // Twelve beats with no touch is a holder that has gone.
+  await new Promise((r) => setTimeout(r, 13 * beat));
+  cleanStaleDownloads(cache);
+  assert.ok(!existsSync(file), "and one silent for twelve beats is not");
 });
 
 test("two copies onto one snapshot path cannot collide over their temporary", (t) => {

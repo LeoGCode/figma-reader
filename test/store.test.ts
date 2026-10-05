@@ -3,12 +3,12 @@
 import { after, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import {
-  chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync,
-  writeFileSync,
+  chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync,
+  utimesSync, writeFileSync,
 } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { LEASE_BEAT_MS, pidNamespace, processStamp, takeLease } from "../src/browser.ts";
 import { FigDocument } from "../src/fig-file.ts";
 import { cleanStaleDownloads, type FigmaWeb } from "../src/figma-web.ts";
@@ -1224,6 +1224,117 @@ describe("SnapshotStore beside another process's sweep", () => {
       }
     },
   );
+
+  it("sweeps the lock directories a crash left, and none that anyone holds", () => {
+    // The publish lock is staged as a directory holding its holder's lease and renamed onto the lock; a crash before
+    // the rename left the staged one for good, a crash while holding left the lock, and diff previous left its reader
+    // directory behind. Judged as the staging files are, by the leases in them.
+    const dir = tempDir();
+    const exports = join(dir, "exports");
+    const past = new Date(Date.now() - HOUR);
+    const planted = (name: string, lease?: string, stamp = processStamp(process.pid), old = true) => {
+      const path = join(exports, name);
+      mkdirSync(path, { recursive: true });
+      if (lease) writeFileSync(join(path, lease), stamp);
+      if (old) utimesSync(path, past, past);
+      return path;
+    };
+    // pid 1 is alive but did not write this stamp, which is how liveLeases tells a holder that died.
+    const gone = [
+      planted("K.publish.1.ab12cd", "1-ab12cd"),
+      planted("K.publish.4242.ef34gh"),
+      planted("K.publish", "1-ij56kl"),
+      planted("K.reading", `1-${Date.now()}-mn78op`),
+      planted("L.reading"),
+    ];
+    const held = [
+      planted(`L.publish.${process.pid}.qr90st`, `${process.pid}-qr90st`),
+      // Staged a moment ago and its lease not yet in it: its owner may be between the two, so it is not a crash's yet.
+      planted(`M.publish.${process.pid}.uv12wx`, undefined, undefined, false),
+      planted("L.publish", `${process.pid}-yz34ab`),
+      planted("M.reading", `${process.pid}-${Date.now()}-cd56ef`),
+      // An export's own lease directory, which every export of the key uses again.
+      planted("K"),
+    ];
+    cleanStaleDownloads(dir);
+    assert.deepEqual(gone.filter((p) => existsSync(p)).map((p) => basename(p)), [], "left with nobody holding them");
+    assert.deepEqual(held.filter((p) => !existsSync(p)).map((p) => basename(p)), [], "removed while held");
+  });
+
+  it("never takes a staged publish lock from its owner, not even in the moment before its lease is in it", async () => {
+    // The one moment a staged lock holds no lease is its owner's, between its mkdir and its lease. A sweep there that
+    // removed it made the owner's lease write fail, twice running in the worst case, and the publish then went ahead
+    // without the lock. So the sweep runs at that moment, and right after the lease, of every staging this export makes.
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    const fs = createRequire(import.meta.url)("node:fs");
+    const real = { mkdirSync: fs.mkdirSync, writeFileSync: fs.writeFileSync, renameSync: fs.renameSync };
+    const staging = (path: unknown) => /\.publish\.\d+\.[a-z0-9]+$/.test(String(path));
+    let sweeps = 0;
+    const lockedAtSwap: boolean[] = [];
+    fs.mkdirSync = (path: string, ...rest: unknown[]) => {
+      const made = real.mkdirSync(path, ...rest);
+      if (staging(path)) {
+        sweeps++;
+        cleanStaleDownloads(dir);
+      }
+      return made;
+    };
+    fs.writeFileSync = (path: string, ...rest: unknown[]) => {
+      real.writeFileSync(path, ...rest);
+      if (staging(dirname(String(path)))) {
+        sweeps++;
+        cleanStaleDownloads(dir);
+      }
+    };
+    fs.renameSync = (from: string, to: string) => {
+      if (to === store.figPath("K")) lockedAtSwap.push(existsSync(join(dir, "exports", "K.publish")));
+      return real.renameSync(from, to);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(label(await store.get("K", true)), "export 2");
+    } finally {
+      Object.assign(fs, real);
+      syncBuiltinESMExports();
+    }
+    assert.equal(sweeps, 2, "a sweep before its lease and one after it");
+    assert.deepEqual(lockedAtSwap, [true], "and the swap was made holding the lock");
+    assert.deepEqual(readdirSync(join(dir, "exports")), ["K"], "nothing of the lock left behind");
+  });
+
+  it("leaves no reader directory behind diff previous, and a reader arriving as the last one leaves takes its lease", async () => {
+    // The last reader out removes the directory, and that can land between the next reader's mkdir and its lease,
+    // which then found no directory to write in: diff previous failed with ENOENT.
+    const { dir, store, current } = await pair();
+    const readers = join(dir, "exports", "K.reading");
+    assert.equal(label((await store.previousOf("K", current))!), "export 1");
+    assert.ok(!existsSync(readers), "its reader directory went with its last reader");
+    const fs = createRequire(import.meta.url)("node:fs");
+    const real = fs.writeFileSync;
+    let writes = 0;
+    fs.writeFileSync = (path: string, ...rest: unknown[]) => {
+      // The other reader's rmdir, landing after this one's mkdir: once, which is what one other reader leaving does.
+      if (dirname(String(path)) === readers && !writes++) rmdirSync(readers);
+      return real(path, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(label((await store.previousOf("K", current))!), "export 1");
+    } finally {
+      fs.writeFileSync = real;
+      syncBuiltinESMExports();
+    }
+    assert.equal(writes, 2, "the directory was removed under its lease, which was written again once it was made again");
+    assert.ok(!existsSync(readers));
+    // A reader that crashed holding its lease does not keep the directory for good: the next one out judges it.
+    mkdirSync(readers);
+    writeFileSync(join(readers, `1-${Date.now()}-crashed`), processStamp(process.pid));
+    assert.equal(label((await store.previousOf("K", current))!), "export 1");
+    assert.ok(!existsSync(readers));
+  });
 
   it("fails diff previous on a lease it cannot take for any other reason, rather than link without one", async () => {
     const { dir, store, current } = await pair();

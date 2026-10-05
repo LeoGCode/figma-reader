@@ -351,11 +351,23 @@ function beatLeases() {
   }
 }
 
-/** Create a presence file for this process under dir (see liveLeases); returns its path. */
+/**
+ * Create a presence file for this process under dir (see liveLeases); returns its path. A directory left with no lease
+ * in it may be removed by whoever finds it so (a key's reader leases, see previousOf and cleanStaleLocks), and that can
+ * land between the mkdir and the write here: the write then finds no directory, which making it again is all it takes.
+ */
 export function takeLease(dir: string, name = String(process.pid)): string {
-  mkdirSync(dir, { recursive: true });
   const path = join(dir, name);
-  writeFileSync(path, processStamp(process.pid));
+  for (let attempt = 1; ; attempt++) {
+    mkdirSync(dir, { recursive: true });
+    try {
+      writeFileSync(path, processStamp(process.pid));
+      break;
+    } catch (e) {
+      // Bounded: each attempt lost is the directory removed by another process in that very instant.
+      if ((e as NodeJS.ErrnoException | null)?.code !== "ENOENT" || attempt >= 3) throw e;
+    }
+  }
   held.add(path);
   // Only a stamp carrying a namespace declares a beat, and only such a stamp is ever judged by one; off Linux every
   // reader judges by pid. unref, because a client lease is held for as long as the process runs and a timer holding

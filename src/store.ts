@@ -1,5 +1,5 @@
 // Snapshot cache: the latest exported .fig per file key on disk, and the one it replaced; decoded documents in memory.
-import { existsSync, linkSync, mkdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { cannotWrite, mayNotWrite } from "./account.ts";
 import { dropLease, liveLeases, processStamp, takeLease } from "./browser.ts";
@@ -50,6 +50,53 @@ export function stagedByLiveOwner(dir: string, name: string): boolean {
   return [exportLeases(dir, fileKey), readerLeases(dir, fileKey)].some((leases) =>
     liveLeases(leases).some((lease) => lease.split("-")[0] === pid && lease.endsWith(`-${tag}`)),
   );
+}
+
+/** A key's publish lock as underPublishLock stages it, "<key>.publish.<pid>.<tag>", before renaming it onto the lock. */
+const STAGED_LOCK = /^[A-Za-z0-9]+\.publish\.\d+\.[a-z0-9]+$/;
+/** The lock itself, and the directory of a key's reader leases (see previousOf). */
+const LOCK_OR_READERS = /^[A-Za-z0-9]+\.(?:publish|reading)$/;
+/** How old a staged lock holding no lease must be before cleanStaleLocks takes it for a crash's. */
+const UNCLAIMED_STAGED_LOCK_MS = 60_000;
+
+/**
+ * Remove the lock directories nobody holds from the snapshot directory `dir`: a publish lock a crash left staged, or
+ * held, and a key's reader-lease directory with no reader left in it. Swept with the staging files
+ * (cleanStaleDownloads), by the calls that reach the browser. Each is judged by the leases in it, as liveLeases judges
+ * every lease here, and rmdir is the only removal, so a lease written into one meanwhile always keeps it.
+ *
+ * A staged lock is made, given its holder's lease and renamed onto the lock within a few file operations: a crash in
+ * between leaves it, and nothing ever looked at that name again. One whose lease is live is in use; one whose lease
+ * liveLeases finds dead goes, emptied by that judgement. One holding no lease at all is a crash between its mkdir and
+ * its lease, or an owner in that very moment, which is the one way a sweep could take a staged lock from its owner:
+ * so it goes only once it is a minute old, and no owner spends a minute on two file operations. The lock itself and a
+ * reader-lease directory hold a lease whenever anyone holds them, so an empty one is held by nobody: the lock comes
+ * into being by a rename that carries its holder's lease in (underPublishLock clears an empty one the same way), and a
+ * reader that arrives as its directory is removed makes it again (see takeLease). An export's own lease directory is
+ * left alone.
+ */
+export function cleanStaleLocks(dir: string) {
+  const exports = join(dir, "exports");
+  let names: string[];
+  try {
+    names = readdirSync(exports);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const staged = STAGED_LOCK.test(name);
+    if (!staged && !LOCK_OR_READERS.test(name)) continue;
+    const path = join(exports, name);
+    try {
+      const st = statSync(path);
+      if (!st.isDirectory()) continue;
+      // Read before liveLeases, which removes the leases it finds dead: an empty directory then is one it emptied.
+      const leases = readdirSync(path).length;
+      if (liveLeases(path).length) continue;
+      if (staged && !leases && Date.now() - st.mtimeMs < UNCLAIMED_STAGED_LOCK_MS) continue;
+      rmdirSync(path);
+    } catch {}
+  }
 }
 
 /**
@@ -470,6 +517,15 @@ export class SnapshotStore {
       rmSync(now, { force: true });
       rmSync(was, { force: true });
       dropLease(lease);
+      // The last reader out removes the directory, which an export never looks in: it was left behind, empty, by
+      // every diff previous. liveLeases first, so that the lease of a reader that crashed is not what keeps it. A
+      // reader arriving meanwhile has its lease in it (rmdir takes only an empty one), or makes it again (takeLease).
+      const readers = readerLeases(this.dir, fileKey);
+      if (!liveLeases(readers).length) {
+        try {
+          rmdirSync(readers);
+        } catch {}
+      }
     }
   }
 

@@ -2,7 +2,7 @@
 // away, the order, and the records it must not believe.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { devStatusList } from "../src/dev-status.ts";
+import { devStatusList, neverMarked } from "../src/dev-status.ts";
 import { figDoc, guid, internalPage, type TestNode } from "./fixtures.ts";
 
 // Seconds, as lastUpdateUnixTimestamp stores them: 30 Sep, 1, 2 and 3 Oct 2026.
@@ -78,5 +78,12 @@ describe("devStatusList", () => {
     assert.deepEqual(ids({ page: "Checkout" }), ["2:9", "2:10", "2:1", "2:6", "2:3"]);
     assert.deepEqual(ids({ page: "Checkout", status: "completed" }), ["2:1"]);
     assert.deepEqual(ids({ page: "Internal", status: "any" }), [], "an internal-only page is not one of the file's pages");
+  });
+
+  it("counts the never-marked records the default leaves out, on the pages it would list", () => {
+    // 1:2 and 1:4: none and none, with no user. Exactly what any adds to the default, minus nothing else.
+    assert.equal(neverMarked(doc), 2);
+    assert.equal(neverMarked(doc), ids({ status: "any" }).length - ids().length);
+    assert.deepEqual([neverMarked(doc, "Design system"), neverMarked(doc, "Checkout"), neverMarked(doc, "Internal")], [2, 0, 0]);
   });
 });

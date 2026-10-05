@@ -778,6 +778,26 @@ describe("figma_dev_status", () => {
     // The CLI and the MCP server both validate against this shape, so a status nobody spells this way is refused there.
     assert.equal(z.object(byName.get("figma_dev_status")!.shape).strict().safeParse({ file, status: "ready" }).success, false);
   });
+
+  it("says how many never-marked records the default left out, and only when it left some out", async () => {
+    // A frame ready for dev, and a component carrying the record Figma writes on what nobody marked.
+    const quiet = figFile("dev-status-quiet", [
+      page,
+      { id: "1:1", type: "FRAME", parent: "0:1", name: "Ready", sectionStatusInfo: { status: "BUILD", prevStatus: "NONE", lastUpdateUnixTimestamp: at, userId: "1234567" } },
+      { id: "1:2", type: "SYMBOL", parent: "0:1", name: "Icon", sectionStatusInfo: { status: "NONE", prevStatus: "NONE", lastUpdateUnixTimestamp: at } },
+    ]);
+    const shown = await call("figma_dev_status", { file: quiet });
+    assert.deepEqual([shown.total, shown.neverMarked, shown.nodes.map((n: { id: string }) => n.id)], [1, 1, ["1:1"]]);
+    assert.deepEqual(Object.keys(shown).slice(-2), ["neverMarked", "nodes"], "beside the counts, before the list");
+    // Asked for, they are listed, and nothing was left out to count.
+    for (const status of ["any", "none"]) {
+      const all = await call("figma_dev_status", { file: quiet, status });
+      assert.equal(all.neverMarked, undefined, status);
+      assert.ok(all.nodes.some((n: { id: string }) => n.id === "1:2"), status);
+    }
+    // A file whose every record says something has nothing to count.
+    assert.equal((await call("figma_dev_status", { file })).neverMarked, undefined);
+  });
 });
 
 describe("figma_diff", () => {

@@ -26,13 +26,8 @@ export interface DevStatusEntry extends DevStatus {
  * by a newer copy in the same file.
  */
 export function devStatusList(doc: FigDocument, opts: { page?: string; status?: DevStatusFilter } = {}): DevStatusEntry[] {
-  const pages = new Set(doc.pages());
   const found: { entry: DevStatusEntry; at: number }[] = [];
-  for (const n of doc.nodes.values()) {
-    const d = devStatus(n);
-    if (!d || n.isSoftDeleted || doc.isSuperseded(n)) continue;
-    const page = doc.pageOf(n);
-    if (!page || !pages.has(page) || (opts.page !== undefined && page.name !== opts.page)) continue;
+  for (const { n, d, page } of records(doc, opts.page)) {
     const wanted = opts.status === "any" || (opts.status ? d.status === opts.status : devStatusShown(d));
     if (!wanted) continue;
     found.push({
@@ -43,4 +38,27 @@ export function devStatusList(doc: FigDocument, opts: { page?: string; status?: 
   // A record with no time sorts last; one time shared by several nodes (a set and its variants marked at once) is
   // broken by id, so the same file answers in the same order every time.
   return found.sort((a, b) => b.at - a.at || compareGuidIds(a.entry.id, b.entry.id)).map((f) => f.entry);
+}
+
+/**
+ * How many records the default listing leaves out (on `page`, if given): the never-marked ones. Leaving them out is
+ * right - every dev-status question agents asked was which frames are ready - but an answer that does not say it left
+ * anything out reads as the whole of what the file holds, and the count is what tells a reader --status any has more.
+ */
+export function neverMarked(doc: FigDocument, page?: string): number {
+  let count = 0;
+  for (const { d } of records(doc, page)) if (!devStatusShown(d)) count++;
+  return count;
+}
+
+/** Every status record on a visible page, with what devStatusList leaves out of any listing already left out. */
+function* records(doc: FigDocument, onPage?: string) {
+  const pages = new Set(doc.pages());
+  for (const n of doc.nodes.values()) {
+    const d = devStatus(n);
+    if (!d || n.isSoftDeleted || doc.isSuperseded(n)) continue;
+    const page = doc.pageOf(n);
+    if (!page || !pages.has(page) || (onPage !== undefined && page.name !== onPage)) continue;
+    yield { n, d, page };
+  }
 }

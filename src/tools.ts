@@ -14,7 +14,7 @@ import {
 import { BrowserManager, defaultExecutable, defaultStateDir } from "./browser.ts";
 import { changesSince, diffDocuments, parseSince } from "./changes.ts";
 import { componentUsage, componentUses } from "./component-usage.ts";
-import { DEV_STATUS_FILTERS, devStatusList } from "./dev-status.ts";
+import { DEV_STATUS_FILTERS, devStatusList, neverMarked } from "./dev-status.ts";
 import type { Raw } from "./fig-file.ts";
 import { cleanStaleDownloads, FigmaWeb, parseFileRef } from "./figma-web.ts";
 import { groupUnresolved, scanText } from "./instance-text.ts";
@@ -950,7 +950,8 @@ tool(
     "against a re-export, so quote it beside status), previous and previousRaw, changedAt (ISO-8601), and by (a Figma " +
     "user id) and note when the record has them. status none with a previous status other than none is a mark that came " +
     "off at changedAt; none with previous none is a record Figma keeps on a node never marked, listed only with status " +
-    "none or any unless a user or note on it says a person left it. " +
+    "none or any unless a user or note on it says a person left it. With no status given, neverMarked counts those " +
+    "records the listing left out (absent when it left none out); status any lists them. " +
     "Internal-only pages, soft-deleted nodes and superseded library copies are left out. " +
     EXPORTED_AT_NOTE,
   {
@@ -971,7 +972,13 @@ tool(
     }
     const nodes = devStatusList(doc, { page, status });
     const max = limit ?? 100;
-    return json({ ...dated, returned: Math.min(nodes.length, max), total: nodes.length, truncated: nodes.length > max, nodes: nodes.slice(0, max) });
+    // Only the default leaves records out, and saying so is the one sign of them an answer gives: on a real export
+    // the default listed 15 and status any 82, and nothing in the first answer said the other 67 were there.
+    const left = status === undefined ? neverMarked(doc, page) : 0;
+    return json({
+      ...dated, returned: Math.min(nodes.length, max), total: nodes.length, truncated: nodes.length > max,
+      ...(left ? { neverMarked: left } : {}), nodes: nodes.slice(0, max),
+    });
   },
 );
 

@@ -836,21 +836,28 @@ describe("figma_diff", () => {
     const edited = { editInfo: { createdAt: Date.parse("2026-10-01T00:00:00Z") / 1000, lastEditedAt: Date.parse("2026-10-02T00:00:00Z") / 1000 } };
     const screens = { id: "0:1", type: "CANVAS", parent: "0:0", name: "Screens" } as TestNode;
     const archive = { id: "0:2", type: "CANVAS", parent: "0:0", name: "Archive" } as TestNode;
-    const was = figFile("diff-pages-before", [screens, archive, ...many(5, (i) => ({ id: `2:${i + 1}`, type: "FRAME", parent: "0:2", name: `old ${i}` }))]);
+    // The archive page first: in page order its changes came first, and a plain cut at the limit kept only those.
+    const was = figFile("diff-pages-before", [
+      archive, screens,
+      { id: "1:9", type: "FRAME", parent: "0:1", name: "Gone" },
+      ...many(5, (i) => ({ id: `2:${i + 1}`, type: "FRAME", parent: "0:2", name: `old ${i}` })),
+    ]);
     const is = figFile("diff-pages-after", [
-      screens, archive,
+      archive, screens,
       { id: "1:1", type: "FRAME", parent: "0:1", name: "Paywall", ...edited },
       ...many(5, (i) => ({ id: `3:${i + 1}`, type: "FRAME", parent: "0:2", name: `archived ${i}`, ...edited })),
     ]);
     const r = await call("figma_diff", { old: was, new: is });
     assert.deepEqual([r.excludedPages, r.excludedPagesFrom], [["Archive"], projectFile]);
-    assert.deepEqual([ids(r.layers.added), ids(r.layers.removed), r.counts.layersAdded, r.counts.removedNodes], [["1:1"], [], 1, 0]);
-    assert.deepEqual(r.byPage, { Archive: { removedNodes: 5, added: 5, removed: 5 }, Screens: { added: 1 } });
-    // [] covers every page; a page asked for sets the default aside; a name neither file has is refused.
+    assert.deepEqual([ids(r.layers.added), ids(r.layers.removed), r.counts.layersAdded, r.counts.removedNodes], [["1:1"], ["1:9"], 1, 1]);
+    assert.deepEqual(r.byPage, { Archive: { removedNodes: 5, added: 5, removed: 5 }, Screens: { removedNodes: 1, added: 1, removed: 1 } });
+    // [] covers every page, and the limit is shared between them: the later page's one addition and one removal are
+    // listed beside the archive's first, where a cut at 2 in page order listed two of the archive's each.
     const every = await call("figma_diff", { old: was, new: is, exclude_pages: [], limit: 2 });
-    assert.deepEqual([every.excludedPages, ids(every.layers.added), every.truncated], [undefined, ["1:1", "3:1"], true], "shared between the two pages");
+    assert.deepEqual([every.excludedPages, ids(every.layers.added), ids(every.layers.removed), every.truncated], [undefined, ["3:1", "1:1"], ["2:1", "1:9"], true]);
+    // A page asked for sets the default aside; a name neither file has is refused.
     assert.deepEqual(ids((await call("figma_diff", { old: was, new: is, page: "Archive" })).layers.removed).length, 5);
-    await assert.rejects(body("figma_diff", { old: was, new: is, page: "Archiv" }), /no page named "Archiv"; pages: "Screens", "Archive"/);
+    await assert.rejects(body("figma_diff", { old: was, new: is, page: "Archiv" }), /no page named "Archiv"; pages: "Archive", "Screens"/);
     await assert.rejects(body("figma_diff", { old: was, new: is, exclude_pages: ["Old"] }), /no page named "Old" to exclude/);
     await assert.rejects(body("figma_diff", { old: was, new: is, page: "Archive", exclude_pages: ["Archive"] }), /page "Archive" is both asked for and in exclude_pages/);
     // A page renamed between the two is asked for, and left out, by either name.

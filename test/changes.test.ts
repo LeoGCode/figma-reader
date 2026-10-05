@@ -182,6 +182,33 @@ describe("diffDocuments", () => {
   });
 });
 
+describe("diffDocuments' limit, shared between pages", () => {
+  // A page with many changes first, a page with one of each after it. In page order a cut at the limit spent it all
+  // on the first page, and the later page's changes were in no list, with only truncated to say so.
+  const page = (id: string, name: string): TestNode => ({ id, type: "CANVAS", parent: "0:0", name });
+  const frame = (id: string, parent: string, name = id): TestNode => ({ id, type: "FRAME", parent, name });
+  const section = (id: string, parent: string): TestNode => ({ id, type: "SECTION", parent, name: `section ${id}` });
+  const was = figDoc([
+    page("0:1", "Design system"), section("1:900", "0:1"), page("0:2", "Product"), section("2:900", "0:2"),
+    ...[1, 2, 3, 4, 5].flatMap((i) => [frame(`1:${i}`, "0:1"), frame(`1:${10 + i}`, "0:1")]), // to be removed, to be moved
+    frame("2:1", "0:2"), frame("2:11", "0:2"),
+  ]);
+  const is = figDoc([
+    page("0:1", "Design system"), section("1:900", "0:1"), page("0:2", "Product"), section("2:900", "0:2"),
+    ...[1, 2, 3, 4, 5].flatMap((i) => [frame(`1:${10 + i}`, "1:900"), frame(`1:${20 + i}`, "0:1")]), // moved, added
+    frame("2:11", "2:900"), frame("2:21", "0:2"),
+  ]);
+
+  it("lists the later page's additions, removals and moves beside the first page's", () => {
+    const d = diffDocuments(was, is, 2);
+    assert.deepEqual([d.counts.layersAdded, d.counts.layersRemoved, d.counts.layersMoved, d.truncated], [6, 6, 6, true]);
+    assert.deepEqual(ids(d.layers.added), ["1:21", "2:21"]);
+    assert.deepEqual(ids(d.layers.removed), ["1:1", "2:1"]);
+    assert.deepEqual(ids(d.layers.moved).sort(), ["1:11", "2:11"]);
+    assert.deepEqual(ids(d.removedNodes), ["1:1", "2:1"]);
+  });
+});
+
 describe("byPage, with pages named whatever their designers named them", () => {
   // A page called __proto__ made `counts[page] ??= {}` count into Object.prototype, and every answer after it in the
   // same process (a batch, an MCP server) inherited counts it never made.

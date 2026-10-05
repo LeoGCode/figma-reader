@@ -28,8 +28,10 @@ export function topLevelLayers(doc: FigDocument, page: FigNode): FigNode[] {
   return out;
 }
 
-const entry = (doc: FigDocument, n: FigNode): Raw => ({ id: n.id, type: displayType(n), name: n.name, page: doc.pageOf(n)?.name, path: doc.path(n) });
-const place = (doc: FigDocument, n: FigNode): Raw => ({ page: doc.pageOf(n)?.name, parentId: n.parentId, path: doc.path(n) });
+// A path with pathIds where it does not split back into its names (see FigDocument.pathFields): a removed layer's ids
+// are the old file's, where figma_locate finds them.
+const entry = (doc: FigDocument, n: FigNode): Raw => ({ id: n.id, type: displayType(n), name: n.name, page: doc.pageOf(n)?.name, ...doc.pathFields(n) });
+const place = (doc: FigDocument, n: FigNode): Raw => ({ page: doc.pageOf(n)?.name, parentId: n.parentId, ...doc.pathFields(n) });
 
 /**
  * The pages an answer covers, by name: the one asked for, or every page but the excluded ones. diffDocuments resolves
@@ -148,7 +150,7 @@ export function diffDocuments(old: FigDocument, cur: FigDocument, limit: number,
     const was = old.get(id), is = cur.get(id);
     if (!was || !is) continue;
     if (was.name !== is.name) {
-      renamed.push({ out: { id, type: displayType(is), oldName: was.name, name: is.name, page: cur.pageOf(is)?.name, path: cur.path(is) }, on: [pageOf(cur, is)] });
+      renamed.push({ out: { id, type: displayType(is), oldName: was.name, name: is.name, page: cur.pageOf(is)?.name, ...cur.pathFields(is) }, on: [pageOf(cur, is)] });
     }
     // Moved to the page it is on now, and from the one it left: the page it left lost a layer as surely.
     if (was.parentId !== is.parentId) {
@@ -302,7 +304,7 @@ export function changesSince(doc: FigDocument, since: Date, limit: number, pages
       found.push({
         newest,
         out: {
-          id: top.id, name: top.name, type: displayType(top), page: page.name, path: doc.path(top),
+          id: top.id, name: top.name, type: displayType(top), page: page.name, ...doc.pathFields(top),
           lastEditedAt: new Date(newest * 1000).toISOString(),
           created: (recorded(top.editInfo?.createdAt) ?? -Infinity) >= at,
           editedNodes: count,

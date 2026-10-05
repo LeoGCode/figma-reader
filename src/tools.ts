@@ -12,10 +12,10 @@ import {
   resolveAccount, writeAccountInfo,
 } from "./account.ts";
 import { BrowserManager, defaultExecutable, defaultStateDir } from "./browser.ts";
-import { changesSince, diffDocuments, parseSince } from "./changes.ts";
+import { changesSince, diffDocuments, parseSince, sharedByPage } from "./changes.ts";
 import { componentUsage, componentUses } from "./component-usage.ts";
 import { DEV_STATUS_FILTERS, devStatusList, neverMarked } from "./dev-status.ts";
-import type { FigDocument, Raw } from "./fig-file.ts";
+import type { FigDocument, FigNode, Raw } from "./fig-file.ts";
 import { cleanStaleDownloads, FigmaWeb, parseFileRef } from "./figma-web.ts";
 import { groupUnresolved, scanText } from "./instance-text.ts";
 import { imageExt, localFigFiles, outPath } from "./local-files.ts";
@@ -271,6 +271,11 @@ export function datingRule(name = (tool: string) => tool, arg = (a: string) => a
 const EXPORTED_AT_NOTE =
   "Dated by exportedAt and account, or fileModifiedAt for a file read from disk, as the server's instructions say " +
   "(figma-reader help on the command line).";
+/**
+ * Said in the description of every tool whose entries carry path, which cannot always be split back into its layers:
+ * see FigDocument.pathFields.
+ */
+const PATH_NOTE = "Where path does not split on ' / ' into its names, pathIds follows it: one id per name, page first.";
 /** Missing components listed by figma_get_text; the rest are counted, never dropped silently. */
 const MAX_UNRESOLVED_GROUPS = 20;
 
@@ -636,7 +641,7 @@ tool(
     "markdown, category, the properties pinned) and measurements (from/to node ids and sides; the distance itself is not " +
     "stored). devStatus is absent on a node never marked: a record that is none and was none, with no user or note on " +
     "it, is one Figma keeps on components nobody marked, and only figma_dev_status with status none or any lists it. " +
-    EXPORTED_AT_NOTE,
+    `${PATH_NOTE} ${EXPORTED_AT_NOTE}`,
   {
     file: fileArg,
     node_id: z.string().optional(),
@@ -650,7 +655,7 @@ tool(
     const n = doc.require(id);
     const parent = n.parentId ? doc.get(n.parentId) : undefined;
     const data = new Normalizer(doc).node(n, depth ?? 3, parent);
-    const out = JSON.stringify({ ...dated, page: doc.pageOf(n)?.name, path: doc.path(n), ...data }, null, 1);
+    const out = JSON.stringify({ ...dated, page: doc.pageOf(n)?.name, ...doc.pathFields(n), ...data }, null, 1);
     if (out.length > 200_000) throw new Error(`result is ${Math.round(out.length / 1000)}KB; use a smaller depth or a deeper node_id`);
     return text(out);
   },
@@ -678,7 +683,7 @@ tool(
     "for a node the file has (path from the page down, as figma_get_node gives it), {id, found: false} for one it has " +
     "not, and {id, error} for a string that is not a node id. found, missing and invalid count the entries. found: false " +
     "is said only of a file that was read: one that cannot be read fails the whole call. " +
-    EXPORTED_AT_NOTE,
+    `${PATH_NOTE} ${EXPORTED_AT_NOTE}`,
   {
     file: fileArg,
     node_ids: z.array(z.string()).min(1).describe("The node ids to look up, like 12:34 (or 12-34)"),
@@ -699,7 +704,7 @@ tool(
         return { id, found: false };
       }
       count.found++;
-      return { id, found: true, type: displayType(n), name: n.name, page: doc.pageOf(n)?.name, path: doc.path(n) };
+      return { id, found: true, type: displayType(n), name: n.name, page: doc.pageOf(n)?.name, ...doc.pathFields(n) };
     });
     return json({ ...dated, ...count, results });
   },
@@ -711,13 +716,14 @@ tool(
  * scope to, the project's excludePages - of which a file without one of those pages has nothing to skip, the list
  * being for all of the project's files. [] leaves none out. `from` is the project file when the list came from it.
  * Excluding the one page asked about answers "nothing" about a page nobody looked at, so that is refused too.
+ * `project: false` is a tool that takes exclude_pages but never the project's (figma_get_text).
  */
-function pagesLeftOut(pages: string[], args: { page?: string; exclude_pages?: string[]; scoped?: boolean; asked?: string }) {
-  const { page, exclude_pages, scoped, asked = "asked for" } = args;
+function pagesLeftOut(pages: string[], args: { page?: string; exclude_pages?: string[]; scoped?: boolean; asked?: string; project?: boolean }) {
+  const { page, exclude_pages, scoped, asked = "asked for", project = true } = args;
   const noPage = (name: string, what = "") => new Error(`no page named ${JSON.stringify(name)}${what}; pages: ${pages.map((p) => JSON.stringify(p)).join(", ")}`);
   if (page !== undefined && !pages.includes(page)) throw noPage(page);
   for (const name of exclude_pages ?? []) if (!pages.includes(name)) throw noPage(name, " to exclude");
-  const fromProject = exclude_pages === undefined && page === undefined && !scoped ? account.config?.excludePages : undefined;
+  const fromProject = project && exclude_pages === undefined && page === undefined && !scoped ? account.config?.excludePages : undefined;
   const excluded = new Set(exclude_pages ?? fromProject ?? []);
   if (page !== undefined && excluded.has(page)) throw new Error(`page ${JSON.stringify(page)} is both ${asked} and in exclude_pages`);
   return { excluded, from: fromProject ? account.config!.path : undefined };
@@ -1012,7 +1018,7 @@ tool(
     "none or any unless a user or note on it says a person left it. With no status given, neverMarked counts those " +
     "records the listing left out (absent when it left none out); status any lists them. " +
     "Internal-only pages, soft-deleted nodes and superseded library copies are left out. " +
-    EXPORTED_AT_NOTE,
+    `${PATH_NOTE} ${EXPORTED_AT_NOTE}`,
   {
     file: fileArg,
     page: z.string().optional().describe("Only nodes on this page; a name no page has is an error listing the pages"),
@@ -1063,6 +1069,13 @@ tool(
   },
 );
 
+/**
+ * The keys of a figma_get_text item, which fields picks from. Across 80 jq filters agents ran on get-text, .text was
+ * kept 73 times and .id 31, .frame once, and name, via and component never; an MCP client cannot filter at all. On a
+ * real 67 MB export the items of a 148-string frame took 21 KB, and their ids and strings alone 8 KB.
+ */
+const TEXT_FIELDS = ["id", "name", "text", "via", "component", "variant", "frame"] as const;
+
 tool(
   "figma_get_text",
   "All text content under a node (or the whole file) in reading order, with node ids. Component instances are expanded, so " +
@@ -1072,32 +1085,72 @@ tool(
     "The result always reports total/truncated/unresolvedInstances: a non-zero unresolvedInstances means text is missing, " +
     "at that many places; unresolved lists each missing component once, with its count and some of those places, the most " +
     "common first, and unresolvedComponentsOmitted counts the components past that listing. " +
+    "Without node_id or page it reads every page but exclude_pages (never the project's excludePages) and shares " +
+    "limit between them, so one cannot crowd out the rest; byPage gives each page's returned and total: pass page " +
+    "for one cut short. " +
     EXPORTED_AT_NOTE,
   {
     file: fileArg,
     node_id: z.string().optional(),
+    page: z.string().optional().describe("Only text on this page, by name"),
+    exclude_pages: z.array(z.string()).optional().describe("Pages to leave out, by name (default none)"),
+    fields: z.array(z.enum(TEXT_FIELDS)).min(1).optional().describe(`Keys to keep in each item, of ${TEXT_FIELDS.join(", ")} (default all)`),
     limit: z.number().int().positive().optional().describe("Default 500"),
     include_hidden: z.boolean().optional().describe("Include layers hidden in the design (default false)"),
     refresh: refreshArg,
   },
-  async ({ file, node_id, limit, include_hidden, refresh }) => {
+  async ({ file, node_id, page, exclude_pages, fields, limit, include_hidden, refresh }) => {
     const { doc, dated, urlNodeId } = await open(file, refresh);
     const id = node_id ?? urlNodeId;
-    const roots = id ? [doc.require(id)] : doc.pages();
-    const { items, unresolved } = scanText(doc, roots, include_hidden ?? false);
-    const max = limit ?? 500;
+    const asked = id ? doc.require(id) : undefined;
+    // The document's own id is the whole file, and is read as one: it is on no page, so neither page nor exclude_pages
+    // had anything to check it against, and both were dropped in silence while every page (the internal-only one too)
+    // was scanned in one piece, with the first pages taking the limit again.
+    const scope = asked?.id === doc.rootId ? undefined : asked;
+    const pages = doc.pages();
+    // The project's excludePages is not read here. It is there for pages whose hits fill a search's limit, and the
+    // limit below is shared between pages, so no page fills it any more; what a whole-file get-text is asked for is an
+    // inventory ("is this string anywhere", "which of these ids are text inside an instance"), and a page left out by
+    // a default the call never named would answer "no" for it. Agents scoped 179 of 183 get-text calls to a node.
+    const { excluded } = pagesLeftOut(pages.map((p) => p.name), { page, exclude_pages, project: false });
+    if (scope) {
+      const on = doc.pageOf(scope)?.name;
+      if (page !== undefined && on !== page) {
+        throw new Error(`node ${scope.id} is ${on === undefined ? "on no page" : `on page ${JSON.stringify(on)}`}, not on ${JSON.stringify(page)}`);
+      }
+      if (on !== undefined && excluded.has(on)) throw new Error(`node ${scope.id} is on page ${JSON.stringify(on)}, which exclude_pages leaves out`);
+    }
+    const whole = !scope && page === undefined;
+    const roots: FigNode[] = scope ? [scope] : pages.filter((p) => (page === undefined ? !excluded.has(p.name) : p.name === page));
+    // One scan per page, so that each string is known by its page. In page order the first page took the whole limit:
+    // on the real export its 531 strings filled all 500, and the 32,560 on the twelve pages after it went unseen with
+    // only truncated: true to say so. The limit is shared the way figma_diff and figma_changes share theirs.
+    const found = roots.map((root) => ({ root, ...scanText(doc, [root], include_hidden ?? false) }));
+    const strings = found.flatMap((f) => f.items.map((item) => ({ item, root: f.root })));
+    const unresolved = found.flatMap((f) => f.unresolved);
+    const kept = sharedByPage(strings, (s) => s.root.id, limit ?? 500);
+    // How many strings each page holds and how many of them the answer shows: what says where a cut was made. A Map,
+    // as in changes.ts, since a page is named by whoever made the file and "__proto__" is a name.
+    const byPage = new Map<string, { returned: number; total: number }>();
+    if (whole) {
+      for (const f of found) if (f.items.length) byPage.set(f.root.name, { returned: 0, total: (byPage.get(f.root.name)?.total ?? 0) + f.items.length });
+      for (const s of kept) byPage.get(s.root.name)!.returned++;
+    }
+    const keep = fields && new Set<string>(fields);
     const groups = unresolved.length ? groupUnresolved(unresolved) : [];
     const shown = groups.slice(0, MAX_UNRESOLVED_GROUPS);
     return json({
       ...dated,
-      returned: Math.min(items.length, max),
-      total: items.length,
-      truncated: items.length > max,
+      ...(whole ? leftOut(new Set(pages.filter((p) => excluded.has(p.name)).map((p) => p.name)), undefined) : {}),
+      returned: kept.length,
+      total: strings.length,
+      truncated: strings.length > kept.length,
+      ...(whole ? { byPage: Object.fromEntries(byPage) } : {}),
       unresolvedInstances: unresolved.length,
       unresolved: shown.length ? shown : undefined,
       // The listing is capped, and dropping the rest silently would contradict "each missing component once".
       unresolvedComponentsOmitted: groups.length > shown.length ? groups.length - shown.length : undefined,
-      text: items.slice(0, max),
+      text: kept.map(({ item }) => (keep ? Object.fromEntries(Object.entries(item).filter(([k]) => keep.has(k))) : item)),
     });
   },
 );
@@ -1209,7 +1262,8 @@ tool(
     "that cache, never from " +
     "a local copy, and refresh exports it again first, which keeps the snapshot it replaces as previous: so " +
     "'previous <key>' with refresh compares the last export with the live file. old and new are each dated, as the " +
-    "server's instructions say: report the changes as between those two times.",
+    "server's instructions say: report the changes as between those two times. " +
+    PATH_NOTE,
   {
     old: z.string().describe("The older file: a .fig path, file key or figma.com URL, or the word previous for the snapshot that new's latest export replaced"),
     new: z.string().describe("The newer file: a .fig path, file key or figma.com URL; a key or URL when old is previous. A node-id in a URL is ignored"),
@@ -1279,7 +1333,7 @@ tool(
     "and editedNodes, every page counted, excluded ones too; page or exclude_pages (default: the project's " +
     "excludePages, echoed as excludedPages) narrow the list and its counts before the limit, which is shared between " +
     "pages so one page cannot crowd out the rest. " +
-    EXPORTED_AT_NOTE,
+    `${PATH_NOTE} ${EXPORTED_AT_NOTE}`,
   {
     file: fileArg,
     since: z.string().describe(

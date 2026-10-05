@@ -86,4 +86,18 @@ describe("devStatusList", () => {
     assert.equal(neverMarked(doc), ids({ status: "any" }).length - ids().length);
     assert.deepEqual([neverMarked(doc, "Design system"), neverMarked(doc, "Checkout"), neverMarked(doc, "Internal")], [2, 0, 0]);
   });
+
+  it("gives the ids of a path's names where a name in it holds the separator", () => {
+    const named = figDoc([
+      { id: "0:1", type: "CANVAS", parent: "0:0", name: "Checkout" },
+      { id: "1:1", type: "SECTION", parent: "0:1", name: "Payment / v2" },
+      { id: "1:2", type: "FRAME", parent: "1:1", name: "Card", ...info("BUILD", "NONE", oct1) },
+      { id: "1:3", type: "FRAME", parent: "0:1", name: "Cart", ...info("BUILD", "NONE", sep30) },
+    ]);
+    assert.deepEqual(devStatusList(named).map((e) => [e.id, e.path, e.pathIds]), [
+      ["1:2", "Checkout / Payment / v2 / Card", ["0:1", "1:1", "1:2"]],
+      ["1:3", "Checkout / Cart", undefined],
+    ]);
+    assert.ok(!("pathIds" in devStatusList(named)[1]), "absent, not undefined, where the path splits right");
+  });
 });

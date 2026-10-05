@@ -264,7 +264,7 @@ test("help says once what <file> and --refresh take, and names the arguments a b
   assert.match(search, /^ {2}--no-exclude-pages +Give exclude_pages as an empty list$/m);
   // Read off the tools: an agent passed node_ids as "1:2,3:4", the way the flag takes them, and lost the call.
   const batch = (await cli(["help", "batch"])).stdout.replace(/\s+/g, " ");
-  assert.match(batch, /a list as a JSON array, even of one value, never as a comma-separated string\. The lists are node_ids \(locate\), types \(search\), exclude_pages \(search, diff, changes\):/);
+  assert.match(batch, /a list as a JSON array, even of one value, never as a comma-separated string\. The lists are node_ids \(locate\), types \(search\), exclude_pages \(search, get-text, diff, changes\), fields \(get-text\):/);
 });
 
 test("locate takes its ids from --node-ids, and cannot run without them", async () => {

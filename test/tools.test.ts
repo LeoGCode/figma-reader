@@ -406,6 +406,7 @@ describe("figma_get_text", () => {
     assert.deepEqual([r.returned, r.total, r.truncated, r.text.length], [500, 501, true, 500]);
     assert.deepEqual([r.unresolvedInstances, r.unresolved, r.unresolvedComponentsOmitted], [0, undefined, undefined]);
     assert.equal(r.text[0].text, "line 0");
+    assert.deepEqual(r.byPage, { Page: { returned: 500, total: 501 } });
   });
 
   it("is not truncated when the limit is the number of strings", async () => {
@@ -425,6 +426,90 @@ describe("figma_get_text", () => {
     // The description promises each missing component once; the ones past the cap used to be dropped with no note.
     assert.equal(r.unresolvedComponentsOmitted, 5);
     assert.match(r.unresolved[0].reason, /main component is not present in this file/);
+  });
+
+  it("keeps only the keys fields names in each item, and the envelope as it is", async () => {
+    // Agents kept .text and .id, and dropped the rest with jq; an MCP client has no jq to drop it with.
+    const framed = figFile("text-fields", [
+      page,
+      { id: "1:1", type: "FRAME", parent: "0:1", name: "Card" },
+      { id: "1:2", type: "TEXT", parent: "1:1", name: "Title", textData: { characters: "Hello" } },
+      { id: "1:3", type: "TEXT", parent: "0:1", name: "Loose", textData: { characters: "Bye" } },
+    ]);
+    const all = await call("figma_get_text", { file: framed });
+    assert.deepEqual(all.text, [
+      { id: "1:2", name: "Title", text: "Hello", via: "direct", frame: "Card" },
+      { id: "1:3", name: "Loose", text: "Bye", via: "direct" },
+    ]);
+    const slim = await call("figma_get_text", { file: framed, fields: ["text", "id"] });
+    assert.deepEqual(slim.text, [{ id: "1:2", text: "Hello" }, { id: "1:3", text: "Bye" }]);
+    assert.deepEqual({ ...slim, text: undefined }, { ...all, text: undefined });
+    // A key that does not apply stays absent, as it is without fields.
+    assert.deepEqual((await call("figma_get_text", { file: framed, fields: ["frame"] })).text, [{ frame: "Card" }, {}]);
+    const shape = z.object(byName.get("figma_get_text")!.shape).strict();
+    assert.equal(shape.safeParse({ file: framed, fields: [] }).success, false, "an empty list would return empty items");
+    assert.equal(shape.safeParse({ file: framed, fields: ["page"] }).success, false, "only an item's own keys");
+  });
+
+  // 600 strings on the first page, a few on the ones after it, and a page with none.
+  const paged = figFile("text-pages", [
+    { id: "0:1", type: "CANVAS", parent: "0:0", name: "Design system" },
+    ...many(600, (i) => ({ id: `1:${i + 1}`, type: "TEXT", parent: "0:1", name: "t", textData: { characters: `ds ${i}` } })),
+    { id: "0:2", type: "CANVAS", parent: "0:0", name: "Archive" },
+    ...many(3, (i) => ({ id: `2:${i + 1}`, type: "TEXT", parent: "0:2", name: "t", textData: { characters: `old ${i}` } })),
+    { id: "0:3", type: "CANVAS", parent: "0:0", name: "Product" },
+    { id: "3:1", type: "FRAME", parent: "0:3", name: "Screen" },
+    ...many(5, (i) => ({ id: `3:${i + 2}`, type: "TEXT", parent: "3:1", name: "t", textData: { characters: `copy ${i}` } })),
+    { id: "0:4", type: "CANVAS", parent: "0:0", name: "Empty" },
+  ]);
+
+  it("shares the limit between the pages of a whole file, and says per page how much it showed", async () => {
+    // In page order the first page took the whole limit, and the eight strings after it went unseen with only
+    // truncated: true to say so.
+    const r = await call("figma_get_text", { file: paged });
+    assert.deepEqual([r.returned, r.total, r.truncated], [500, 608, true]);
+    assert.deepEqual(r.byPage, {
+      "Design system": { returned: 492, total: 600 },
+      // The project's excludePages names Archive, and get-text does not read it: a whole file is every page.
+      Archive: { returned: 3, total: 3 },
+      Product: { returned: 5, total: 5 },
+    });
+    assert.equal(r.excludedPages, undefined);
+    assert.deepEqual(r.text.slice(490).map((t: { text: string }) => t.text), [
+      "ds 490", "ds 491", "old 0", "old 1", "old 2", "copy 0", "copy 1", "copy 2", "copy 3", "copy 4",
+    ]);
+    // Four strings between three pages: one each, and the one left over to the page still cut.
+    const small = await call("figma_get_text", { file: paged, limit: 4 });
+    assert.deepEqual(small.text.map((t: { text: string }) => t.text), ["ds 0", "ds 1", "old 0", "copy 0"]);
+    assert.deepEqual(small.byPage, { "Design system": { returned: 2, total: 600 }, Archive: { returned: 1, total: 3 }, Product: { returned: 1, total: 5 } });
+  });
+
+  it("reads one page by name, or every page but the ones exclude_pages names", async () => {
+    const one = await call("figma_get_text", { file: paged, page: "Product" });
+    assert.deepEqual([one.returned, one.total, one.truncated, one.byPage, one.excludedPages], [5, 5, false, undefined, undefined]);
+    const rest = await call("figma_get_text", { file: paged, exclude_pages: ["Design system"] });
+    assert.deepEqual([rest.returned, rest.total, rest.truncated, rest.excludedPages, rest.excludedPagesFrom], [8, 8, false, ["Design system"], undefined]);
+    assert.deepEqual(Object.keys(rest.byPage), ["Archive", "Product"]);
+    const scoped = await call("figma_get_text", { file: paged, node_id: "3:1", page: "Product" });
+    assert.deepEqual([scoped.total, scoped.byPage], [5, undefined]);
+  });
+
+  it("reads the document's own id as the whole file, page filters, shared limit and byPage included", async () => {
+    // It is on no page, so page and exclude_pages were dropped without a word and every page was read in one piece.
+    for (const args of [{}, { exclude_pages: ["Design system"] }, { page: "Product" }, { limit: 4 }]) {
+      const whole = await call("figma_get_text", { file: paged, ...args });
+      for (const root of ["0:0", "0-0"]) assert.deepEqual(await call("figma_get_text", { file: paged, node_id: root, ...args }), whole, `${root} ${JSON.stringify(args)}`);
+    }
+    const rest = await call("figma_get_text", { file: paged, node_id: "0:0", exclude_pages: ["Design system"] });
+    assert.deepEqual([rest.total, rest.excludedPages, Object.keys(rest.byPage)], [8, ["Design system"], ["Archive", "Product"]]);
+  });
+
+  it("refuses a page the file does not have, and a node off the page asked for or on one left out", async () => {
+    await assert.rejects(call("figma_get_text", { file: paged, page: "Nope" }), /no page named "Nope"; pages: "Design system", "Archive", "Product", "Empty"/);
+    await assert.rejects(call("figma_get_text", { file: paged, exclude_pages: ["Nope"] }), /no page named "Nope" to exclude/);
+    await assert.rejects(call("figma_get_text", { file: paged, page: "Product", exclude_pages: ["Product"] }), /both asked for and in exclude_pages/);
+    await assert.rejects(call("figma_get_text", { file: paged, node_id: "3:1", page: "Archive" }), /node 3:1 is on page "Product", not on "Archive"/);
+    await assert.rejects(call("figma_get_text", { file: paged, node_id: "3:1", exclude_pages: ["Product"] }), /node 3:1 is on page "Product", which exclude_pages leaves out/);
   });
 });
 
@@ -466,6 +551,24 @@ describe("figma_locate", () => {
     assert.match(r.results[0].error, /not a node id: .*only the instance, 1:1, is a node of the file/);
     for (const e of r.results.slice(1, 4)) assert.match(e.error, /^not a node id: node ids look like 12:34 \(or 12-34\)$/, e.id);
     assert.equal(r.results[4].found, false);
+  });
+
+  it("gives the ids of a path's names where a name holds the separator, as figma_get_node does", async () => {
+    // "Page / Button / Primary / Label" reads as a layer Button holding a layer Primary.
+    const slashed = figFile("locate-slashed", [
+      page,
+      { id: "1:1", type: "FRAME", parent: "0:1", name: "Button / Primary" },
+      { id: "1:2", type: "TEXT", parent: "1:1", name: "Label", textData: { characters: "Buy" } },
+      { id: "1:3", type: "FRAME", parent: "0:1", name: "Card" },
+    ]);
+    const r = await call("figma_locate", { file: slashed, node_ids: ["1:2", "1:3"] });
+    assert.deepEqual(r.results, [
+      { id: "1:2", found: true, type: "TEXT", name: "Label", page: "Page", path: "Page / Button / Primary / Label", pathIds: ["0:1", "1:1", "1:2"] },
+      { id: "1:3", found: true, type: "FRAME", name: "Card", page: "Page", path: "Page / Card" },
+    ]);
+    const node = await call("figma_get_node", { file: slashed, node_id: "1:2", depth: 0 });
+    assert.deepEqual([node.path, node.pathIds], ["Page / Button / Primary / Label", ["0:1", "1:1", "1:2"]]);
+    assert.ok(!("pathIds" in (await call("figma_get_node", { file: slashed, node_id: "1:3", depth: 0 }))));
   });
 
   it("needs at least one id", () => {

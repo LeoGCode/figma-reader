@@ -228,13 +228,30 @@ export class FigDocument {
     return undefined;
   }
 
+  /** The names from the node's page down to the node, joined with " / ". */
   path(n: FigNode): string {
-    const parts: string[] = [];
+    return this.pathFields(n).path;
+  }
+
+  /**
+   * path(n), and with it pathIds, the id of each layer it names, page first, when the path cannot be split back into
+   * those names. A name may hold " / " itself (component naming, "Button / Primary"): 256 names in a real 67 MB export,
+   * which split the paths of 706 nodes (those layers and what they hold) into layers that are not there, and a reader
+   * splitting "Checkout / Button / Primary" takes a layer named Button for a parent. Only then: an id per layer on
+   * every result made dev-status, changes and locate answers 20-53% larger on that export, for paths of which 99.6%
+   * split right. A name ending " /" misleads without adding a part ("a /" then "b" splits as "a", "/ b"), so the test
+   * is the split itself.
+   */
+  pathFields(n: FigNode): { path: string; pathIds?: string[] } {
+    const chain: FigNode[] = [];
     for (const cur of this.ancestry(n)) {
       if (cur.type === "DOCUMENT") break;
-      parts.unshift(cur.name);
+      chain.unshift(cur);
     }
-    return parts.join(" / ");
+    const path = chain.map((c) => c.name).join(" / ");
+    const parts = path.split(" / ");
+    if (parts.length === chain.length && parts.every((p, i) => p === chain[i].name)) return { path };
+    return { path, pathIds: chain.map((c) => c.id) };
   }
 
   *walk(start: FigNode): Generator<FigNode> {

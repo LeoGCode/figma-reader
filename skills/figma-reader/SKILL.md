@@ -17,7 +17,7 @@ Read-only CLI: `figma-reader <command> <file> [flags]`. `<file>` is a local `.fi
 | Pages and their top-level frames | `get-tree <file>`, then `get-tree <file> --node-id <id>` to open one |
 | A frame or layer, by name | `search <file> "<name>"` (`--types FRAME`, `--page <p>`, `--exclude-page <p>`, `--regex 'a\|b'`) |
 | Where some copy appears | `search <file> "<words>" --include-text --types TEXT` |
-| All copy of a frame | `get-text <file> --node-id <id>` |
+| All copy of a frame | `get-text <file> --node-id <id> --fields id,text` |
 | Exact specs (size, fills, layout, type) | `get-node <file> --node-id <id> --depth 1` |
 | Whether cited ids exist, and where | `locate <file> --node-ids 1:2,3:4` |
 | Which frames are Ready for dev | `dev-status <file>` (`--page <p>`) |
@@ -36,7 +36,7 @@ JSON on stdout unless marked text; exit 0 ok, 1 failed (message on stderr), 2 ba
 - `get-tree` (**text**: `grep`, not `jq`): line 1 `# {D}`, then `- <id> <TYPE> "<name>" <w>x<h> (<hints>)`, two spaces per level. Hints: `hidden`, `of "<component>"`, a text preview, `ready for dev`, `<n> children` (not opened), `<n> vectors`. A cut branch ends `- ... N more children`; a last line `level N not shown` names the `--max-nodes` that shows it.
 - `get-node`: one flat object, no wrapper: `{D, page, path, id, name, type, width, height, fills, layout, component, devStatus?, children[] or childCount}`. On TEXT, `characters` is the string and `text` the **style**.
 - `search`: `{D, total, truncated, excludedPages?, results[{id, type, name, page, characters?}]}`; a TEXT hit's string is `characters`, `name` the layer name.
-- `get-text`: `{D, total, truncated, unresolvedInstances, text[{id, text, frame?}]}`: `jq -r '.text[] | "\(.id) \(.text)"'`.
+- `get-text`: `{D, total, truncated, byPage?, unresolvedInstances, text[{id, text, frame?}]}`; `--fields id,text` keeps just those. A whole file's `byPage` has each page's `returned`/`total`: `--page` for one cut short.
 - `locate`: `{D, found, missing, invalid, results[{id, found, type?, name?, page?, path?}]}`.
 - `dev-status`: `{D, total, neverMarked?, nodes[{id, name, page, status, raw, previous, changedAt}]}`; `neverMarked`: records left out, which `--status any` lists.
 - `diff`: `{old{D}, new{D}, counts, byPage, layers{added, removed, renamed, moved}, removedNodes[{id, page, path, removedCount}], truncated}`; `changes`: `{D, total, byPage, layers[{id, name, page, lastEditedAt, created, editedNodes}]}`.

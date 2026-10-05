@@ -295,6 +295,10 @@ describe("figma_search page exclusion", () => {
       assert.ok(whole.total > 0, JSON.stringify(args));
     }
     assert.deepEqual((await call("figma_search", { file: archived, query: "request", node_id: "0:0" })).excludedPages, ["Archive"]);
+    // And the arguments say so: a node_id sets the project's default aside only when it is not the document.
+    const describe_ = (tool: string, arg: string) => (byName.get(tool)!.shape[arg] as z.ZodType).description ?? "";
+    assert.match(describe_("figma_search", "exclude_pages"), /unless page or a node_id other than the document's own \(0:0\) is given/);
+    for (const tool of ["figma_search", "figma_get_text"]) assert.match(describe_(tool, "node_id"), /the document's own id \(0:0\) is the whole file/, tool);
   });
 
   it("replaces the project's list with the call's, and an empty one searches everything", async () => {

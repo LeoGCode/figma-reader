@@ -774,8 +774,8 @@ tool(
     page: z.string().optional().describe("Restrict to page name"),
     exclude_pages: z.array(z.string()).optional().describe(
       "Pages to skip, by name as page takes it. They are left out while walking, so their hits neither fill the limit nor " +
-        "count in total. Default: excludePages in the project's .figma-reader.json, unless page or node_id is given; an " +
-        "empty list searches every page",
+        "count in total. Default: excludePages in the project's .figma-reader.json, unless page or a node_id other than " +
+        "the document's own (0:0) is given; an empty list searches every page",
     ),
     include_hidden: z.boolean().optional().describe("Include text on layers hidden in the design (default false)"),
     limit: z.number().int().positive().optional().describe("Default 50"),
@@ -1092,13 +1092,13 @@ tool(
     "The result always reports total/truncated/unresolvedInstances: a non-zero unresolvedInstances means text is missing, " +
     "at that many places; unresolved lists each missing component once, with its count and some of those places, the most " +
     "common first, and unresolvedComponentsOmitted counts the components past that listing. " +
-    "Without node_id or page it reads every page but exclude_pages (never the project's excludePages) and shares " +
-    "limit between them, so one cannot crowd out the rest; byPage gives each page's returned and total: pass page " +
-    "for one cut short. " +
+    "Without page, or a node_id other than the document's own (0:0), it reads every page but exclude_pages (never the " +
+    "project's excludePages) and shares limit between them, so one cannot crowd out the rest; byPage gives each page's " +
+    "returned and total: pass page for one cut short. " +
     EXPORTED_AT_NOTE,
   {
     file: fileArg,
-    node_id: z.string().optional(),
+    node_id: z.string().optional().describe("Only the text under this node, like 12:34 (or 12-34); the document's own id (0:0) is the whole file"),
     page: z.string().optional().describe("Only text on this page, by name"),
     exclude_pages: z.array(z.string()).optional().describe("Pages to leave out, by name (default none)"),
     fields: z.array(z.enum(TEXT_FIELDS)).min(1).optional().describe(`Keys to keep in each item, of ${TEXT_FIELDS.join(", ")} (default all)`),

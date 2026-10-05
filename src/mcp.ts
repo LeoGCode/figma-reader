@@ -3,10 +3,39 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { release, tools } from "./tools.ts";
+import { datingRule, fileRule, release, servingMcp, type ToolResult, tools } from "./tools.ts";
 import { version } from "./version.ts";
 
-const server = new McpServer({ name: "figma-reader", version });
+// The account was resolved when tools.ts loaded, for the life of this server, and no tool takes --account: a call
+// refused for want of one has to tell the client to fix the server's env or directory instead.
+servingMcp();
+
+// The rules every tool's file and refresh, and every dated tool's description, point to: said once for the session
+// rather than in each of them.
+const server = new McpServer(
+  { name: "figma-reader", version },
+  { instructions: `How file and refresh work: ${fileRule()}\n\nHow results are dated: ${datingRule()}` },
+);
+
+/**
+ * A result's JSON without the indentation the CLI prints it with. A CLI agent pipes its output through jq, grep or a
+ * script (89% of the CLI calls seen), which re-indents or drops it anyway; an MCP client hands the text to the model
+ * as it is, and on a real export the indentation was 17-41% of the bytes of search, get-text, dev-status, diff and
+ * get-node answers. Only an answer that is JSON throughout: get-tree's outline, a stylesheet, and JSON followed by
+ * out_file's note are text, kept as written. Done here, after the tool, so that a call answers and refuses alike on
+ * both surfaces: get-node's 200 KB limit is still on the JSON as the CLI prints it.
+ */
+function compact(result: ToolResult): ToolResult {
+  const content = result.content.map((c) => {
+    if (c.type !== "text" || !/^\s*[[{]/.test(c.text)) return c;
+    try {
+      return { ...c, text: JSON.stringify(JSON.parse(c.text)) };
+    } catch {
+      return c;
+    }
+  });
+  return { ...result, content };
+}
 
 for (const t of tools) {
   // readOnlyHint is what a client checks before running a tool without asking the user, and it was published as true
@@ -21,7 +50,7 @@ for (const t of tools) {
   const inputSchema = z.object(t.shape).strict();
   server.registerTool(t.name, { description: t.description, inputSchema, annotations }, (async (args: any) => {
     try {
-      return await t.run(args);
+      return compact(await t.run(args));
     } catch (e) {
       return { isError: true, content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }] };
     }

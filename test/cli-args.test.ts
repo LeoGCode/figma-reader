@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { z } from "zod";
-import { commandName, commandUsage, parseArgs, positionals, UsageError, wantsHelp } from "../src/cli-args.ts";
+import { checkArgs, commandName, commandUsage, parseArgs, positionals, UsageError, wantsHelp } from "../src/cli-args.ts";
 
 const shape = {
   file: z.string(),
@@ -30,6 +30,45 @@ test("flags map to snake_case arguments with typed values", () => {
   assert.equal(parseArgs(shape, ["a", "q", "--no-refresh"]).refresh, false);
   for (const v of ["false", "no", "0", "off", "FALSE"]) assert.equal(parseArgs(shape, ["a", "q", `--refresh=${v}`]).refresh, false, v);
   for (const v of ["true", "yes", "1", "on", "True"]) assert.equal(parseArgs(shape, ["a", "q", `--refresh=${v}`]).refresh, true, v);
+});
+
+test("a list flag also answers to its singular, the way a repeated flag reads", () => {
+  // search --exclude-page Archive --exclude-page Old fills exclude_pages, as --type does types here.
+  assert.deepEqual(parseArgs(shape, ["a", "q", "--type", "FRAME", "--types", "TEXT", "--type=INSTANCE,GROUP"]).types, ["FRAME", "TEXT", "INSTANCE", "GROUP"]);
+  // It takes a value like the list it stands for, so "--help" after it is that value.
+  assert.equal(wantsHelp(shape, ["a.fig", "q", "--type", "--help"]), false);
+  // Never in place of an argument that has the singular name itself, and only for a list.
+  const both = { ...shape, page: z.string().optional(), pages: z.array(z.string()).optional() };
+  assert.deepEqual(parseArgs(both, ["a", "q", "--page", "P"]), { file: "a", query: "q", page: "P" });
+  assert.throws(() => parseArgs({ ...shape, names: z.string().optional() }, ["a", "q", "--name", "x"]), /unknown option --name/);
+});
+
+test("--no-<list> gives a list as empty, the one way to write [] without --json", () => {
+  // search's exclude_pages: [] turns the project's excludePages off, which took --json '{"exclude_pages":[]}' since an
+  // empty --exclude-page= is bad usage like every list. It answers to the singular too, as the list does.
+  for (const argv of [["--no-types"], ["--no-type"], ["--json", '{"types":[]}', "--no-types"], ["--no-types", "--json", '{"types":[]}']]) {
+    assert.deepEqual(parseArgs(shape, ["a", "q", ...argv]).types, [], argv.join(" "));
+  }
+  assert.equal(parseArgs(shape, ["a", "q", "--no-refresh"]).refresh, false, "a switch is still turned off");
+  // It takes no value, so "--help" after it is a request for usage.
+  assert.equal(wantsHelp(shape, ["a.fig", "q", "--no-type", "--help"]), true);
+  const bad = (argv: string[], re: RegExp) => assert.throws(() => parseArgs(shape, ["a", "q", ...argv]), (e) => e instanceof UsageError && re.test(e.message), argv.join(" "));
+  bad(["--no-types=FRAME"], /--no-types takes no value/);
+  // Empty and given values at once contradict each other, in whichever order: lists add up rather than replace.
+  bad(["--no-types", "--types", "FRAME"], /--no-types gives types as an empty list, but it was also given \["FRAME"\]/);
+  bad(["--type", "FRAME", "--no-type"], /--no-type gives types as an empty list, but it was also given \["FRAME"\]/);
+  bad(["--json", '{"types":["TEXT"]}', "--no-types"], /--no-types gives types as an empty list, but it was also given \["TEXT"\]/);
+  // Anything --json gives that is not a list is refused too, on either side: null was taken for unset before it.
+  for (const v of ["null", '"TEXT"', "5", "false", "{}"]) {
+    const given = new RegExp(`--no-types gives types as an empty list, but it was also given ${v.replace(/[{}]/g, "\\$&")}$`);
+    bad(["--json", `{"types":${v}}`, "--no-types"], given);
+    bad(["--no-types", "--json", `{"types":${v}}`], given);
+  }
+  // An empty value is still bad usage, and says what gives an empty list on purpose.
+  bad(["--types="], /^--types needs at least one value; --no-types gives an empty list$/);
+  // Only switches and lists have a --no- form.
+  bad(["--no-depth"], /unknown option --no-depth/);
+  bad(["--no-node-id"], /unknown option --no-node-id/);
 });
 
 test("--json merges raw arguments and positionals fill only what is unset", () => {
@@ -92,4 +131,54 @@ test("usage lists --json under Options, aligned, also for a command without opti
     return l.length - l.replace(/^ {2}\S+(?: <[^>]+>)? +/, "").length;
   };
   assert.deepEqual(["--depth", "--refresh", "--json"].map(column), [20, 20, 20]);
+});
+
+test("a required list is a flag the command cannot run without, and says so", () => {
+  // locate is the first tool to require something that is not a string, which positionals() never takes: it was
+  // listed under [options] like any other flag, and leaving it out failed with zod's "expected array, received
+  // undefined".
+  const locate = { file: z.string(), node_ids: z.array(z.string()).min(1), refresh: z.boolean().optional() };
+  assert.deepEqual(positionals(locate), ["file"]);
+  assert.deepEqual(parseArgs(locate, ["a.fig", "--node-ids", "1:2,3-4"]), { file: "a.fig", node_ids: ["1:2", "3-4"] });
+  assert.deepEqual(parseArgs(locate, ["a.fig", "--json", '{"node_ids":["1:2"]}']).node_ids, ["1:2"]);
+  assert.throws(() => parseArgs(locate, ["a.fig"]), (e) => e instanceof UsageError && e.message === "missing --node-ids");
+  assert.throws(() => parseArgs(locate, []), (e) => e instanceof UsageError && e.message === "missing <file> --node-ids");
+  const usage = commandUsage("fr", { name: "figma_locate", description: "Locate.", shape: locate });
+  assert.equal(usage.split("\n")[0], "Usage: fr locate <file> --node-ids <string,...> [options]");
+  // An empty list is no answer to a required one, so its help offers no --no- form; an optional list's does.
+  assert.doesNotMatch(usage, /--no-node-ids/);
+  assert.match(commandUsage("fr", { name: "figma_search", description: "Search.", shape }), /^ {2}--no-types +Give types as an empty list$/m);
+});
+
+test("--no-<list> empties only a list that may be empty, and help offers it only there", () => {
+  // get-text's fields cannot be empty ([] keeps no key): its help offered --no-fields, which the schema then refused in
+  // zod's words, and an empty --fields= pointed to it. exclude_pages beside it can be emptied, as search's can.
+  const text = { file: z.string(), fields: z.array(z.string()).min(1).optional(), exclude_pages: z.array(z.string()).optional() };
+  assert.deepEqual(parseArgs(text, ["a.fig", "--no-exclude-page", "--fields", "id,text"]), { file: "a.fig", exclude_pages: [], fields: ["id", "text"] });
+  assert.throws(() => parseArgs(text, ["a.fig", "--no-fields"]), (e) => e instanceof UsageError && e.message === "--no-fields: fields cannot be empty; leave --fields out for the default");
+  // A required list has no default to leave it to: locate without --node-ids is missing it, so the way out is a value.
+  const locate = { file: z.string(), node_ids: z.array(z.string()).min(1) };
+  for (const flag of ["--no-node-ids", "--no-node-id"]) {
+    assert.throws(() => parseArgs(locate, ["a.fig", flag]), (e) => e instanceof UsageError && e.message === `${flag}: node_ids cannot be empty; give --node-ids at least one value`);
+  }
+  assert.throws(() => parseArgs(locate, ["a.fig"]), (e) => e instanceof UsageError && e.message === "missing --node-ids");
+  assert.throws(() => parseArgs(text, ["a.fig", "--fields="]), (e) => e instanceof UsageError && e.message === "--fields needs at least one value");
+  assert.throws(() => parseArgs(text, ["a.fig", "--exclude-page="]), /--exclude-page needs at least one value; --no-exclude-page gives an empty list/);
+  const usage = commandUsage("fr", { name: "figma_get_text", description: "Text.", shape: text });
+  assert.match(usage, /--no-exclude-pages/);
+  assert.doesNotMatch(usage, /--no-fields/);
+});
+
+test("a required list answers to its singular as a flag, and only to its own name in --json and a batch line", () => {
+  // The singular is the CLI's way of writing a repeated flag (--node-id 1:2 --node-id 3:4, as --exclude-page reads),
+  // so it counts as the required list it stands for. --json and a batch line take MCP argument names, where node_id
+  // is no argument of locate's: that is the error to name, not that --node-ids is missing.
+  const locate = { file: z.string(), node_ids: z.array(z.string()).min(1), refresh: z.boolean().optional() };
+  assert.deepEqual(parseArgs(locate, ["a.fig", "--node-id", "1:2", "--node-id=3-4"]), { file: "a.fig", node_ids: ["1:2", "3-4"] });
+  assert.equal(wantsHelp(locate, ["a.fig", "--node-id", "--help"]), false, "--help is the value it takes");
+  assert.throws(() => parseArgs(locate, ["a.fig", "--node-id="]), /--node-id needs at least one value/);
+  assert.throws(() => parseArgs(locate, ["a.fig", "--json", '{"node_id":["1:2"]}']), (e) => e instanceof UsageError && /Unrecognized key: "node_id"/.test(e.message));
+  assert.throws(() => checkArgs(locate, { file: "a.fig", node_id: ["1:2"] }), (e) => e instanceof UsageError && /Unrecognized key: "node_id"/.test(e.message));
+  // A missing positional is still said first, whatever --json carried.
+  assert.throws(() => parseArgs(locate, ["--json", '{"node_id":["1:2"]}']), (e) => e instanceof UsageError && e.message === "missing <file> --node-ids");
 });

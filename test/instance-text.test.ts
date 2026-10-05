@@ -89,6 +89,33 @@ describe("scanText in collapsed instances", () => {
     assert.equal(variable.items[0].text, "Request quote");
   });
 
+  it("reads the document-wide property index once per document, however many scans of its pages read it", () => {
+    // figma_get_text and figma_search scan a page at a time. The index of which property def a variant's def stands
+    // for was a scanner's own, so each page's scan walked every node of the file again: 300 pages of 180,605 nodes
+    // made 54 million visits and 0.7-0.8 s, against 50-100 ms for one scan.
+    const pages = ["1", "2", "3", "4", "5"];
+    const nodes = [...button, ...pages.flatMap((p): TestNode[] => [
+      { id: `${p}0:1`, type: "CANVAS", parent: "0:0", name: `Page ${p}` },
+      instance(`${p}0:2`, `${p}0:1`, "2:1", { componentPropAssignments: [{ defID: guid("3:2"), value: { textValue: { characters: `Label ${p}` } } }] }),
+    ])];
+    const passes = (doc: ReturnType<typeof figDoc>) => {
+      const values = doc.nodes.values.bind(doc.nodes);
+      const count = { passes: 0 };
+      doc.nodes.values = () => (count.passes++, values());
+      return count;
+    };
+    const once = figDoc(nodes);
+    const onePass = passes(once);
+    const all = scanText(once, once.pages()).items;
+    const perPage = figDoc(nodes);
+    const pagePasses = passes(perPage);
+    const each = perPage.pages().flatMap((p) => scanText(perPage, [p]).items);
+    assert.deepEqual(each, all);
+    assert.deepEqual(all.filter((t) => t.name === "Label").map((t) => t.text), pages.map((p) => `Label ${p}`), "each page's instance read its own value");
+    assert.equal(onePass.passes, 1);
+    assert.equal(pagePasses.passes, onePass.passes, "a scan per page walked the whole document again");
+  });
+
   it("lets a text override beat the property's default", () => {
     const { items } = texts([page, ...button, instance("1:1", "0:1", "2:1", {
       symbolData: { symbolOverrides: [override(["2:2"], { textData: { characters: "Overridden" } })] },

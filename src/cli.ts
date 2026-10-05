@@ -2,12 +2,14 @@
 // figma-reader: the same read-only Figma tools as the MCP server, as shell commands.
 // Text and JSON go to stdout, errors to stderr; images are written to files and their paths printed.
 import { writeSync } from "node:fs";
+import { createInterface } from "node:readline";
 import {
   accountProfileDir, checkAccountName, CONFIG_FILE, DEFAULT_ACCOUNT, expandHome, listAccounts, readAccountInfo,
   resolveAccount, writeProjectAccount,
 } from "./account.ts";
+import { BATCH_SUMMARY, batchUsage, runBatch } from "./batch.ts";
 import { defaultExecutable, profileHasLoginCookie } from "./browser.ts";
-import { commandName, commandUsage, parseArgs, UsageError, wantsHelp } from "./cli-args.ts";
+import { commandName, commandUsage, parseArgs, UsageError, wantsHelp, wrap } from "./cli-args.ts";
 import { writePrivateTemp } from "./local-files.ts";
 import { version } from "./version.ts";
 
@@ -131,10 +133,12 @@ try {
 }
 if (handled) await quit(0);
 
-// Loading the tools resolves the account and registers this process with the shared browser state, so from here on
-// always release before exiting.
-const { account, release, tools } = await import("./tools.ts").catch((e) => fatal((e as Error).message, 1));
+// Loading the tools resolves the account. A command that reaches the browser registers this process with the shared
+// browser state when it does (a local read or help never does), so from here on always release before exiting.
+const { account, AccountNotChosen, datingRule, fileRule, release, tools } = await import("./tools.ts").catch((e) => fatal((e as Error).message, 1));
 const byCommand = new Map(tools.map((t) => [commandName(t.name), t]));
+/** An argument as a command line writes it: <file> in place, every other one a flag. */
+const spell = (a: string) => (a === "file" ? "<file>" : `--${a.replaceAll("_", "-")}`);
 
 function overview() {
   const width = Math.max(...[...byCommand.keys()].map((c) => c.length)) + 2;
@@ -150,9 +154,17 @@ function overview() {
     "Accounts:",
     ...[...ACCOUNT_COMMANDS.values()].map((c) => `  ${c.usage.padEnd(width)}${c.description}`),
     "",
+    "Many calls in one process:",
+    `  ${"batch".padEnd(width)}${BATCH_SUMMARY}`,
+    "",
     `Every command takes --account <name> to override the account; this directory uses "${account.name}".`,
-    "<file> is a local .fig path, a Figma file key, or a figma.com/design/... URL (its node-id is used when --node-id is omitted).",
     "Output is JSON or text on stdout. Images are written to --save-path, or to a temp file, and the path is printed.",
+    "",
+    // Said here once, as the MCP server says them in its instructions: each command's <file> and --refresh, and each
+    // dated command's help, only point to them.
+    `Files: ${wrap(fileRule(commandName, spell), 110, "")}`,
+    "",
+    `Dates: ${wrap(datingRule(commandName, spell), 110, "")}`,
   ].join("\n");
 }
 
@@ -165,12 +177,43 @@ process.on("SIGTERM", () => void exit(143));
 
 if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
   const t = argv[0] ? byCommand.get(argv[0]) : undefined;
-  if (argv[0] && !t && !ACCOUNT_COMMANDS.has(argv[0])) {
+  if (argv[0] && !t && !ACCOUNT_COMMANDS.has(argv[0]) && argv[0] !== "batch") {
     console.error(`${BIN}: unknown command ${JSON.stringify(argv[0])}\n\n${overview()}`);
     await exit(2);
   }
-  console.log(t ? commandUsage(BIN, t) : argv[0] ? accountUsage(argv[0]) : overview());
+  console.log(t ? commandUsage(BIN, t) : argv[0] === "batch" ? batchUsage(BIN, tools) : argv[0] ? accountUsage(argv[0]) : overview());
   await exit(0);
+}
+
+if (cmd === "batch") {
+  if (wantsHelp({}, argv)) {
+    console.log(batchUsage(BIN, tools));
+    await exit(0);
+  }
+  if (argv.length) {
+    console.error(`${BIN} batch: unexpected argument ${JSON.stringify(argv[0])}; the calls are read from stdin.\nRun '${BIN} help batch' for usage.`);
+    await exit(2);
+  }
+  // Each answer waits until it has been handed to the OS, which is the backpressure a slow reader needs, and an error
+  // there (EPIPE, the reader is gone) is what stops the batch.
+  const write = (line: string) => new Promise<boolean>((done) => process.stdout.write(`${line}\n`, (e) => done(!e)));
+  try {
+    const { answered, failed, refused } = await runBatch(createInterface({ input: process.stdin, crlfDelay: Infinity }), tools, write);
+    const which = (is: number[]) => (is.length > 20 ? `${is.slice(0, 20).join(", ")}, ...` : is.join(", "));
+    if (failed.length) {
+      console.error(
+        `${BIN} batch: ${failed.length} of ${answered} calls failed (i = ${which(failed)})` +
+          (refused.length ? `, ${refused.length} of them refused because no Figma account was chosen (i = ${which(refused)})` : ""),
+      );
+    }
+    // A refused line is what a refused single call is, so it exits as one: 2, since nothing was tried and a retry is
+    // refused the same way, where 1 says that something failed and might not next time.
+    await exit(refused.length ? 2 : failed.length ? 1 : 0);
+  } catch (e) {
+    // Only reading stdin can throw here, every call's own failure being its line's answer; the browser is released.
+    console.error(`${BIN} batch: ${e instanceof Error ? e.message : String(e)}`);
+    await exit(1);
+  }
 }
 
 const tool = byCommand.get(cmd);
@@ -205,5 +248,8 @@ try {
   await exit(result.isError ? 1 : 0);
 } catch (e) {
   console.error(`${BIN} ${cmd}: ${e instanceof Error ? e.message : String(e)}`);
-  await exit(1);
+  // A call refused for want of an account is bad usage, not a failure: nothing was tried, and the same command fails
+  // the same way every time until --account or the working directory changes, which is what 2 tells a script or an
+  // agent apart from a figma.com call that failed and may succeed on a retry. A bad --account name is 2 as well.
+  await exit(e instanceof AccountNotChosen ? 2 : 1);
 }

@@ -246,11 +246,18 @@ interface Origin {
   frame?: string;
 }
 
+/**
+ * Which set-level property def each variant's local def stands for, read off every node of the document, so kept per
+ * document and not per scanner: figma_get_text and figma_search scan a page at a time, and a scanner per page made the
+ * pass once per page. On a 300-page file of 180,605 nodes that was 54 million node visits and 0.7-0.8 s, against
+ * 50-100 ms for one scan of every page.
+ */
+const defParentsByDoc = new WeakMap<FigDocument, Map<string, string>>();
+
 class TextScanner {
   readonly items: TextHit[] = [];
   readonly unresolved: Unresolved[] = [];
   private seen = new Set<string>();
-  private defParents?: Map<string, string>;
 
   private doc: FigDocument;
   private includeHidden: boolean;
@@ -455,13 +462,14 @@ class TextScanner {
 
   /** A variant's local property def id -> the set-level def it stands for (itself when it has none). */
   private canonical(id: string | undefined): string {
-    if (!this.defParents) {
-      this.defParents = new Map();
+    let parents = defParentsByDoc.get(this.doc);
+    if (!parents) {
+      defParentsByDoc.set(this.doc, (parents = new Map()));
       for (const n of this.doc.nodes.values()) {
-        for (const d of n.componentPropDefs ?? []) if (d.parentPropDefId) this.defParents.set(guidId(d.id)!, guidId(d.parentPropDefId)!);
+        for (const d of n.componentPropDefs ?? []) if (d.parentPropDefId) parents.set(guidId(d.id)!, guidId(d.parentPropDefId)!);
       }
     }
-    return (id && this.defParents.get(id)) ?? id ?? "";
+    return (id && parents.get(id)) ?? id ?? "";
   }
 
   private push(hit: TextHit) {

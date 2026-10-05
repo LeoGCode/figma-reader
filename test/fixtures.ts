@@ -84,7 +84,7 @@ export const variable = (
 // Just enough of Figma's schema to round-trip the fields the .fig fixtures use. It carries guid, parentIndex, type,
 // name and key only, so anything encoded through figBytes and decoded back holds no text, sizes, instances, variables
 // or styles, whatever the TestNodes said: a test that needs those either builds its document with figDoc (no
-// encoding) or writes a .fig with a schema of its own, as test/tools.test.ts does.
+// encoding), passes figBytes a schema of its own, or writes a .fig with one, as test/tools.test.ts does.
 const SCHEMA = parseSchema(`
   struct GUID { uint sessionID; uint localID; }
   message ParentIndex { GUID guid = 1; string position = 2; }
@@ -93,8 +93,13 @@ const SCHEMA = parseSchema(`
 `);
 const codec = compileSchema(SCHEMA) as { encodeMessage(m: unknown): Uint8Array };
 
-/** A real .fig archive: "fig-kiwi" canvas (deflated schema + message chunks), meta.json and images/. */
-export function figBytes(nodes: TestNode[], opts: { meta?: object; images?: Record<string, Uint8Array> } = {}): Uint8Array {
+/**
+ * A real .fig archive: "fig-kiwi" canvas (deflated schema + message chunks), meta.json and images/. `schema`, kiwi
+ * source with a NodeChange and a Message like the one above, encodes the fields that one leaves out.
+ */
+export function figBytes(nodes: TestNode[], opts: { meta?: object; images?: Record<string, Uint8Array>; schema?: string } = {}): Uint8Array {
+  const schema = opts.schema ? parseSchema(opts.schema) : SCHEMA;
+  const encoder = opts.schema ? (compileSchema(schema) as typeof codec) : codec;
   const chunk = (b: Uint8Array) => {
     const z = deflateSync(b);
     const out = new Uint8Array(4 + z.length);
@@ -105,8 +110,8 @@ export function figBytes(nodes: TestNode[], opts: { meta?: object; images?: Reco
   const header = new Uint8Array(12);
   header.set(new TextEncoder().encode("fig-kiwi"));
   new DataView(header.buffer).setUint32(8, 15, true);
-  const message = codec.encodeMessage({ nodeChanges: nodeChanges(nodes) });
-  const canvas = new Uint8Array([...header, ...chunk(encodeBinarySchema(SCHEMA)), ...chunk(message)]);
+  const message = encoder.encodeMessage({ nodeChanges: nodeChanges(nodes) });
+  const canvas = new Uint8Array([...header, ...chunk(encodeBinarySchema(schema)), ...chunk(message)]);
   const files: Record<string, Uint8Array> = { "canvas.fig": canvas, "meta.json": new TextEncoder().encode(JSON.stringify(opts.meta ?? {})) };
   for (const [hash, bytes] of Object.entries(opts.images ?? {})) files[`images/${hash}`] = bytes;
   return zipSync(files);

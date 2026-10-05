@@ -1,7 +1,7 @@
 // Turning raw kiwi values into the JSON the tools return.
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Normalizer, propValue, propValueOf } from "../src/normalize.ts";
+import { devStatus, labelMarkdown, Normalizer, propValue, propValueOf } from "../src/normalize.ts";
 import { figDoc, guid, internalPage, variable, variableSet } from "./fixtures.ts";
 
 describe("propValue", () => {
@@ -340,5 +340,195 @@ describe("Normalizer.boundVariables", () => {
       corner_radius: "radius/sm",
       opacity: "opacity/muted",
     });
+  });
+});
+
+describe("Dev Mode status, annotations and measurements", () => {
+  // 2026-10-01T10:00:00Z, stored in seconds as lastUpdateUnixTimestamp is.
+  const at = 1790848800;
+  const status = (info: Record<string, unknown>) => devStatus({ id: "1:1", type: "FRAME", name: "F", childIds: [], sectionStatusInfo: info });
+
+  it("names each stored status, keeps the stored value beside it, and dates the change", () => {
+    // BUILD is read as Ready for dev without a re-export to confirm it, which is why raw is never dropped.
+    assert.deepEqual(status({ status: "BUILD", prevStatus: "NONE", lastUpdateUnixTimestamp: at, userId: "1234567" }), {
+      status: "ready_for_dev", raw: "BUILD", previous: "none", previousRaw: "NONE", changedAt: "2026-10-01T10:00:00.000Z", by: "1234567",
+    });
+    assert.deepEqual(status({ status: "COMPLETED", prevStatus: "BUILD", lastUpdateUnixTimestamp: at, description: "Shipped in 4.2" }), {
+      status: "completed", raw: "COMPLETED", previous: "ready_for_dev", previousRaw: "BUILD", changedAt: "2026-10-01T10:00:00.000Z", note: "Shipped in 4.2",
+    });
+  });
+
+  it("reports a mark that came off as none with what it was, and a value it has no name for as unknown", () => {
+    // Marked, then unmarked: what a handoff most needs to hear about. changedAt is when the mark came off.
+    assert.deepEqual(status({ status: "NONE", prevStatus: "BUILD", lastUpdateUnixTimestamp: at }), {
+      status: "none", raw: "NONE", previous: "ready_for_dev", previousRaw: "BUILD", changedAt: "2026-10-01T10:00:00.000Z",
+    });
+    // A status Figma adds later comes out of the file's own schema by name; it is passed on, not guessed at.
+    assert.deepEqual(status({ status: "IN_REVIEW", prevStatus: "BUILD" }), { status: "unknown", raw: "IN_REVIEW", previous: "ready_for_dev", previousRaw: "BUILD" });
+    // A record that leaves its fields out has nothing marked, and no time or user to report.
+    assert.deepEqual(status({}), { status: "none", raw: "NONE", previous: "none", previousRaw: "NONE" });
+    // A value spelled like something every object has is a value with no name all the same, not that inherited thing.
+    for (const raw of ["constructor", "toString", "__proto__"]) {
+      assert.deepEqual(status({ status: raw, prevStatus: raw }), { status: "unknown", raw, previous: "unknown", previousRaw: raw }, raw);
+    }
+  });
+
+  const doc = figDoc([
+    {
+      id: "0:0", type: "DOCUMENT", name: "Document",
+      annotationCategories: {
+        version: 3,
+        items: [
+          { id: guid("9:1"), preset: "DEVELOPMENT" },
+          { id: guid("9:2"), preset: "NONE", custom: { color: "TEAL", label: "Analytics" } },
+        ],
+      },
+    },
+    { id: "0:1", type: "CANVAS", parent: "0:0", name: "Page" },
+    {
+      id: "1:1", type: "FRAME", parent: "0:1", name: "Checkout",
+      sectionStatusInfo: { status: "BUILD", prevStatus: "NONE", lastUpdateUnixTimestamp: at },
+      annotations: [
+        {
+          // The HTML Figma stores: a paragraph per line, an empty one for a blank line, code spans, a link, an entity.
+          label: '<p>Use the <code style="font-family: mono;" spellcheck="false">aria-label</code> &amp; see <a rel="noopener" ' +
+            'href="https://example.com/spec?a=1&amp;b=2" target="_blank">the spec</a></p><p><br></p><p><strong style="x">Never</strong> truncate</p>',
+          categoryId: guid("9:1"),
+        },
+        // Properties only: an empty label is the common kind, and says which values Dev Mode shows beside the layer.
+        { label: "", properties: [{ type: "FILL" }, { type: "TEXT_STYLE" }], categoryId: guid("9:2") },
+        // labelV2 is the later field and wins when it is set; a category the document does not name keeps its id.
+        { label: "<p>old</p>", labelV2: "new", categoryId: guid("9:7") },
+        // Set and empty, it is still the label: falling back to label brought back an instruction someone cleared.
+        { label: "<p>Obsolete instruction</p>", labelV2: "" },
+        { label: "<p>Obsolete instruction</p>", labelV2: "<p><br></p>" },
+      ],
+    },
+    { id: "1:2", type: "FRAME", parent: "1:1", name: "Card" },
+    { id: "1:4", type: "FRAME", parent: "0:1", name: "Never marked", sectionStatusInfo: { status: "NONE", prevStatus: "NONE", lastUpdateUnixTimestamp: at } },
+    // None and none, but a person left them: no record Figma writes on its own names a user or carries a note.
+    { id: "1:5", type: "FRAME", parent: "0:1", name: "Touched", sectionStatusInfo: { status: "NONE", prevStatus: "NONE", userId: "1234567" } },
+    { id: "1:6", type: "FRAME", parent: "0:1", name: "Noted", sectionStatusInfo: { status: "NONE", prevStatus: "NONE", description: "Not this sprint" } },
+  ]);
+  const node = (id: string) => new Normalizer(doc).node(doc.require(id), 0);
+
+  it("puts the status on the node, unless the record never said anything but none", () => {
+    assert.equal(node("1:1").devStatus.status, "ready_for_dev");
+    // Figma writes none-and-was-none records on components nobody marked, by the thousand in a library: a dated
+    // "none" on every variant would read as a status. figma_dev_status with status none or any still lists them.
+    assert.equal(node("1:4").devStatus, undefined);
+    assert.equal(node("1:2").devStatus, undefined);
+    assert.deepEqual(node("1:5").devStatus, { status: "none", raw: "NONE", previous: "none", previousRaw: "NONE", by: "1234567" });
+    assert.deepEqual(node("1:6").devStatus, { status: "none", raw: "NONE", previous: "none", previousRaw: "NONE", note: "Not this sprint" });
+  });
+
+  it("reads annotation labels as markdown, with their category and pinned properties", () => {
+    assert.deepEqual(node("1:1").annotations, [
+      { label: "Use the `aria-label` & see [the spec](https://example.com/spec?a=1&b=2)\n\n**Never** truncate", category: "Development" },
+      { category: "Analytics", properties: ["FILL", "TEXT_STYLE"] },
+      { label: "new", categoryId: "9:7" },
+      {},
+      {},
+    ]);
+    assert.equal(node("1:2").annotations, undefined);
+  });
+
+  it("reports a measurement's two nodes and sides, the target as Figma stores it", () => {
+    const none = { sessionID: 0xffffffff, localID: 0xffffffff };
+    const measured = figDoc([
+      { id: "0:1", type: "CANVAS", parent: "0:0", name: "Page" },
+      {
+        id: "1:1", type: "FRAME", parent: "0:1", name: "Card",
+        measurements: [
+          // Real files leave fromNode out (the measurement is on it), put "no node" in toNode and the target in the
+          // stable path. To itself, across to the other side: a width.
+          { id: guid("5:1"), toNode: none, toNodeStablePath: { guids: [guid("1:1")] }, fromNodeSide: "LEFT", toSameSide: false },
+          // To the same side of an enclosing frame: a padding, with the free text the designer typed over it.
+          { id: guid("5:2"), toNode: none, toNodeStablePath: { guids: [guid("0:1")] }, fromNodeSide: "TOP", toSameSide: true, freeText: "space/md" },
+          // To a layer inside an instance: the instance, then that layer's override key.
+          { id: guid("5:3"), toNode: none, toNodeStablePath: { guids: [guid("1:3"), guid("77:5")] }, fromNodeSide: "BOTTOM" },
+          // A target since deleted is reported as such, not dropped; an explicit fromNode and toNode are read as given.
+          { id: guid("5:4"), fromNode: guid("1:3"), toNode: guid("8:8"), fromNodeSide: "RIGHT", toSameSide: true },
+        ],
+      },
+      { id: "1:3", type: "INSTANCE", parent: "1:1", name: "Button" },
+    ]);
+    assert.deepEqual(new Normalizer(measured).node(measured.require("1:1"), 0).measurements, [
+      { from: "1:1", fromSide: "LEFT", to: "1:1", toSide: "RIGHT" },
+      { from: "1:1", fromSide: "TOP", to: "0:1", toSide: "TOP", freeText: "space/md" },
+      { from: "1:1", fromSide: "BOTTOM", to: "1:3", toSide: "TOP", toPath: ["1:3", "77:5"] },
+      { from: "1:3", fromSide: "RIGHT", to: "8:8", toSide: "RIGHT", toMissing: true },
+    ]);
+    // A side this decoder has no opposite for has none, rather than whatever an object inherits under that name.
+    const odd = figDoc([
+      { id: "0:1", type: "CANVAS", parent: "0:0", name: "Page" },
+      { id: "1:1", type: "FRAME", parent: "0:1", name: "Card", measurements: [{ id: guid("5:1"), toNode: none, toNodeStablePath: { guids: [guid("1:1")] }, fromNodeSide: "constructor" }] },
+    ]);
+    assert.deepEqual(new Normalizer(odd).node(odd.require("1:1"), 0).measurements, [{ from: "1:1", fromSide: "constructor", to: "1:1" }]);
+  });
+});
+
+describe("labelMarkdown", () => {
+  const md = (html: string) => labelMarkdown(html).markdown;
+
+  it("writes a line per paragraph, one blank line for an empty one, and a line break for <br>", () => {
+    assert.equal(md("<p>one</p><p>two</p>"), "one\ntwo");
+    assert.equal(md("<p>one</p><p><br></p><p>two</p>"), "one\n\ntwo");
+    assert.equal(md("<p>one<br>two<br/>three</p>"), "one\ntwo\nthree");
+  });
+
+  it("turns bold, italic and code into their markdown", () => {
+    assert.equal(md('<strong style="x">a</strong> <b>b</b>'), "**a** **b**");
+    assert.equal(md("<em>a</em> <i>b</i>"), "*a* *b*");
+    assert.equal(md('<code style="font-family: mono;" spellcheck="false">aria-label</code>'), "`aria-label`");
+  });
+
+  it("reads what a code span holds as text: an escaped tag, backticks, and no markup", () => {
+    // The corpus check took this for leftover HTML: it is the literal text of an element's name.
+    assert.deepEqual(labelMarkdown("<p>Use <code>&lt;button&gt;</code></p>"), { markdown: "Use `<button>`", unconverted: [] });
+    assert.equal(md("<code>a`b</code>"), "``a`b``");
+    assert.equal(md("<code>`x</code>"), "`` `x ``");
+    assert.equal(md("<code><strong>x</strong> [y]</code>"), "`x [y]`");
+  });
+
+  it("keeps a link's address however the attribute is quoted, escaping what would end the link", () => {
+    for (const html of [
+      `<a href="https://example.com/spec">spec</a>`,
+      `<a href='https://example.com/spec'>spec</a>`,
+      `<a href=https://example.com/spec>spec</a>`,
+      // A ">" inside another attribute's quotes does not end the tag.
+      `<a title="a > b" target='_blank' href="https://example.com/spec">spec</a>`,
+    ]) {
+      assert.equal(md(`<p>See ${html}</p>`), "See [spec](https://example.com/spec)", html);
+    }
+    assert.equal(md('<a href="https://example.com/?a=1&amp;b=2">x</a>'), "[x](https://example.com/?a=1&b=2)");
+    assert.equal(md('<a href="https://example.com/Foo_(bar) baz">see [1]</a>'), "[see \\[1\\]](https://example.com/Foo_%28bar%29%20baz)");
+    assert.equal(md('<a href="https://example.com/"></a>'), "[https://example.com/](https://example.com/)");
+    assert.equal(md('<a href="https://example.com/"><code>[x]</code></a>'), "[`[x]`](https://example.com/)");
+    assert.equal(md('<a name="top">plain</a>'), "plain");
+  });
+
+  it("writes lists as bullets or numbers, nested by indentation", () => {
+    assert.equal(md("<ul><li>one</li><li>two</li></ul>"), "- one\n- two");
+    assert.equal(md("<ol><li>a</li><li>b</li></ol>"), "1. a\n2. b");
+    assert.equal(md("<ul><li><p>one</p></li><li><p>two</p></li></ul>"), "- one\n- two");
+    assert.equal(md("<p>Steps:</p><ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul>"), "Steps:\n- one\n  - inner\n- two");
+  });
+
+  it("decodes entities once, and leaves one that names no character as written", () => {
+    assert.equal(md("&amp;lt; &amp; &lt; &gt; &quot; &apos; &#65; &#x42; &#x110000;"), "&lt; & < > \" ' A B &#x110000;");
+  });
+
+  it("keeps the text of markup it cannot convert, and says what that markup was", () => {
+    assert.deepEqual(labelMarkdown('<p>a <u>b</u> <span style="c">c</span></p>'), { markdown: "a b c", unconverted: ["u", "span"] });
+    assert.deepEqual(labelMarkdown('<p>a <a href="x>b</p>'), { markdown: 'a <a href="x>b', unconverted: ["malformed"] });
+    // Text with no markup at all passes through, a "<" that starts no tag included.
+    assert.deepEqual(labelMarkdown("a < b, 2<3, *kept*\nnext"), { markdown: "a < b, 2<3, *kept*\nnext", unconverted: [] });
+  });
+
+  it("ends what was left open, and ignores an end tag that ends nothing", () => {
+    assert.equal(md('<p>see <a href="https://example.com/">the spec'), "see [the spec](https://example.com/)");
+    assert.equal(md("<code>x"), "`x`");
+    assert.equal(md("</code></a>x"), "x");
   });
 });

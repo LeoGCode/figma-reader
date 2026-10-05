@@ -2,7 +2,7 @@
 // (the login) and its own snapshot cache, so one project never reuses another account's session or exported files.
 // A project picks its account in .figma-reader.json; FIGMA_ACCOUNT (or the CLI's --account) overrides it.
 // The per-platform roots everything we write hangs off live here too (appRoot), since accounts are most of it.
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -43,6 +43,31 @@ export const accountCacheDir = (name: string) => join(cacheRoot(), "accounts", n
 export const accountProfileDir = (name: string, exe: string) =>
   join(accountDir(name), `profile-${basename(exe).replace(/[^a-z0-9-]/gi, "")}`);
 
+/**
+ * A write failed because this process may not make it there: a read-only sandbox (Codex's -s read-only), a read-only
+ * mount, a directory another user owns. A macOS sandbox answers EPERM, as does Windows for a write its ACLs deny, where
+ * Linux says EACCES or EROFS. A full or failing disk is something else, which moving elsewhere would not cure.
+ */
+export function mayNotWrite(e: unknown): boolean {
+  const code = (e as NodeJS.ErrnoException | null)?.code;
+  return code === "EROFS" || code === "EACCES" || code === "EPERM";
+}
+
+/**
+ * The error for a write into one of the directories above that this process may not make (see mayNotWrite).
+ * Raw, it was "EACCES: permission denied, mkdir '<path>'", which says neither what needed the directory nor that a
+ * read needs none of it, and agents guessed. `doing` says what needed `dir`, `fix` what would let it; the system's
+ * message stays in it, code and path included. Any other error comes back as it is, to be thrown unchanged.
+ */
+export function cannotWrite(e: unknown, doing: string, dir: string, fix: string): unknown {
+  if (!mayNotWrite(e)) return e;
+  return new Error(
+    `${doing} ${dir}, which this process may not write (${(e as Error).message}). ${fix} Reading a local .fig by its ` +
+      "path, or a key whose cached snapshot is still fresh (younger than FIGMA_SNAPSHOT_MAX_AGE_MIN, 30 minutes unless set), writes nothing.",
+    { cause: e },
+  );
+}
+
 export function checkAccountName(name: string): string {
   if (!NAME.test(name)) throw new Error(`invalid account name ${JSON.stringify(name)}: use letters, digits, '.', '_' or '-'`);
   return name;
@@ -53,6 +78,11 @@ export interface ProjectConfig {
   account?: string;
   /** Absolute; relative entries in the file are resolved against the file's directory. */
   filesDirs?: string[];
+  /**
+   * Pages figma_search, figma_diff and figma_changes leave out by default, by name: archives, templates, a copied
+   * design system.
+   */
+  excludePages?: string[];
 }
 
 /** The nearest .figma-reader.json from start upwards. */
@@ -77,6 +107,9 @@ function readConfigObject(path: string): Record<string, any> {
   if (raw.filesDirs !== undefined && !(Array.isArray(raw.filesDirs) && raw.filesDirs.every((d: unknown) => typeof d === "string"))) {
     throw new Error(`${path}: "filesDirs" must be an array of paths`);
   }
+  if (raw.excludePages !== undefined && !(Array.isArray(raw.excludePages) && raw.excludePages.every((p: unknown) => typeof p === "string"))) {
+    throw new Error(`${path}: "excludePages" must be an array of page names`);
+  }
   return raw;
 }
 
@@ -87,6 +120,7 @@ function readProjectConfig(path: string): ProjectConfig {
     path,
     account: raw.account === undefined ? undefined : checkAccountName(raw.account),
     filesDirs: raw.filesDirs?.map((d: string) => resolve(base, tilde(d))),
+    excludePages: raw.excludePages,
   };
 }
 
@@ -102,6 +136,44 @@ export function resolveAccount(env: NodeJS.ProcessEnv = process.env, cwd = proce
   if (env.FIGMA_ACCOUNT) return { name: checkAccountName(env.FIGMA_ACCOUNT), source: "env", config };
   if (config?.account) return { name: config.account, source: "project", config };
   return { name: DEFAULT_ACCOUNT, source: "default", config };
+}
+
+/**
+ * A call refused before it began because nothing chose its account (see otherAccounts; tools.ts decides and words the
+ * refusal). The CLI exits 2 on it, a single call and a batch alike. Kept here, with nothing to load, so that batch.ts
+ * can tell a refused line from a failed one without importing the tools.
+ */
+export class AccountNotChosen extends Error {}
+
+/**
+ * The accounts that make the fallback to "default" a guess: nothing chose an account here, and these exist besides
+ * it. "default" is then whichever login was set up first, often a personal one, and a call from a directory outside
+ * the project (an agent's scratch directory) read client files through it with nothing in the answer to say so.
+ * Empty when an account was chosen, "default" included (FIGMA_ACCOUNT, --account, a project file), or when "default"
+ * is the only account there is, which is the setup every single-login machine has and keeps working as it did.
+ * `accounts` is only called for the fallback, so a chosen account never depends on the data root being readable;
+ * whatever it throws (see existingAccounts) is the caller's to refuse on.
+ */
+export function otherAccounts(resolved: ResolvedAccount, accounts: () => string[] = existingAccounts): string[] {
+  return resolved.source === "default" ? accounts().filter((n) => n !== DEFAULT_ACCOUNT) : [];
+}
+
+/**
+ * The accounts set up on this machine, for otherAccounts. listAccounts reads every failure as "no accounts", which for
+ * the accounts command only shortens a list; here it let the fallback through on a machine whose other logins merely
+ * could not be listed (EACCES, EIO, a home on a network share gone stale). So only a directory that is not there yet,
+ * which is every machine that never logged in, means none, and any other failure is thrown. A symbolic link counts as
+ * an account too, whatever it points at: it is not up to this check to prove that one is not a login.
+ */
+export function existingAccounts(dir = join(dataRoot(), "accounts")): string[] {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException | null)?.code === "ENOENT") return [];
+    throw e;
+  }
+  return entries.filter((e) => e.isDirectory() || e.isSymbolicLink()).map((e) => e.name).sort();
 }
 
 /**

@@ -1,11 +1,12 @@
 // Which account a project gets decides whose Figma login and snapshot cache it uses, so the precedence is pinned here.
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  accountCacheDir, accountDir, accountProfileDir, appRoot, CONFIG_FILE, findProjectConfig, resolveAccount, writeProjectAccount,
+  accountCacheDir, accountDir, accountProfileDir, appRoot, cannotWrite, CONFIG_FILE, existingAccounts, findProjectConfig, otherAccounts,
+  resolveAccount, writeProjectAccount,
 } from "../src/account.ts";
 
 const roots: string[] = [];
@@ -35,6 +36,51 @@ test("no project file and no env is the default account", { skip: strayConfig &&
   assert.deepEqual(resolveAccount({}, nested), { name: "default", source: "default", config: undefined });
 });
 
+test("default is a guess only when nothing chose it and another account exists", () => {
+  // The fallback is whichever login was set up first; beside another account it may well be the wrong one, and
+  // otherAccounts is what makes a call through figma.com refuse it (see tools.ts).
+  const fallback = { name: "default", source: "default" } as const;
+  assert.deepEqual(otherAccounts(fallback, () => ["acme", "default", "personal"]), ["acme", "personal"]);
+  assert.deepEqual(otherAccounts(fallback, () => ["default"]), [], "the only account there is is no guess");
+  assert.deepEqual(otherAccounts(fallback, () => []), [], "nor is one never logged in");
+  // A choice is a choice, default included, however many accounts there are, and it does not even look: a data root
+  // that cannot be read must not stand in the way of an account named outright.
+  const unreadable = () => {
+    throw Object.assign(new Error("EACCES: permission denied, scandir '/data/accounts'"), { code: "EACCES" });
+  };
+  assert.deepEqual(otherAccounts({ name: "default", source: "env" }, unreadable), []);
+  assert.deepEqual(otherAccounts({ name: "acme", source: "project" }, unreadable), []);
+  // For the fallback the failure is passed on, for the caller to refuse on: it is no evidence of "no other accounts".
+  assert.throws(() => otherAccounts(fallback, unreadable), /EACCES/);
+});
+
+test("the accounts that exist are listed from the data root, and a root that cannot be read is an error, not none", () => {
+  const { root } = project();
+  const dir = join(root, "accounts");
+  // Never logged in on this machine: there is no accounts directory, and so no account.
+  assert.deepEqual(existingAccounts(dir), []);
+  mkdirSync(join(dir, "default"), { recursive: true });
+  mkdirSync(join(dir, "acme"));
+  writeFileSync(join(dir, ".DS_Store"), "");
+  // A linked account directory is an account like any other; whether it points at a login is not this check's call.
+  symlinkSync(join(root, "elsewhere"), join(dir, "linked"), "dir");
+  assert.deepEqual(existingAccounts(dir), ["acme", "default", "linked"]);
+  // listAccounts reads every failure as "no accounts". Here that let the fallback through: anything but a missing
+  // directory is thrown. A file where the directory belongs fails on every platform (ENOTDIR).
+  const file = join(root, "accounts-file");
+  writeFileSync(file, "");
+  assert.throws(() => existingAccounts(file), (e: NodeJS.ErrnoException) => e.code === "ENOTDIR");
+  // And a directory this user may not read, where permissions can say so.
+  if (process.platform !== "win32" && process.getuid?.() !== 0) {
+    chmodSync(dir, 0);
+    try {
+      assert.throws(() => existingAccounts(dir), (e: NodeJS.ErrnoException) => e.code === "EACCES");
+    } finally {
+      chmodSync(dir, 0o755);
+    }
+  }
+});
+
 test("the nearest project file above the working directory picks the account", () => {
   const { root, nested } = project({ account: "acme" });
   const r = resolveAccount({}, nested);
@@ -55,6 +101,16 @@ test("filesDirs resolve against the project file's directory", () => {
   const r = resolveAccount({}, nested);
   assert.equal(r.name, "default");
   assert.deepEqual(r.config?.filesDirs, [join(root, "design"), ABS]);
+});
+
+test("excludePages is read as written, and anything but a list of names is refused", () => {
+  const { nested } = project({ excludePages: ["Archive", "Templates"] });
+  assert.deepEqual(resolveAccount({}, nested).config?.excludePages, ["Archive", "Templates"]);
+  // A single name, the likeliest slip, would otherwise be searched for as nothing or spread into its letters.
+  for (const bad of ["Archive", [1], { name: "x" }]) {
+    const { nested: dir } = project({ excludePages: bad });
+    assert.throws(() => resolveAccount({}, dir), /"excludePages" must be an array of page names/, JSON.stringify(bad));
+  }
 });
 
 test("account names cannot escape the accounts directory", () => {
@@ -130,4 +186,18 @@ test("FIGMA_READER_CACHE moves the cache root but keeps accounts apart below it"
     if (saved === undefined) delete process.env.FIGMA_READER_CACHE;
     else process.env.FIGMA_READER_CACHE = saved;
   }
+});
+
+test("a write one of our directories refuses is said in words, keeping the system's code; any other error is left alone", () => {
+  const fsError = (code: string) => Object.assign(new Error(`${code}: denied, mkdir '/cache/x'`), { code });
+  // EPERM is what a macOS sandbox and Windows answer where Linux says EACCES or EROFS.
+  for (const code of ["EROFS", "EACCES", "EPERM"]) {
+    const e = fsError(code);
+    const said = cannotWrite(e, "exporting K saves its snapshot in the cache,", "/cache", "Run it elsewhere.") as Error;
+    const start = `exporting K saves its snapshot in the cache, /cache, which this process may not write (${code}: denied, mkdir '/cache/x'). Run it elsewhere. Reading a local .fig`;
+    assert.ok(said.message.startsWith(start), said.message);
+    assert.equal(said.cause, e);
+  }
+  // A full or failing disk is not a directory this process may not write, and saying so would send it elsewhere.
+  for (const e of [fsError("ENOSPC"), fsError("EIO"), new Error("no code"), "a string"]) assert.equal(cannotWrite(e, "x", "/d", "y"), e);
 });

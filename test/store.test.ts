@@ -1,12 +1,17 @@
 // The snapshot cache decides when a tool call pays for a browser export (up to a minute) and when it may serve an
 // older copy, so each rule is pinned against a fake exporter that counts its calls.
-import { after, describe, it } from "node:test";
+import { after, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { LEASE_BEAT_MS, pidNamespace, processStamp, takeLease } from "../src/browser.ts";
-import type { FigmaWeb } from "../src/figma-web.ts";
+import { FigDocument } from "../src/fig-file.ts";
+import { cleanStaleDownloads, type FigmaWeb } from "../src/figma-web.ts";
 import { LEASE_POLL_MS, SnapshotStore } from "../src/store.ts";
 import { figBytes } from "./fixtures.ts";
 
@@ -23,6 +28,8 @@ const tempDir = () => {
 /** A .fig whose single page is named after the export that wrote it, so tests can tell snapshots apart. */
 const fig = (label: string) => figBytes([{ id: "0:1", type: "CANVAS", parent: "0:0", name: label }]);
 const label = (doc: { pages(): { name: string }[] }) => doc.pages()[0].name;
+/** The label of the key's previous snapshot, read straight from its file. */
+const prevLabel = (store: SnapshotStore, key = "K") => label(FigDocument.fromFile(key, store.previousPath(key), new Date()));
 
 /**
  * Fake exporter: export n writes a file labelled "<tag> n"; `hold` keeps exports pending until released. The tag is
@@ -73,6 +80,20 @@ describe("SnapshotStore.get", () => {
     assert.equal(a, b);
     assert.deepEqual(x.calls, ["K"]);
     assert.equal(label(a), "export 1");
+  });
+
+  it("makes its directory with the first export into it, and not before", async () => {
+    // A process that only reads local files writes nothing, which is what lets it run in a read-only sandbox.
+    const x = exporter();
+    const dir = join(tempDir(), "cache");
+    const local = join(tempDir(), "local.fig");
+    writeFileSync(local, fig("local"));
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    assert.equal(label(await store.getLocal(local)), "local");
+    assert.equal(store.peek("K"), undefined);
+    assert.ok(!existsSync(dir), "made by a store that had only read");
+    assert.equal(label(await store.get("K")), "export 1");
+    assert.ok(existsSync(store.figPath("K")));
   });
 
   it("serves a snapshot younger than the max age without exporting, decoded once", async () => {
@@ -267,6 +288,30 @@ describe("SnapshotStore between processes", () => {
     assert.equal(label(await first), "a 1");
     assert.equal(label(await second), "b 1", "its own export, begun after it asked");
     assert.deepEqual(b.calls, ["K"]);
+  });
+
+  it("says that it may export before it waits for another process's export, and never when a snapshot answers", async () => {
+    // tools.ts registers with the browser when it hears this. Heard only once this load's own export began, the
+    // process it waited for could be the browser's last client and close it on the way out, just as this one needs it.
+    const a = exporter("a"), b = exporter("b");
+    const dir = tempDir();
+    let said = 0;
+    const store = new SnapshotStore({ saveLocalCopy: b.web.saveLocalCopy, mayExport: () => void said++ }, dir, HOUR);
+    a.hold();
+    const first = new SnapshotStore(a.web, dir, HOUR).get("K", true);
+    await exportsStarted(a, 1);
+    const second = store.get("K", true);
+    await new Promise((r) => setTimeout(r, 3 * LEASE_POLL_MS));
+    assert.deepEqual([said, b.calls.length], [1, 0], "said so while it was still waiting");
+    a.release();
+    await first;
+    assert.equal(label(await second), "b 1");
+    // A snapshot fresh enough to answer, and a local file, ask nothing of the browser.
+    assert.equal(await store.get("K"), await second);
+    const local = join(tempDir(), "local.fig");
+    writeFileSync(local, fig("local"));
+    await store.getLocal(local);
+    assert.equal(said, 1);
   });
 
   // A lease of this process's own pid, stamped as this process, is exactly what liveLeases reads as a live holder:
@@ -543,8 +588,8 @@ describe("SnapshotStore between processes", () => {
     const x = exporter();
     const dir = tempDir();
     // The lease of a holder no pid here can judge is aged out by its heartbeat, and this is the holder the age
-    // must not reach: a server in a container is one process for hours, and its client lease is taken once at
-    // startup. Any rule that reads the lease's age instead of its beat collects it while it works.
+    // must not reach: a server in a container is one process for hours, and its client lease is taken once, by its
+    // first call to the browser. Any rule that reads the lease's age instead of its beat collects it while it works.
     const lease = foreignHolder(dir, "long-lived", 20);
     const store = new SnapshotStore(x.web, dir, HOUR);
     const refreshed = store.get("K", true);
@@ -685,6 +730,234 @@ describe("SnapshotStore between processes", () => {
     assert.deepEqual(x.calls, [], "the wait bought an answer, not only serialization");
   });
 
+  // The leases above do not serialise exports: two processes can each find no live lease and both export, as the
+  // tests above for two holders at once arrange, and the ceiling lets one export beside another still running. So the
+  // swap onto the snapshot, the keeping of the one it replaced, and the reading of that pair go through a lock of
+  // their own: a directory holding the holder's lease, under exports/.
+  const lockDir = (dir: string) => join(dir, "exports", "K.publish");
+  /** The publish lock as a process holds it, with `stamp` (its own processStamp by default) in its lease. */
+  const plantLock = (dir: string, name: string, stamp = processStamp(process.pid)) => {
+    mkdirSync(lockDir(dir), { recursive: true });
+    writeFileSync(join(lockDir(dir), name), stamp);
+  };
+  /** A rival process's try at the lock, as underPublishLock makes it: true when it got in. */
+  const rivalGetsIn = (dir: string) => {
+    const staged = join(dir, "exports", "rival");
+    mkdirSync(staged, { recursive: true });
+    writeFileSync(join(staged, "1-rival"), processStamp(process.pid));
+    try {
+      renameSync(staged, lockDir(dir));
+      rmSync(lockDir(dir), { recursive: true, force: true });
+      return true;
+    } catch {
+      rmSync(staged, { recursive: true, force: true });
+      return false;
+    }
+  };
+  /** Run `during` while `fn` runs, at every link and rename it makes but those of the lock itself. */
+  const atEveryStep = async (dir: string, during: () => void, fn: () => Promise<unknown>) => {
+    const fs = createRequire(import.meta.url)("node:fs");
+    const real = { renameSync: fs.renameSync, linkSync: fs.linkSync };
+    let steps = 0;
+    for (const name of ["renameSync", "linkSync"] as const) {
+      fs[name] = (from: string, to: string) => {
+        if (!String(to).startsWith(lockDir(dir)) && !String(to).startsWith(join(dir, "exports", "rival"))) {
+          steps++;
+          during();
+        }
+        return real[name](from, to);
+      };
+    }
+    syncBuiltinESMExports();
+    try {
+      await fn();
+    } finally {
+      Object.assign(fs, real);
+      syncBuiltinESMExports();
+    }
+    return steps;
+  };
+
+  it("keeps every other process out while it swaps an export onto the snapshot and keeps the one it replaced", async () => {
+    // Injected between one export's link and its swap, another export's whole publish left the previous snapshot one
+    // the current one had never replaced, and the snapshot that had been in between under neither name.
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    const outcomes: boolean[] = [];
+    const steps = await atEveryStep(dir, () => outcomes.push(rivalGetsIn(dir)), () => store.get("K", true));
+    assert.equal(steps, 3, "the link, the swap, and the link renamed onto the previous snapshot");
+    assert.deepEqual(outcomes, [false, false, false], "no other process got the lock at any of them");
+    assert.ok(!existsSync(lockDir(dir)), "and it is given back");
+  });
+
+  it("waits to publish while another process holds the lock, and publishes once it is given back", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    plantLock(dir, `${process.pid}-other`);
+    const refreshed = store.get("K", true);
+    await exportsStarted(x, 2);
+    await polls(3);
+    assert.equal(label(new SnapshotStore(x.web, dir, HOUR).peek("K")!), "export 1", "exported and decoded, not yet swapped in");
+    rmSync(lockDir(dir), { recursive: true, force: true });
+    assert.equal(label(await refreshed), "export 2");
+    assert.equal(prevLabel(store), "export 1");
+  });
+
+  it("takes over the publish lock of a holder that is gone", async () => {
+    // pid 1 is alive but did not write this stamp, which is how liveLeases tells a holder that died. A ceiling of a
+    // second makes a store that never takes the lock over publish without it instead, which leaves the lock behind.
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR, 4, 1000);
+    await store.get("K");
+    plantLock(dir, "1-crashed");
+    assert.equal(label(await store.get("K", true)), "export 2");
+    assert.ok(!existsSync(lockDir(dir)), "taken over and given back, not waited out");
+  });
+
+  it("takes over the publish lock of a holder in another pid namespace once it has been silent too long", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR, 4, 5000);
+    await store.get("K");
+    plantLock(dir, "1-container", inAnotherNamespace(processStamp(process.pid), 20));
+    const began = performance.now();
+    assert.equal(label(await store.get("K", true)), "export 2");
+    // Twelve silent beats of 20 ms: judged by its silence, since no pid here can judge it.
+    assert.ok(performance.now() - began >= 12 * 20, "waited for the silence its stamp asks for");
+    assert.ok(!existsSync(lockDir(dir)));
+  });
+
+  it("reads the previous snapshot together with the current one, and refuses a pair another export came between", async () => {
+    const a = exporter("a"), b = exporter("b");
+    const dir = tempDir();
+    const first = new SnapshotStore(a.web, dir, HOUR);
+    await first.get("K");
+    const current = await first.get("K", true);
+    assert.equal(label((await first.previousOf("K", current))!), "a 1", "the snapshot this one replaced");
+    const outcomes: boolean[] = [];
+    await atEveryStep(dir, () => outcomes.push(rivalGetsIn(dir)), () => first.previousOf("K", current));
+    assert.deepEqual(outcomes, [false, false], "both read under the lock, so no export can come between them");
+    // Another process publishes after `current` was read: the previous snapshot is now `current` itself, and
+    // comparing the two answered that nothing had changed, with two equal dates as the only sign.
+    await new SnapshotStore(b.web, dir, HOUR).get("K", true);
+    await assert.rejects(first.previousOf("K", current), /the snapshot of K changed while it was being read/);
+  });
+
+  it("refuses a previous snapshot that is the current one rather than diff a snapshot with itself", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    const current = await store.get("K");
+    assert.equal(await store.previousOf("K", current), undefined, "a first export has no previous snapshot");
+    linkSync(store.figPath("K"), store.previousPath("K"));
+    await assert.rejects(store.previousOf("K", current), /the previous snapshot of K is the same file as its current one/);
+  });
+
+  it("reads the previous snapshot from its own file, though the current one is one decode under its key and its path", async () => {
+    // A snapshot is kept under its key and found again under its path (one decode for both). The previous snapshot
+    // must never be answered by that sharing: a diff of the current document with itself reports nothing changed.
+    const x = exporter();
+    const dir = realpathSync(tempDir());
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    const current = await store.get("K", true);
+    const decode = mock.method(FigDocument, "fromFile");
+    try {
+      assert.equal(await store.getLocal(store.figPath("K")), current, "the key and its path are one document");
+      const prev = await store.previousOf("K", current);
+      assert.notEqual(prev, current);
+      assert.deepEqual([label(prev!), label(current)], ["export 1", "export 2"]);
+      // Read by its own path afterwards, the previous snapshot is that same decode, and still not the current one.
+      assert.equal(await store.getLocal(store.previousPath("K")), prev);
+      assert.equal(decode.mock.callCount(), 1, "the previous snapshot decoded once, the current one not again");
+    } finally {
+      decode.mock.restore();
+    }
+  });
+
+  it("registers with the browser before every wait an export makes, the publish lock's too, and never to read the pair", async () => {
+    // The process a load waits on may be the browser's last client and close it on its way out, so a load says it
+    // may export before any wait (see load). Publishing waits again, for the lock, after its export; and reading a
+    // fresh snapshot and its previous one exports nothing, so it must not register at all.
+    const x = exporter();
+    const dir = tempDir();
+    let said = 0;
+    let saidAtExport = 0;
+    const store = new SnapshotStore(
+      { mayExport: () => void said++, saveLocalCopy: (k: string, p: string) => ((saidAtExport = said), x.web.saveLocalCopy(k, p)) },
+      dir,
+      HOUR,
+    );
+    await store.get("K");
+    plantLock(dir, `${process.pid}-other`);
+    const refreshed = store.get("K", true);
+    await exportsStarted(x, 2);
+    await polls(3);
+    assert.deepEqual([said, saidAtExport], [2, 2], "said so before its export, and so before it waits for the lock");
+    rmSync(lockDir(dir), { recursive: true, force: true });
+    const current = await refreshed;
+    assert.equal(label((await store.previousOf("K", current))!), "export 1");
+    assert.equal(await store.get("K"), current);
+    assert.equal(said, 2, "reading the pair asked nothing of the browser");
+  });
+
+  it(
+    "reads the previous snapshot where it stands from a cache it may not write, and writes nothing there",
+    { skip: (process.platform === "win32" || process.getuid?.() === 0) && "permissions do not bind here" },
+    async () => {
+      // A key whose snapshot is fresh is answered without writing, which is what lets a read-only sandbox use the
+      // cache. diff previous gave both files a private name by hard link first, and failed there with EACCES/EROFS.
+      const x = exporter();
+      const dir = tempDir();
+      const writer = new SnapshotStore(x.web, dir, HOUR);
+      await writer.get("K");
+      await writer.get("K", true);
+      // Every directory of the cache made unwritable, the lease directories an export leaves included.
+      const dirsOf = (d: string): string[] => [d, ...readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()).flatMap((e) => dirsOf(join(d, e.name)))];
+      const lock = (mode: number) => dirsOf(dir).reverse().forEach((d) => chmodSync(d, mode));
+      const listing = () => readdirSync(dir, { recursive: true }).map(String).sort();
+      // Another process, which may only read: a ceiling of 300 ms on the wait for a publish under way.
+      const reader = new SnapshotStore(x.web, dir, HOUR, 4, 300);
+      const before = listing();
+      lock(0o555);
+      try {
+        const current = await reader.get("K");
+        assert.equal(label((await reader.previousOf("K", current))!), "export 1");
+        assert.deepEqual(listing(), before, "nothing written, not even for a moment that outlived the call");
+      } finally {
+        lock(0o755);
+      }
+      // A publish under way holds the lock between swapping the snapshot and renaming the previous one: a pair read
+      // in place then may be one the snapshot never replaced, so it is refused, as previousOf refuses one read late.
+      plantLock(dir, `${process.pid}-other`);
+      lock(0o555);
+      try {
+        const current = await reader.get("K");
+        await assert.rejects(reader.previousOf("K", current), /the snapshot of K changed while it was being read/);
+      } finally {
+        lock(0o755);
+        rmSync(lockDir(dir), { recursive: true, force: true });
+      }
+      // A lock left by a holder that is gone, which this process cannot clear: read without it, and without waiting.
+      plantLock(dir, "1-crashed");
+      lock(0o555);
+      try {
+        const slow = new SnapshotStore(x.web, dir, HOUR, 4, 10_000);
+        const current = await slow.get("K");
+        const began = performance.now();
+        assert.equal(label((await slow.previousOf("K", current))!), "export 1");
+        assert.ok(performance.now() - began < 5_000, "not the ceiling waited out for a holder long gone");
+      } finally {
+        lock(0o755);
+      }
+    },
+  );
+
   it("answers a refresh with an export whose file is the size of the one it replaced", async () => {
     const x = exporter();
     const dir = tempDir();
@@ -711,6 +984,314 @@ describe("SnapshotStore between processes", () => {
     assert.equal(label(await refreshed), "newer export");
     assert.deepEqual(x.calls, [], "the wait bought an answer, not only serialization");
   });
+});
+
+// A refresh used to rename the new export over the only copy there was, so "what changed since the last export" had
+// nothing to compare against. The export it replaces is kept beside it, one per key, for figma_diff.
+describe("SnapshotStore previous snapshot", () => {
+  it("keeps the snapshot each export replaced, exactly one, dated by the export that made it", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    assert.ok(!existsSync(store.previousPath("K")), "a first export has nothing to keep");
+    const first = statSync(store.figPath("K"));
+    await store.get("K", true);
+    assert.equal(prevLabel(store), "export 1");
+    assert.equal(statSync(store.previousPath("K")).mtimeMs, first.mtimeMs, "and its time is still that export's");
+    await store.get("K", true);
+    assert.deepEqual([label(store.peek("K")!), prevLabel(store)], ["export 3", "export 2"]);
+    // One previous per key, and nothing left over from keeping it: the cache holds the two snapshots and the leases.
+    assert.deepEqual(readdirSync(dir).sort(), ["K.fig", "K.previous.fig", "exports"]);
+  });
+
+  it("keeps the one a re-export of a stale snapshot replaced too", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    writeFileSync(join(dir, "K.fig"), fig("stale"));
+    const old = new Date(Date.now() - 2 * HOUR);
+    utimesSync(join(dir, "K.fig"), old, old);
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    assert.equal(label(await store.get("K")), "export 1");
+    assert.equal(prevLabel(store), "stale");
+  });
+
+  it("leaves the snapshot and the previous one as they were when an export fails", async () => {
+    const dir = tempDir();
+    writeFileSync(join(dir, "K.fig"), fig("current"));
+    writeFileSync(join(dir, "K.previous.fig"), fig("previous"));
+    // One export that throws, and one that writes a file that does not decode: both are failures, and a previous
+    // replaced by either would leave the diff comparing against the very snapshot that is still current.
+    let broken = true;
+    const web = {
+      async saveLocalCopy(_key: string, path: string) {
+        if (broken) throw new Error("export failed");
+        writeFileSync(path, "not a fig");
+      },
+    } as unknown as FigmaWeb;
+    const store = new SnapshotStore(web, dir, HOUR);
+    await assert.rejects(store.get("K", true), /export failed/);
+    broken = false;
+    await assert.rejects(store.get("K", true));
+    assert.deepEqual([label(store.peek("K")!), prevLabel(store)], ["current", "previous"]);
+    assert.deepEqual(readdirSync(dir).sort(), ["K.fig", "K.previous.fig", "exports"]);
+  });
+
+  it("never leaves the snapshot path empty while it keeps the previous one", async () => {
+    // Another process reading the snapshot between two renames would find no file: it exports, reads "no file" as
+    // the floor a refresh is judged by, or fails a decode it has just stat'ed for. Moving the snapshot to the
+    // previous name and the export onto the snapshot is that window, so every rename and link is checked at the
+    // call itself, in this process, before anything after it could fill the gap.
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    const fs = createRequire(import.meta.url)("node:fs");
+    const real = { renameSync: fs.renameSync, linkSync: fs.linkSync };
+    const seen: boolean[] = [];
+    for (const name of ["renameSync", "linkSync"] as const) {
+      fs[name] = (...args: unknown[]) => {
+        seen.push(existsSync(store.figPath("K")));
+        return real[name](...args);
+      };
+    }
+    syncBuiltinESMExports();
+    try {
+      await store.get("K", true);
+    } finally {
+      Object.assign(fs, real);
+      syncBuiltinESMExports();
+    }
+    assert.ok(seen.length >= 2, "the export renamed its file onto the snapshot, and kept the previous one");
+    assert.ok(seen.every(Boolean), `the snapshot was missing at ${seen.filter((s) => !s).length} of ${seen.length} steps`);
+    assert.equal(prevLabel(store), "export 1");
+  });
+
+  it("leaves the snapshot and the previous one as they were when the swap onto the snapshot fails", async () => {
+    // The rename onto the snapshot is the step Windows refuses while another process has the file open. The previous
+    // snapshot used to be replaced before it, so a failed swap left the current snapshot under both names and the
+    // older one gone: the very history the previous snapshot is there to keep.
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    await store.get("K", true);
+    const fs = createRequire(import.meta.url)("node:fs");
+    const real = fs.renameSync;
+    fs.renameSync = (from: string, to: string) => {
+      if (to === store.figPath("K")) throw Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" });
+      return real(from, to);
+    };
+    syncBuiltinESMExports();
+    try {
+      await assert.rejects(store.get("K", true), /EPERM/);
+    } finally {
+      fs.renameSync = real;
+      syncBuiltinESMExports();
+    }
+    assert.deepEqual([label(new SnapshotStore(x.web, dir, HOUR).peek("K")!), prevLabel(store)], ["export 2", "export 1"]);
+    assert.deepEqual(readdirSync(dir).sort(), ["K.fig", "K.previous.fig", "exports"], "nothing staged left behind");
+    assert.deepEqual(readdirSync(join(dir, "exports")).sort(), ["K"], "and the publish lock given back");
+  });
+
+  it("does not fail an export over a previous snapshot it cannot replace", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    // Windows refuses to replace a file another process has open, as a diff reading the previous one would. A
+    // directory in its place cannot be renamed over anywhere, which stands in for that here.
+    mkdirSync(join(store.previousPath("K"), "held"), { recursive: true });
+    assert.equal(label(await store.get("K", true)), "export 2");
+    assert.equal(label(store.peek("K")!), "export 2");
+    assert.ok(statSync(store.previousPath("K")).isDirectory(), "left as it was");
+    assert.deepEqual(readdirSync(dir).sort(), ["K.fig", "K.previous.fig", "exports"], "and nothing staged left behind");
+  });
+});
+
+// Every call that reaches the browser first sweeps the cache for what crashed exports left behind (cleanStaleDownloads),
+// judging a file by its age. The store's own staging files have the swept shape and are older than the sweep while in
+// use, so each test below runs that sweep, as another process starting meanwhile would, at the moment it hurt.
+describe("SnapshotStore beside another process's sweep", () => {
+  /**
+   * Run `fn` with the sweep run right after each hard link it makes and right before each staging file it decodes,
+   * and count both: a link has to outlive the first, and stay claimed until it has been read, past the second.
+   */
+  const sweptAtEveryStep = async <T>(dir: string, fn: () => Promise<T>) => {
+    const fs = createRequire(import.meta.url)("node:fs");
+    const real = fs.linkSync;
+    const swept = { links: 0, decodes: 0 };
+    fs.linkSync = (from: string, to: string) => {
+      real(from, to);
+      swept.links++;
+      cleanStaleDownloads(dir);
+    };
+    syncBuiltinESMExports();
+    const fromFile = FigDocument.fromFile;
+    const decode = mock.method(FigDocument, "fromFile", (key: string, path: string, at: Date) => {
+      if (path.endsWith(".tmp")) {
+        swept.decodes++;
+        cleanStaleDownloads(dir);
+      }
+      return fromFile.call(FigDocument, key, path, at);
+    });
+    try {
+      return { result: await fn(), ...swept };
+    } finally {
+      decode.mock.restore();
+      fs.linkSync = real;
+      syncBuiltinESMExports();
+    }
+  };
+
+  it("keeps an export's own file while it is decoded", async () => {
+    // The file is the download moved into place, written before the decode began, so a sweep starting during the
+    // decode (seconds, on a large file) found it older than itself and deleted it: the rename onto the snapshot failed.
+    const dir = tempDir();
+    const downloaded = new Date(Date.now() - 60_000);
+    const web = {
+      async saveLocalCopy(_key: string, path: string) {
+        writeFileSync(path, fig("export 1"));
+        utimesSync(path, downloaded, downloaded);
+      },
+    } as unknown as FigmaWeb;
+    const fromFile = FigDocument.fromFile;
+    const decode = mock.method(FigDocument, "fromFile", (key: string, path: string, at: Date) => {
+      if (path.endsWith(".tmp")) cleanStaleDownloads(dir);
+      return fromFile.call(FigDocument, key, path, at);
+    });
+    try {
+      assert.equal(label(await new SnapshotStore(web, dir, HOUR).get("K")), "export 1");
+      assert.equal(decode.mock.callCount(), 1, "the sweep ran during the decode");
+    } finally {
+      decode.mock.restore();
+    }
+    assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".tmp")), [], "and nothing staged is left behind");
+  });
+
+  it("keeps the previous snapshot when the sweep lands between the link that keeps it and its rename", async () => {
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    // The snapshot being replaced is older than the sweep, as it always is, and its link carries that time.
+    const old = new Date(Date.now() - 2 * HOUR);
+    utimesSync(store.figPath("K"), old, old);
+    const swept = await sweptAtEveryStep(dir, () => store.get("K", true));
+    assert.equal(label(swept.result), "export 2");
+    assert.ok(swept.links > 0, "the link was made, so the sweep ran there");
+    assert.equal(prevLabel(store), "export 1");
+  });
+
+  /** A store holding a pair diff previous reads, exported twenty and ten minutes ago: fresh, and older than any sweep. */
+  const pair = async () => {
+    const dir = tempDir();
+    const store = new SnapshotStore(exporter().web, dir, HOUR);
+    await store.get("K");
+    await store.get("K", true);
+    const at = (minutes: number) => new Date(Date.now() - minutes * 60_000);
+    utimesSync(store.previousPath("K"), at(20), at(20));
+    utimesSync(store.figPath("K"), at(10), at(10));
+    return { dir, store, current: await store.get("K") };
+  };
+
+  it("reads diff previous's pair under its own names while the sweep runs, until the previous one is decoded", async () => {
+    // The lease that claims the two links has to stand until the previous snapshot is read from its link: given up as
+    // soon as the links were made, a sweep before the decode deleted the file it was about to open.
+    const { dir, store, current } = await pair();
+    const swept = await sweptAtEveryStep(dir, () => store.previousOf("K", current));
+    assert.equal(label(swept.result!), "export 1");
+    assert.deepEqual([swept.links, swept.decodes], [2, 1], "a sweep after each link, and one as the previous one was opened");
+    assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".tmp")), [], "and its own names are gone");
+  });
+
+  it(
+    "reads diff previous's pair where it stands, linking nothing, when the lease that guards the links cannot be taken",
+    { skip: (process.platform === "win32" || process.getuid?.() === 0) && "permissions do not bind here" },
+    async () => {
+      // A cache that takes the links but not that lease: links made without it had no live owner, and a sweep in another
+      // process deleted them while they were read, which answered that the snapshot had changed when none had.
+      const { dir, store, current } = await pair();
+      const leases = join(dir, "exports", "K.reading");
+      mkdirSync(leases, { recursive: true });
+      chmodSync(leases, 0o555);
+      try {
+        const swept = await sweptAtEveryStep(dir, () => store.previousOf("K", current));
+        assert.equal(label(swept.result!), "export 1");
+        assert.equal(swept.links, 0, "no link made without the lease");
+      } finally {
+        chmodSync(leases, 0o755);
+      }
+    },
+  );
+
+  it("fails diff previous on a lease it cannot take for any other reason, rather than link without one", async () => {
+    const { dir, store, current } = await pair();
+    writeFileSync(join(dir, "exports", "K.reading"), "a file where the lease directory belongs");
+    await assert.rejects(store.previousOf("K", current), (e: NodeJS.ErrnoException) => e.code === "EEXIST" || e.code === "ENOTDIR");
+    assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".tmp")), [], "and no link made");
+  });
+
+  it(
+    "says which directory an export could not write, what needed it, and what reads without writing",
+    { skip: (process.platform === "win32" || process.getuid?.() === 0) && "permissions do not bind here" },
+    async () => {
+      // A read-only sandbox answered with the system's "EACCES: permission denied, mkdir '<path>'" and nothing else.
+      const x = exporter();
+      const dir = tempDir();
+      chmodSync(dir, 0o555);
+      try {
+        await assert.rejects(new SnapshotStore(x.web, dir, HOUR).get("K"), (e: Error) => {
+          const said = `exporting K saves its snapshot in figma-reader's cache, ${dir}, which this process may not write (EACCES: `;
+          assert.ok(e.message.startsWith(said), e.message);
+          assert.match(e.message, /FIGMA_READER_CACHE/);
+          assert.match(e.message, /Reading a local \.fig by its path, or a key whose cached snapshot is still fresh .*, writes nothing\.$/);
+          return true;
+        });
+        assert.deepEqual(x.calls, [], "and the browser was never asked for an export there was nowhere to keep");
+      } finally {
+        chmodSync(dir, 0o755);
+      }
+      // A cache directory that stands takes no write from mkdir, and the lease directory of the key may take the lease
+      // while the directory the snapshot goes in takes nothing: the export ran, and only the move onto the snapshot's
+      // directory said so, raw, once the whole export was spent.
+      mkdirSync(join(dir, "exports", "K"), { recursive: true });
+      chmodSync(dir, 0o555);
+      try {
+        await assert.rejects(new SnapshotStore(x.web, dir, HOUR).get("K"), (e: Error) => {
+          assert.ok(e.message.startsWith(`exporting K saves its snapshot in figma-reader's cache, ${dir}, which this process may not write (EACCES: `), e.message);
+          return true;
+        });
+        assert.deepEqual(x.calls, [], "still nothing asked of the browser");
+      } finally {
+        chmodSync(dir, 0o755);
+      }
+    },
+  );
+
+  it(
+    "says the same of a write into the cache that fails later in the export",
+    { skip: (process.platform === "win32" || process.getuid?.() === 0) && "permissions do not bind here" },
+    async () => {
+      // A cache that stops taking writes while the browser exports: the swap onto the snapshot is refused.
+      const dir = tempDir();
+      const web = {
+        async saveLocalCopy(_key: string, path: string) {
+          writeFileSync(path, fig("export 1"));
+          chmodSync(dir, 0o555);
+        },
+      } as unknown as FigmaWeb;
+      try {
+        await assert.rejects(new SnapshotStore(web, dir, HOUR).get("K"), (e: Error) => {
+          assert.ok(e.message.startsWith(`exporting K saves its snapshot in figma-reader's cache, ${dir}, which this process may not write (EACCES: `), e.message);
+          assert.match(e.message, /rename/);
+          return true;
+        });
+      } finally {
+        chmodSync(dir, 0o755);
+      }
+    },
+  );
 });
 
 describe("SnapshotStore.getLocal and peek", () => {

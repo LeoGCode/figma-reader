@@ -31,7 +31,8 @@ const SHAPES = new Set(["VECTOR", "BOOLEAN_OPERATION", "STAR", "LINE", "ELLIPSE"
  * something to count away. Strokes as well as fills, as figma_export_image_fills reads both: an image stroke on an
  * ellipse used to hide the layer holding the image inside its frame's "(1 vector)".
  */
-const hasImage = (n: FigNode) => [...(n.fillPaints ?? []), ...(n.strokePaints ?? [])].some((p: { type?: string }) => p.type === "IMAGE");
+const image = (p: { type?: string }) => p.type === "IMAGE";
+const hasImage = (n: FigNode) => Boolean(n.fillPaints?.some(image) || n.strokePaints?.some(image));
 const isDrawing = (n: FigNode) => SHAPES.has(n.type) && (n.type === "BOOLEAN_OPERATION" || !n.childIds.length) && !hasImage(n);
 
 /**
@@ -90,24 +91,62 @@ export function outline(doc: FigDocument, start: FigNode, depth: number, maxNode
   const roots = start.type === "DOCUMENT" ? doc.pages() : [start];
   /**
    * The shapes a layer's subtree draws, when it draws nothing else (0 when it holds anything else, or nothing): a shape
-   * counts one, a group or frame of them what it holds. Kept per node: deciding a layer walks what it holds, and each
-   * layer under it that is listed or printed would walk its own part of that again.
+   * counts one, a group or frame of them what it holds. Only a layer the outline prints is asked, and the walk ends at
+   * the first thing in it that does not draw, a layer's own children read before any of them is opened. Kept per node:
+   * each layer under a printed one that is printed in turn would walk its part again.
+   *
+   * A loop with its own stack, not recursion: a group nested 10,000 deep overflowed the call stack even for an outline
+   * of one line. A layer met again while it is being counted is a parent cycle, which only a broken file has: not a
+   * drawing, so the walk ends there too.
    */
   const drawn = new Map<FigNode, number>();
-  const shapes = (n: FigNode): number => {
-    let total = drawn.get(n);
-    if (total !== undefined) return total;
-    total = 0;
-    for (const c of doc.children(n)) {
-      const part = isDrawing(c) ? 1 : isHolder(c) ? shapes(c) : 0;
-      if (!part) {
-        total = 0;
-        break;
+  /** The layers being counted, outermost first, and the same as a set: empty between two counts. */
+  const path: { n: FigNode; kids: FigNode[]; next: number; total: number }[] = [];
+  const counting = new Set<FigNode>();
+  /** The count of the layer that just finished, or was known, for the layer above it to take. */
+  let last: number | undefined;
+  const finish = (total: number) => {
+    const f = path.pop()!;
+    counting.delete(f.n);
+    drawn.set(f.n, total);
+    last = total;
+  };
+  const open = (n: FigNode) => {
+    const kids = doc.children(n);
+    counting.add(n);
+    path.push({ n, kids, next: 0, total: 0 });
+    // A text beside a large drawing ends the walk before the drawing is opened.
+    if (!kids.length || !kids.every((c) => isDrawing(c) || isHolder(c))) finish(0);
+  };
+  const shapes = (top: FigNode): number => {
+    const known = drawn.get(top);
+    if (known !== undefined) return known;
+    last = undefined;
+    open(top);
+    while (path.length) {
+      const f = path.at(-1)!;
+      if (last !== undefined) {
+        // A layer that is not a drawing makes every layer holding it not one either.
+        if (!last) {
+          finish(0);
+          continue;
+        }
+        f.total += last;
+        f.next++;
+        last = undefined;
       }
-      total += part;
+      if (f.next === f.kids.length) {
+        finish(f.total);
+        continue;
+      }
+      const c = f.kids[f.next];
+      if (isDrawing(c)) {
+        f.total++;
+        f.next++;
+      } else if (drawn.has(c) || counting.has(c)) last = drawn.get(c) ?? 0;
+      else open(c);
     }
-    drawn.set(n, total);
-    return total;
+    return last!;
   };
   /**
    * A drawing is counted on its line, its subtree not listed, except the node asked for: get-tree with a drawing's id

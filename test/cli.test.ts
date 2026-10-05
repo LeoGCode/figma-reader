@@ -388,6 +388,37 @@ test("a local read or help works where nothing may be written", { skip: (process
   }
 });
 
+test("a call that has to write where it may not says which directory, what needed it, and what reads without writing", { skip: (process.platform === "win32" || process.getuid?.() === 0) && "permissions do not bind here" }, async () => {
+  // Raw, both ended in "EACCES: permission denied, mkdir '<path>'", which says neither what needed the directory nor
+  // that a read by path needs none of it, and an agent in a read-only sandbox was left to guess.
+  const { dir, env } = ownHome("unwritable");
+  const cache = join(root, "unwritable cache");
+  mkdirSync(cache);
+  chmodSync(dir, 0o555);
+  chmodSync(cache, 0o555);
+  try {
+    // Port 1, where nothing listens: had status got past its registration, it would have found no browser there.
+    const status = await cli(["status"], { env: { ...env, FIGMA_CDP_URL: "http://127.0.0.1:1" } });
+    assert.equal(status.code, 1, status.stderr);
+    const state = join(dir, ".local", "state", "figma-reader");
+    assert.ok(status.stderr.includes(`registers with it in figma-reader's state directory, ${state}, which this process may not write (EACCES: `), status.stderr);
+    assert.match(status.stderr, /Run it where that directory is writable\. Reading a local \.fig by its path, or a key whose cached snapshot is still fresh/);
+    // A home it may write, and a cache it may not: the export stops before the browser is asked for anything.
+    const home = ownHome("unwritable cache, writable home");
+    const load = await cli(["load-file", "UNWRITABLEKEY1"], {
+      env: { ...home.env, FIGMA_ACCOUNT: "ro", FIGMA_READER_CACHE: cache, FIGMA_BROWSER_PATH: join(home.dir, "no-such-browser") },
+    });
+    assert.equal(load.code, 1, load.stderr);
+    const said = `exporting UNWRITABLEKEY1 saves its snapshot in figma-reader's cache, ${join(cache, "accounts", "ro")}, which this process may not write (EACCES: `;
+    assert.ok(load.stderr.includes(said), load.stderr);
+    assert.match(load.stderr, /or set FIGMA_READER_CACHE to a directory that is\./);
+    assert.doesNotMatch(load.stderr, /Cannot start browser/, "the browser was never launched for it");
+  } finally {
+    chmodSync(dir, 0o755);
+    chmodSync(cache, 0o755);
+  }
+});
+
 test("a call that reaches the browser has registered with it by then, and gives that back when it exits", async () => {
   // The lease is what another process's release() reads before it closes the browser, so it has to be there before
   // this process first talks to the browser: taken any later, a release in between closes it under this one.

@@ -5,7 +5,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, w
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  accountCacheDir, accountDir, accountProfileDir, appRoot, CONFIG_FILE, existingAccounts, findProjectConfig, otherAccounts,
+  accountCacheDir, accountDir, accountProfileDir, appRoot, cannotWrite, CONFIG_FILE, existingAccounts, findProjectConfig, otherAccounts,
   resolveAccount, writeProjectAccount,
 } from "../src/account.ts";
 
@@ -186,4 +186,18 @@ test("FIGMA_READER_CACHE moves the cache root but keeps accounts apart below it"
     if (saved === undefined) delete process.env.FIGMA_READER_CACHE;
     else process.env.FIGMA_READER_CACHE = saved;
   }
+});
+
+test("a write one of our directories refuses is said in words, keeping the system's code; any other error is left alone", () => {
+  const fsError = (code: string) => Object.assign(new Error(`${code}: denied, mkdir '/cache/x'`), { code });
+  // EPERM is what a macOS sandbox and Windows answer where Linux says EACCES or EROFS.
+  for (const code of ["EROFS", "EACCES", "EPERM"]) {
+    const e = fsError(code);
+    const said = cannotWrite(e, "exporting K saves its snapshot in the cache,", "/cache", "Run it elsewhere.") as Error;
+    const start = `exporting K saves its snapshot in the cache, /cache, which this process may not write (${code}: denied, mkdir '/cache/x'). Run it elsewhere. Reading a local .fig`;
+    assert.ok(said.message.startsWith(start), said.message);
+    assert.equal(said.cause, e);
+  }
+  // A full or failing disk is not a directory this process may not write, and saying so would send it elsewhere.
+  for (const e of [fsError("ENOSPC"), fsError("EIO"), new Error("no code"), "a string"]) assert.equal(cannotWrite(e, "x", "/d", "y"), e);
 });

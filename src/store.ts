@@ -1,6 +1,7 @@
 // Snapshot cache: the latest exported .fig per file key on disk, and the one it replaced; decoded documents in memory.
 import { existsSync, linkSync, mkdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { cannotWrite, mayNotWrite } from "./account.ts";
 import { dropLease, liveLeases, processStamp, takeLease } from "./browser.ts";
 import { FigDocument } from "./fig-file.ts";
 import type { FigmaWeb } from "./figma-web.ts";
@@ -18,6 +19,38 @@ export const LEASE_POLL_MS = 100;
 const OTHER_EXPORT_WAIT_MS = 600_000;
 /** How often a held publish lock is looked at again: it is held for a few file operations (see underPublishLock). */
 const PUBLISH_POLL_MS = 10;
+
+/** Where the processes sharing the snapshot directory `dir` announce that they are exporting a key (see awaitOtherExport). */
+const exportLeases = (dir: string, fileKey: string) => join(dir, "exports", fileKey);
+/** Where a process reading the key's pair under names of its own announces it until those names are gone (see previousOf). */
+const readerLeases = (dir: string, fileKey: string) => join(dir, "exports", `${fileKey}.reading`);
+
+/**
+ * The key, pid and tag a staging file's name carries: "<key>.fig.<pid>.<tag>.tmp" for an export's own file and for
+ * diff previous's link to the snapshot, "<key>.previous.fig.<pid>.<tag>.tmp" for the links that keep and read the
+ * previous one. moveDownload's copy of an export's file is named after that file, so it begins the same way.
+ */
+const STAGED = /^([A-Za-z0-9]+)\.(?:previous\.)?fig\.(\d+)\.([a-z0-9]+)\.tmp/;
+
+/**
+ * Whether the staging file `name` in the snapshot directory `dir` is still in use by the process that made it, which
+ * is what cleanStaleDownloads asks before it sweeps one by its age. Every such file is made under a lease whose name
+ * carries the same pid and tag - the export's own, or previousOf's - held for as long as the file is in use, so a live
+ * one says it is in use however old the file looks, judged by liveLeases by the rules every lease here is judged by.
+ *
+ * Age alone was the rule, and no age can tell: an export's file carries the mtime of the download it was moved from,
+ * a link carries the snapshot's, and both are older than any sweep that begins while they are used. A process that
+ * reached the browser while another was decoding its export deleted the file under it, and the rename onto the
+ * snapshot then failed. A name with no tag (an older build's), or one no live lease claims, is left to its age.
+ */
+export function stagedByLiveOwner(dir: string, name: string): boolean {
+  const m = STAGED.exec(name);
+  if (!m) return false;
+  const [, fileKey, pid, tag] = m;
+  return [exportLeases(dir, fileKey), readerLeases(dir, fileKey)].some((leases) =>
+    liveLeases(leases).some((lease) => lease.split("-")[0] === pid && lease.endsWith(`-${tag}`)),
+  );
+}
 
 /**
  * An export whose lease name says it began at or before `since`, so it may be exporting the file as it was before
@@ -211,7 +244,7 @@ export class SnapshotStore {
 
   /** Where the processes sharing this cache announce that they are exporting a key (see awaitOtherExport). */
   private leaseDir(fileKey: string) {
-    return join(this.dir, "exports", fileKey);
+    return exportLeases(this.dir, fileKey);
   }
 
   /**
@@ -282,19 +315,33 @@ export class SnapshotStore {
         return this.fromDisk(fileKey, path);
       }
     }
-    // Made by the first export rather than by the store: a process that only reads local files or fresh snapshots
-    // writes nothing here, which is all a read-only sandbox lets it do.
-    mkdirSync(this.dir, { recursive: true });
     const tag = Math.random().toString(36).slice(2, 8);
-    const lease = takeLease(this.leaseDir(fileKey), `${process.pid}-${Date.now()}-${tag}`);
+    // A write into this cache that this process may not make, said in words (see cannotWrite).
+    const unkept = (e: unknown) =>
+      cannotWrite(e, `exporting ${fileKey} saves its snapshot in figma-reader's cache,`, this.dir, "Run it where that directory is writable, or set FIGMA_READER_CACHE to a directory that is.");
+    let lease: string;
+    try {
+      // Made by the first export rather than by the store: a process that only reads local files or fresh snapshots
+      // writes nothing here, which is all a read-only sandbox lets it do.
+      mkdirSync(this.dir, { recursive: true });
+      lease = takeLease(this.leaseDir(fileKey), `${process.pid}-${Date.now()}-${tag}`);
+    } catch (e) {
+      throw unkept(e);
+    }
     // Export onto a name no other process writes, and swap that onto the snapshot; reading the snapshot back read
     // whatever stood there. Every process on this cache renames its own export onto the one path, and one landing
     // between this export's rename and that read answered with a file this process had not exported - 39 answers
     // in 40 with another process renaming continuously, and the answer above is the export that was still running
     // when the wait gave up on it, which is the pre-refresh one. The name is the shape moveDownload gives a copy
-    // beside the snapshot, so cleanStaleDownloads sweeps one left behind by a crash between the export and the swap.
+    // beside the snapshot, so cleanStaleDownloads sweeps one left behind by a crash between the export and the swap;
+    // it carries the lease's pid and tag, which is what keeps that sweep off it while this export runs (see
+    // stagedByLiveOwner).
     const mine = `${path}.${process.pid}.${tag}.tmp`;
     try {
+      // Made empty before the browser is asked for anything, and the export is moved onto it. A cache directory that
+      // already stands is not written by mkdir, and a lease directory that takes the lease says nothing of the one the
+      // snapshot goes in: one that took no file was found only by the move, after the whole export.
+      writeFileSync(mine, "", { flag: "wx" });
       await this.web.saveLocalCopy(fileKey, mine);
       const st = statSync(mine);
       // exportedAt comes from the file's mtime, as for a snapshot read back later, so both agree on its age. The
@@ -305,11 +352,20 @@ export class SnapshotStore {
       // Only an export that decoded gets this far, so one that failed leaves the snapshot and the previous one alone.
       await this.underPublishLock(fileKey, () => this.publish(fileKey, mine, tag));
       return this.remember(doc);
+    } catch (e) {
+      // From here on a failed write may be the browser's or the download directory's, each worded where it happens:
+      // only one whose path is in this directory is this cache's.
+      const { path: at, dest } = (e ?? {}) as { path?: unknown; dest?: unknown };
+      throw [dest, at].some((p) => typeof p === "string" && dirname(p) === this.dir) ? unkept(e) : e;
     } finally {
       // The lease goes only once the export it announces has written the file, which is what lets another process
       // read the lease being gone as that export's work being on disk.
       dropLease(lease);
-      rmSync(mine, { force: true });
+      // In a directory that stopped taking writes this throws too, and would stand in for the error that said so: the
+      // file is left to a later sweep instead.
+      try {
+        rmSync(mine, { force: true });
+      } catch {}
     }
   }
 
@@ -331,7 +387,7 @@ export class SnapshotStore {
    * Best effort past the swap: an export is never failed for its history. Without hard links (FAT, some network
    * mounts) nothing is kept; where the old previous cannot be replaced it stays as it was, older than it should be but
    * dated by its own time, which figma_diff reports. The staging name is the shape cleanStaleDownloads sweeps, for a
-   * crash in between.
+   * crash in between, with the export's pid and tag, so its lease keeps the sweep off it until then.
    */
   private publish(fileKey: string, mine: string, tag: string) {
     const staged = `${this.previousPath(fileKey)}.${process.pid}.${tag}.tmp`;
@@ -364,13 +420,25 @@ export class SnapshotStore {
    *
    * Where no link can be made because this process may not write the cache (a read-only sandbox, a mount it can only
    * read), the pair is read in place instead (see previousInPlace): a key whose snapshot is fresh is answered without
-   * writing anything (see load), and diff previous is such an answer.
+   * writing anything (see load), and diff previous is such an answer. So it is where the lease that keeps a sweep off
+   * the links cannot be taken, even in a cache that would take the links: a link without it is a file another
+   * process's sweep may delete while it is being read.
    */
   async previousOf(fileKey: string, current: FigDocument): Promise<FigDocument | undefined> {
     const tag = Math.random().toString(36).slice(2, 8);
-    // The shape cleanStaleDownloads sweeps, for a crash before they are removed below.
+    // The shape cleanStaleDownloads sweeps, for a crash before they are removed below. A link carries the mtime of the
+    // snapshot it names, older than any sweep, so this lease, taken before the first link and given up once the last
+    // is gone, is what keeps a sweep in another process off them while they are read (see stagedByLiveOwner).
     const now = `${this.figPath(fileKey)}.${process.pid}.${tag}.tmp`;
     const was = `${this.previousPath(fileKey)}.${process.pid}.${tag}.tmp`;
+    let lease: string;
+    try {
+      lease = takeLease(readerLeases(this.dir, fileKey), `${process.pid}-${Date.now()}-${tag}`);
+    } catch (e) {
+      // No lease, no links.
+      if (mayNotWrite(e)) return this.previousInPlace(fileKey, current);
+      throw e;
+    }
     try {
       const kept = await this.underPublishLock(fileKey, () => {
         try {
@@ -378,7 +446,7 @@ export class SnapshotStore {
         } catch (e) {
           const code = (e as NodeJS.ErrnoException).code;
           if (code === "ENOENT") return "none";
-          if (code === "EROFS" || code === "EACCES" || code === "EPERM") return "unwritable";
+          if (mayNotWrite(e)) return "unwritable";
           throw e;
         }
         try {
@@ -401,6 +469,7 @@ export class SnapshotStore {
     } finally {
       rmSync(now, { force: true });
       rmSync(was, { force: true });
+      dropLease(lease);
     }
   }
 

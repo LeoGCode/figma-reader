@@ -494,6 +494,16 @@ describe("figma_get_text", () => {
     assert.deepEqual([scoped.total, scoped.byPage], [5, undefined]);
   });
 
+  it("reads the document's own id as the whole file, page filters, shared limit and byPage included", async () => {
+    // It is on no page, so page and exclude_pages were dropped without a word and every page was read in one piece.
+    for (const args of [{}, { exclude_pages: ["Design system"] }, { page: "Product" }, { limit: 4 }]) {
+      const whole = await call("figma_get_text", { file: paged, ...args });
+      for (const root of ["0:0", "0-0"]) assert.deepEqual(await call("figma_get_text", { file: paged, node_id: root, ...args }), whole, `${root} ${JSON.stringify(args)}`);
+    }
+    const rest = await call("figma_get_text", { file: paged, node_id: "0:0", exclude_pages: ["Design system"] });
+    assert.deepEqual([rest.total, rest.excludedPages, Object.keys(rest.byPage)], [8, ["Design system"], ["Archive", "Product"]]);
+  });
+
   it("refuses a page the file does not have, and a node off the page asked for or on one left out", async () => {
     await assert.rejects(call("figma_get_text", { file: paged, page: "Nope" }), /no page named "Nope"; pages: "Design system", "Archive", "Product", "Empty"/);
     await assert.rejects(call("figma_get_text", { file: paged, exclude_pages: ["Nope"] }), /no page named "Nope" to exclude/);

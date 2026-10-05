@@ -243,6 +243,7 @@ describe("paths in diff and changes, where a name holds the separator", () => {
   // split wrong carries the ids of the layers it names, from the file it describes: a removed layer's are the old one's.
   const T = Date.parse("2026-10-01T00:00:00Z") / 1000;
   const page: TestNode = { id: "0:1", type: "CANVAS", parent: "0:0", name: "Screens" };
+  const archive: TestNode = { id: "0:2", type: "CANVAS", parent: "0:0", name: "Archive" };
   const old = figDoc([
     page,
     { id: "1:1", type: "SECTION", parent: "0:1", name: "Flow / v1" },
@@ -250,6 +251,9 @@ describe("paths in diff and changes, where a name holds the separator", () => {
     { id: "1:3", type: "FRAME", parent: "1:1", name: "Moving" },
     { id: "1:4", type: "FRAME", parent: "0:1", name: "Plain" },
     { id: "1:6", type: "FRAME", parent: "0:1", name: "Clean" },
+    { id: "1:7", type: "FRAME", parent: "0:1", name: "Shipped" },
+    archive,
+    { id: "2:1", type: "SECTION", parent: "0:2", name: "Flow / v2" },
   ]);
   const cur = figDoc([
     page,
@@ -258,6 +262,10 @@ describe("paths in diff and changes, where a name holds the separator", () => {
     { id: "1:4", type: "FRAME", parent: "0:1", name: "Plain / renamed", editInfo: { createdAt: T - 9, lastEditedAt: T + 5 } },
     { id: "1:5", type: "FRAME", parent: "1:1", name: "New", editInfo: { createdAt: T + 10, lastEditedAt: T + 10 } },
     { id: "1:6", type: "FRAME", parent: "0:1", name: "Clean", editInfo: { createdAt: T - 9, lastEditedAt: T + 1 } },
+    archive,
+    { id: "2:1", type: "SECTION", parent: "0:2", name: "Flow / v2" },
+    // Into a section on another page whose name holds the separator: the destination is the side that needs ids.
+    { id: "1:7", type: "FRAME", parent: "2:1", name: "Shipped" },
   ]);
   const where = (e: Record<string, any>) => [e.id, e.path, e.pathIds];
 
@@ -267,9 +275,18 @@ describe("paths in diff and changes, where a name holds the separator", () => {
     assert.deepEqual(d.layers.removed.map(where), [["1:2", "Screens / Flow / v1 / Gone", ["0:1", "1:1", "1:2"]]]);
     assert.deepEqual(d.removedNodes.map(where), [["1:2", "Screens / Flow / v1 / Gone", ["0:1", "1:1", "1:2"]]]);
     assert.deepEqual(d.layers.renamed.map(where), [["1:4", "Screens / Plain / renamed", ["0:1", "1:4"]]]);
-    const [moved] = d.layers.moved;
-    assert.deepEqual(moved.from, { page: "Screens", parentId: "1:1", path: "Screens / Flow / v1 / Moving", pathIds: ["0:1", "1:1", "1:3"] });
-    assert.deepEqual(moved.to, { page: "Screens", parentId: "0:1", path: "Screens / Moving" });
+    assert.deepEqual(d.layers.moved, [
+      {
+        id: "1:3", type: "FRAME", name: "Moving",
+        from: { page: "Screens", parentId: "1:1", path: "Screens / Flow / v1 / Moving", pathIds: ["0:1", "1:1", "1:3"] },
+        to: { page: "Screens", parentId: "0:1", path: "Screens / Moving" },
+      },
+      {
+        id: "1:7", type: "FRAME", name: "Shipped",
+        from: { page: "Screens", parentId: "0:1", path: "Screens / Shipped" },
+        to: { page: "Archive", parentId: "2:1", path: "Archive / Flow / v2 / Shipped", pathIds: ["0:2", "2:1", "1:7"] },
+      },
+    ]);
   });
 
   it("gives changes' layers the same", () => {

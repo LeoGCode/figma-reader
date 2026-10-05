@@ -12,7 +12,7 @@ export interface DevStatusEntry extends DevStatus {
   name: string;
   page: string;
   path: string;
-  /** Only where a name in path holds " / " (see FigDocument.pathFields). */
+  /** Only where path does not split back into its names on " / " (see FigDocument.pathFields). */
   pathIds?: string[];
 }
 

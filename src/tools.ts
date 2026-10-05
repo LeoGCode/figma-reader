@@ -255,7 +255,7 @@ const EXPORTED_AT_NOTE =
  * Said in the description of every tool whose entries carry path, which cannot always be split back into its layers:
  * see FigDocument.pathFields.
  */
-const PATH_NOTE = "Where a name in path holds ' / ' itself, pathIds follows it: one id per name, page first.";
+const PATH_NOTE = "Where path does not split on ' / ' into its names, pathIds follows it: one id per name, page first.";
 /** Missing components listed by figma_get_text; the rest are counted, never dropped silently. */
 const MAX_UNRESOLVED_GROUPS = 20;
 
@@ -1082,7 +1082,11 @@ tool(
   async ({ file, node_id, page, exclude_pages, fields, limit, include_hidden, refresh }) => {
     const { doc, dated, urlNodeId } = await open(file, refresh);
     const id = node_id ?? urlNodeId;
-    const scope = id ? doc.require(id) : undefined;
+    const asked = id ? doc.require(id) : undefined;
+    // The document's own id is the whole file, and is read as one: it is on no page, so neither page nor exclude_pages
+    // had anything to check it against, and both were dropped in silence while every page (the internal-only one too)
+    // was scanned in one piece, with the first pages taking the limit again.
+    const scope = asked?.id === doc.rootId ? undefined : asked;
     const pages = doc.pages();
     // The project's excludePages is not read here. It is there for pages whose hits fill a search's limit, and the
     // limit below is shared between pages, so no page fills it any more; what a whole-file get-text is asked for is an

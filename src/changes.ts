@@ -28,8 +28,8 @@ export function topLevelLayers(doc: FigDocument, page: FigNode): FigNode[] {
   return out;
 }
 
-// A path with pathIds where a name in it holds " / " (see FigDocument.pathFields): a removed layer's ids are the old
-// file's, where figma_locate finds them.
+// A path with pathIds where it does not split back into its names (see FigDocument.pathFields): a removed layer's ids
+// are the old file's, where figma_locate finds them.
 const entry = (doc: FigDocument, n: FigNode): Raw => ({ id: n.id, type: displayType(n), name: n.name, page: doc.pageOf(n)?.name, ...doc.pathFields(n) });
 const place = (doc: FigDocument, n: FigNode): Raw => ({ page: doc.pageOf(n)?.name, parentId: n.parentId, ...doc.pathFields(n) });
 

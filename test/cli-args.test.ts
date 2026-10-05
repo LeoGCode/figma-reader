@@ -58,7 +58,12 @@ test("--no-<list> gives a list as empty, the one way to write [] without --json"
   bad(["--no-types", "--types", "FRAME"], /--no-types gives types as an empty list, but it was also given \["FRAME"\]/);
   bad(["--type", "FRAME", "--no-type"], /--no-type gives types as an empty list, but it was also given \["FRAME"\]/);
   bad(["--json", '{"types":["TEXT"]}', "--no-types"], /--no-types gives types as an empty list, but it was also given \["TEXT"\]/);
-  bad(["--no-types", "--json", '{"types":"TEXT"}'], /--no-types gives types as an empty list, but it was also given "TEXT"/);
+  // Anything --json gives that is not a list is refused too, on either side: null was taken for unset before it.
+  for (const v of ["null", '"TEXT"', "5", "false", "{}"]) {
+    const given = new RegExp(`--no-types gives types as an empty list, but it was also given ${v.replace(/[{}]/g, "\\$&")}$`);
+    bad(["--json", `{"types":${v}}`, "--no-types"], given);
+    bad(["--no-types", "--json", `{"types":${v}}`], given);
+  }
   // An empty value is still bad usage, and says what gives an empty list on purpose.
   bad(["--types="], /^--types needs at least one value; --no-types gives an empty list$/);
   // Only switches and lists have a --no- form.

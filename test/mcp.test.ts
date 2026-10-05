@@ -8,11 +8,14 @@ import { join } from "node:path";
 import { findProjectConfig } from "../src/account.ts";
 import { FigDocument } from "../src/fig-file.ts";
 import { Normalizer } from "../src/normalize.ts";
+import { extractVariables } from "../src/tokens.ts";
 import { figBytes, type TestNode } from "./fixtures.ts";
 
 const root = mkdtempSync(join(tmpdir(), "figma-reader-mcp-"));
 after(() => rmSync(root, { recursive: true, force: true }));
 mkdirSync(join(root, "home"));
+/** A real export with variables, which this repo ships for tests. */
+const realExport = join(import.meta.dirname, "files", "real-export.fig");
 const FRAMES = 20_000;
 const fig = join(root, "big.fig");
 writeFileSync(fig, figBytes([
@@ -224,12 +227,18 @@ test("results are compact JSON, and text stays as the tool wrote it", async () =
     call(3, "figma_get_node", { file: fig, node_id: "0:1", depth: 0 }),
     call(4, "figma_load_file", { file: fig }),
     call(5, "figma_get_tree", { file: fig, depth: 0 }),
+    // An answer that is a JSON array, not an object: the variable collections of a real export.
+    call(6, "figma_get_variables", { file: realExport }),
   ]);
-  for (const id of [2, 3, 4]) {
+  for (const id of [2, 3, 4, 6]) {
     const text: string = answers.get(id)!.result.content[0].text;
     assert.equal(text, JSON.stringify(JSON.parse(text)), `answer ${id} is indented`);
   }
   assert.equal(JSON.parse(answers.get(2)!.result.content[0].text).results.length, 3);
+  // The same value as the tool's own answer, only without the indentation.
+  const variables = JSON.parse(answers.get(6)!.result.content[0].text);
+  assert.ok(Array.isArray(variables) && variables.length > 0, "the export defines variable collections");
+  assert.deepEqual(variables, JSON.parse(JSON.stringify(extractVariables(FigDocument.fromFile("k", realExport, new Date())))));
   // get-tree's outline is text: its lines and their indentation are the answer.
   assert.match(answers.get(5)!.result.content[0].text, /^# \{"fileModifiedAt":"[^"]+"\}\n- 0:1 PAGE "Page"/);
 });

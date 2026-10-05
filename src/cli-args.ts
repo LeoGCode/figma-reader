@@ -117,8 +117,10 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
     if (negate && inline !== undefined) throw new UsageError(`${flag} takes no value`);
     if (p.type === "array" && negate) {
       // Whatever else gives the list values is a contradiction, said once the whole command line is read (below).
+      // Only an unset list starts empty: ??= took a null from --json for unset too, so {"exclude_pages":null} passed
+      // before --no-exclude-page and was refused after it.
       emptied.set(key, flag);
-      out[key] ??= [];
+      if (out[key] === undefined) out[key] = [];
     } else if (p.type === "boolean") {
       const on = inline === undefined || TRUE.test(inline);
       if (!on && !FALSE.test(inline!)) throw new UsageError(`${flag} takes true/false, got ${JSON.stringify(inline)}`);

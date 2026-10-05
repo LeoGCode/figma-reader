@@ -767,7 +767,10 @@ tool(
         "every text hit is a TEXT node; an empty list is no filter at all",
     ),
     include_text: z.boolean().optional().describe("Also match text content, including text rendered inside instances"),
-    node_id: z.string().optional().describe("Search only this node and everything under it, like 12:34 (or 12-34); a node-id in the file URL is used when it is omitted"),
+    node_id: z.string().optional().describe(
+      "Search only this node and everything under it, like 12:34 (or 12-34); a node-id in the file URL is used when it is " +
+        "omitted, and the document's own id (0:0) is the whole file",
+    ),
     page: z.string().optional().describe("Restrict to page name"),
     exclude_pages: z.array(z.string()).optional().describe(
       "Pages to skip, by name as page takes it. They are left out while walking, so their hits neither fill the limit nor " +
@@ -783,7 +786,11 @@ tool(
     // fileArg promises a node-id in the URL is used when node_id is omitted; search used to ignore it, so pasting a
     // frame's URL searched the whole file and said nothing about it.
     const scopeId = node_id ?? urlNodeId;
-    const scope = scopeId ? doc.require(scopeId) : undefined;
+    const asked = scopeId ? doc.require(scopeId) : undefined;
+    // The document's own id is the whole file, as figma_get_text reads it, project excludePages and all. As a node to
+    // scope to it is on no page, so every page was skipped as not the node's page, and the search answered that
+    // nothing matched with nothing to say it had looked nowhere.
+    const scope = asked?.id === doc.rootId ? undefined : asked;
     const scopePage = scope && doc.pageOf(scope);
     const { re, as } = searchPattern(query, { regex, caseSensitive: case_sensitive });
     // An empty list means no filter: as a filter it would match nothing.

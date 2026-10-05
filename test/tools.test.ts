@@ -285,6 +285,18 @@ describe("figma_search page exclusion", () => {
     assert.deepEqual(Object.keys(await call("figma_search", { file: plain, query: "request" })).filter((k) => k.startsWith("excluded")), []);
   });
 
+  it("reads the document's own id as the whole file, the project's excludePages included", async () => {
+    // As a node to scope to, 0:0 is on no page: every page was skipped as not its page, and the answer was no hits.
+    for (const args of [{}, { page: "Screens" }, { exclude_pages: [] }, { exclude_pages: ["Templates"] }]) {
+      const whole = await call("figma_search", { file: archived, query: "request", ...args });
+      for (const node_id of ["0:0", "0-0"]) {
+        assert.deepEqual(await call("figma_search", { file: archived, query: "request", node_id, ...args }), whole, `${node_id} ${JSON.stringify(args)}`);
+      }
+      assert.ok(whole.total > 0, JSON.stringify(args));
+    }
+    assert.deepEqual((await call("figma_search", { file: archived, query: "request", node_id: "0:0" })).excludedPages, ["Archive"]);
+  });
+
   it("replaces the project's list with the call's, and an empty one searches everything", async () => {
     const own = await call("figma_search", { file: archived, query: "request", exclude_pages: ["Templates"], limit: 3 });
     assert.deepEqual([own.total, pages(own), own.excludedPages, own.excludedPagesFrom], [7, ["Archive"], ["Templates"], undefined]);

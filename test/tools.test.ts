@@ -10,6 +10,8 @@ import { join } from "node:path";
 import { deflateSync, zipSync } from "fflate";
 import { compileSchema, encodeBinarySchema, parseSchema } from "kiwi-schema";
 import { z } from "zod";
+import { FigDocument } from "../src/fig-file.ts";
+import { outline } from "../src/outline.ts";
 import { guid, nodeChanges, type TestNode } from "./fixtures.ts";
 
 const root = mkdtempSync(join(tmpdir(), "figma-reader-tools-"));
@@ -363,10 +365,18 @@ describe("dating a result", () => {
       const r = await call(name, { file, ...args });
       assert.equal(r.fileModifiedAt, taken.toISOString(), name);
       assert.equal(r.exportedAt, undefined, `${name} called a file it did not export a snapshot`);
+      // No login and no account's cache had any part in reading it, so naming one would claim one did.
+      assert.equal(r.account, undefined, `${name} named an account for a file no account read`);
     }
     // The age of a copy is not the age of the design, so nothing here reports one for a file we did not export.
     const loaded = await call("figma_load_file", { file });
     assert.deepEqual([loaded.source, loaded.snapshotAgeMinutes], ["local", undefined]);
+    // get-tree answers in text, so it was the one reading tool with nothing to date it by. It now leads with a header
+    // line holding the same field, and the outline under it is exactly what it was.
+    const [header, ...rest] = (await body("figma_get_tree", { file })).split("\n");
+    assert.equal(header, `# ${JSON.stringify({ fileModifiedAt: taken.toISOString() })}`);
+    const doc = FigDocument.fromFile("dated", file, taken);
+    assert.equal(rest.join("\n"), outline(doc, doc.get(doc.rootId)!, 2, 400));
   });
 
   it("follows the file, so a copy replaced on disk is not still dated by the old one", async () => {
@@ -394,6 +404,54 @@ describe("dating a result", () => {
     const r = await call("figma_search", { file, query: "Label", refresh: true });
     assert.equal(r.refreshIgnored, true);
     assert.equal((await call("figma_search", { file, query: "Label" })).refreshIgnored, undefined);
+    // get-tree takes refresh too, and says so in its header.
+    assert.equal(JSON.parse((await body("figma_get_tree", { file, refresh: true })).split("\n")[0].slice(2)).refreshIgnored, true);
+  });
+});
+
+// A key whose snapshot is in this account's cache is answered the way an export is, minus the browser: so these are
+// the answers an export gives. Every one names the account it was read through. An agent run from a scratch
+// directory read a client file through the wrong login twice, and nothing in any answer said which login it was.
+describe("an answer through the account's snapshot cache", () => {
+  const key = "CACHEDKEY123";
+  const snapshot = join(root, "cache", "accounts", "tools-test", `${key}.fig`);
+  copyFileSync(figFile("cached", [page, { id: "1:1", type: "TEXT", parent: "0:1", name: "Label", textData: { characters: "hi" } }]), snapshot);
+  // Younger than FIGMA_SNAPSHOT_MAX_AGE_MIN's 30, so it is served rather than exported again; in whole seconds, for a
+  // filesystem that keeps no finer time.
+  const exported = new Date(Math.floor(Date.now() / 1000) * 1000 - 5 * 60_000);
+  utimesSync(snapshot, exported, exported);
+  const named = { name: "tools-test", source: "FIGMA_ACCOUNT" };
+
+  it("names the account beside exportedAt in every dated result", async () => {
+    for (const [name, args] of [
+      ["figma_load_file", {}],
+      ["figma_get_node", { node_id: "0:1" }],
+      ["figma_search", { query: "Label" }],
+      ["figma_get_text", {}],
+      ["figma_token_usage", {}],
+      ["figma_get_components", {}],
+    ] as [string, Record<string, unknown>][]) {
+      const r = await call(name, { file: key, ...args });
+      assert.equal(r.exportedAt, exported.toISOString(), name);
+      assert.deepEqual(r.account, named, name);
+    }
+    assert.deepEqual((await call("figma_load_file", { file: `https://www.figma.com/design/${key}/Cached` })).account, named, "a URL is the same key");
+  });
+
+  it("gives get-tree a header with both, and leaves the outline as it was", async () => {
+    const [header, ...rest] = (await body("figma_get_tree", { file: key })).split("\n");
+    assert.equal(header, `# ${JSON.stringify({ exportedAt: exported.toISOString(), account: named })}`);
+    const doc = FigDocument.fromFile(key, snapshot, exported);
+    assert.equal(rest.join("\n"), outline(doc, doc.get(doc.rootId)!, 2, 400));
+  });
+
+  it("names the account in an error from figma.com as well", async () => {
+    // A file that is "not found" there may only be one this login cannot see, so the error is where the account
+    // matters most. The export fails here because no browser can start.
+    await assert.rejects(
+      byName.get("figma_get_tree")!.run({ file: key, refresh: true }),
+      (e: Error) => /browser/i.test(e.message) && e.message.endsWith(' [account "tools-test" (source: FIGMA_ACCOUNT)]'),
+    );
   });
 });
 
@@ -461,12 +519,14 @@ describe("the defaults", () => {
 
   it("show a page, its top-level layers and one level under those", async () => {
     const file = figFile("tree", [page, ...chain(4, "0:1")]);
-    const tree = await body("figma_get_tree", { file });
+    // The first line is the header (see "dating a result"); the outline is the rest.
+    const [header, ...tree] = (await body("figma_get_tree", { file })).split("\n");
+    assert.match(header, /^# \{/);
     // Three levels from a document start, not two: with no node_id the pages themselves are level 0.
-    assert.deepEqual(tree.split("\n").map((l) => l.trim().split(" ")[1]), ["0:1", "1:1", "1:2"]);
+    assert.deepEqual(tree.map((l) => l.trim().split(" ")[1]), ["0:1", "1:1", "1:2"]);
     // The layer the cut-off stopped at says what is under it, so nothing is missing in silence.
-    assert.match(tree, /- 1:2 FRAME "level 2" \(1 children\)/);
-    assert.equal(await body("figma_get_tree", { file, node_id: "1:1", depth: 0 }), '- 1:1 FRAME "level 1" (1 children)');
+    assert.match(tree[2], /- 1:2 FRAME "level 2" \(1 children\)/);
+    assert.equal((await body("figma_get_tree", { file, node_id: "1:1", depth: 0 })).split("\n")[1], '- 1:1 FRAME "level 1" (1 children)');
   });
 
   it("give a node three levels of children, and refuse to answer with 200 KB", async () => {

@@ -105,6 +105,17 @@ export function resolveAccount(env: NodeJS.ProcessEnv = process.env, cwd = proce
 }
 
 /**
+ * The accounts that make the fallback to "default" a guess: nothing chose an account here, and these exist besides
+ * it. "default" is then whichever login was set up first, often a personal one, and a call from a directory outside
+ * the project (an agent's scratch directory) read client files through it with nothing in the answer to say so.
+ * Empty when an account was chosen, "default" included (FIGMA_ACCOUNT, --account, a project file), or when "default"
+ * is the only account there is, which is the setup every single-login machine has and keeps working as it did.
+ */
+export function otherAccounts(resolved: ResolvedAccount, accounts = listAccounts()): string[] {
+  return resolved.source === "default" ? accounts.filter((n) => n !== DEFAULT_ACCOUNT) : [];
+}
+
+/**
  * Bind a directory to an account, keeping the file's other settings. When the directory has no file yet but one above
  * it applies, the new file starts as a copy of that one (relative filesDirs rebased): a nearer file shadows the one
  * above completely, so writing only the account would silently drop the project's filesDirs here.

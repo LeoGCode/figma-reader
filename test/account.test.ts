@@ -5,7 +5,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  accountCacheDir, accountDir, accountProfileDir, appRoot, CONFIG_FILE, findProjectConfig, resolveAccount, writeProjectAccount,
+  accountCacheDir, accountDir, accountProfileDir, appRoot, CONFIG_FILE, findProjectConfig, otherAccounts, resolveAccount,
+  writeProjectAccount,
 } from "../src/account.ts";
 
 const roots: string[] = [];
@@ -33,6 +34,18 @@ const project = (config?: object) => {
 test("no project file and no env is the default account", { skip: strayConfig && `${strayConfig} is above the temp dir` }, () => {
   const { nested } = project();
   assert.deepEqual(resolveAccount({}, nested), { name: "default", source: "default", config: undefined });
+});
+
+test("default is a guess only when nothing chose it and another account exists", () => {
+  // The fallback is whichever login was set up first; beside another account it may well be the wrong one, and
+  // otherAccounts is what makes a call through figma.com refuse it (see tools.ts).
+  const fallback = { name: "default", source: "default" } as const;
+  assert.deepEqual(otherAccounts(fallback, ["acme", "default", "personal"]), ["acme", "personal"]);
+  assert.deepEqual(otherAccounts(fallback, ["default"]), [], "the only account there is is no guess");
+  assert.deepEqual(otherAccounts(fallback, []), [], "nor is one never logged in");
+  // A choice is a choice, default included, however many accounts there are.
+  assert.deepEqual(otherAccounts({ name: "default", source: "env" }, ["acme", "default"]), []);
+  assert.deepEqual(otherAccounts({ name: "acme", source: "project" }, ["acme", "default"]), []);
 });
 
 test("the nearest project file above the working directory picks the account", () => {

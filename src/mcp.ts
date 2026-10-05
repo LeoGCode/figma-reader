@@ -3,8 +3,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { release, tools } from "./tools.ts";
+import { release, servingMcp, tools } from "./tools.ts";
 import { version } from "./version.ts";
+
+// The account was resolved when tools.ts loaded, for the life of this server, and no tool takes --account: a call
+// refused for want of one has to tell the client to fix the server's env or directory instead.
+servingMcp();
 
 const server = new McpServer({ name: "figma-reader", version });
 

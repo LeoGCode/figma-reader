@@ -58,7 +58,7 @@ MCP tool names and CLI commands map one to one: `figma_get_tree` is `figma-reade
 | `figma_login` | Open the visible login window / wait for login |
 | `figma_list_files` | Local `.fig` files or recently viewed files. Always an envelope: `returned` / `total` / `truncated` (default limit 30), `searchedDirs` for a local listing, `totalUnfiltered` when `query` left files out |
 | `figma_load_file` | Export + decode, summary (pages, counts, collections, styles) |
-| `figma_get_tree` | Compact layer outline |
+| `figma_get_tree` | Compact layer outline, under a one-line `# {...}` header that dates it (and names the account, for a key or URL) |
 | `figma_get_node` | Normalized design data: geometry, fills/strokes/effects, auto-layout, text runs, instance props, bound variables, style names |
 | `figma_search` | Find nodes by name / text; with `include_text` the text rendered inside component instances is matched too, each hit tagged with `via` and whichever of `component` / `variant` / `frame` apply. The query is a case-insensitive literal substring: `Icons/Arrow/Left` and `/Card [v2]/` find the layers named that. `regex: true` reads it as a pattern instead, bare or `/pattern/flags`, and an invalid pattern is an error; `case_sensitive: true` matches case. The result's `queryAs` says which was used. A hit's `characters` is a preview, the first 120 characters followed by `...` and flagged `charactersTruncated` (`truncated` beside it counts results, not characters). A `types` list without TEXT turns `include_text` off, and `unresolvedInstances` is there only when the text pass ran. `node_id` (or a `node-id` in the URL) searches only that node's subtree and is echoed back as `searchedNode` |
 | `figma_get_variables` | Collections, modes, values, resolved aliases; `json`, `css`, `dtcg`. A file that defines none answers empty in the requested format; a `collection` no collection has is an error listing the ones it has |
@@ -83,7 +83,7 @@ Name saved copies `<anything> [<file key>].fig` (the key is the id after `/desig
 
 Then a pasted URL such as `https://www.figma.com/design/AbCdEf1234567890XyZ/My-App?node-id=8-77` is served from that file offline (newest match wins); node ids are identical. `refresh: true` ignores local copies and exports the live file, and is answered only by an export that begins after it was asked for, never by one already under way; on a path to a `.fig` there is nothing to export from, so it is ignored and the result says `refreshIgnored: true`.
 
-A dated result names the date after what it dates, because the two are not the same claim. `exportedAt` is the ISO-8601 time this tool exported that snapshot through the browser: report what the design said then rather than as current, and `figma_load_file` adds `source` and `snapshotAgeMinutes` beside it. A `.fig` the user supplied carries `fileModifiedAt` instead, that copy's own file time, and no age: copying, syncing or re-downloading the file resets it, so the design data can be older than the field says and nothing here can date it. Six tools date their results — `figma_load_file`, `figma_get_node`, `figma_search`, `figma_get_components`, `figma_token_usage`, `figma_get_text`. `figma_get_tree`, `figma_get_variables`, `figma_get_styles` and `figma_export_image_fills` answer with no date at all, so an answer built on them cannot be dated from the result.
+A dated result names the date after what it dates, because the two are not the same claim. `exportedAt` is the ISO-8601 time this tool exported that snapshot through the browser: report what the design said then rather than as current, and `figma_load_file` adds `source` and `snapshotAgeMinutes` beside it. A `.fig` the user supplied carries `fileModifiedAt` instead, that copy's own file time, and no age: copying, syncing or re-downloading the file resets it, so the design data can be older than the field says and nothing here can date it. Beside `exportedAt` stands `account`, the Figma account the snapshot was read through (see [Accounts](#accounts-one-figma-login-per-project)); a local `.fig` carries none. Seven tools date their results — `figma_load_file`, `figma_get_node`, `figma_search`, `figma_get_components`, `figma_token_usage`, `figma_get_text`, and `figma_get_tree`, whose first line is `# ` followed by the same fields as JSON (`# {"exportedAt":"…","account":{…}}`), with the outline unchanged below it. `figma_get_variables`, `figma_get_styles` and `figma_export_image_fills` answer with no date at all, since their answer is the data itself (a token file, a stylesheet, the images written), so an answer built on them cannot be dated from the result.
 
 `figma_screenshot` always renders the live file and works from a local path only when its name carries the key.
 
@@ -163,12 +163,16 @@ figma-reader accounts      # every account, its login and email, and which one t
 
 The same file serves the CLI and the MCP server: Claude Code and most MCP clients start the server in the project directory, so no extra MCP configuration is needed. The account is fixed when the server starts; after changing it, restart the server (in Claude Code, `/mcp`). `figma_status` reports the account in use and where the choice came from.
 
+Every answer that came through figma.com or the account's snapshot cache says which account it was: JSON results carry `"account": { "name": "acme", "source": "/home/me/work/acme-app/.figma-reader.json" }`, where `source` is `FIGMA_ACCOUNT` (which `--account` sets), the project file, or `default` when nothing chose one, plus `profileOverride` when `FIGMA_USER_DATA_DIR` or `FIGMA_CDP_URL` supplies the login. `get-tree` carries the same in its header line, a screenshot's note ends with it, and an error from figma.com names it in brackets. An answer read from a local `.fig` path names no account, since none takes part in reading it.
+
 Which account applies, first match wins:
 
 1. `--account <name>` on any CLI command
 2. `FIGMA_ACCOUNT`, e.g. in the MCP server's `env` for clients that do not start servers in the project directory
 3. `account` in the nearest `.figma-reader.json`
-4. `default`
+4. `default`, unless other accounts exist (below)
+
+`default` is only a fallback, and with other accounts in `<data>/accounts/` it is a guess: run from a directory outside the project, a call would read the project's files through whichever login was set up first. So when nothing chose an account and others exist, any call that needs figma.com or the snapshot cache (a file key or URL, `screenshot`, `login`, `list-files --source web`) fails before touching either, saying where no project file was found and which accounts exist; the CLI exits 2, as for bad usage. Run it from the project's directory, or pass `--account <name>` / set `FIGMA_ACCOUNT`; `--account default` (`FIGMA_ACCOUNT=default`) is the explicit way to use `default`. An MCP server resolves its account once, when it starts, so its tools say to set `FIGMA_ACCOUNT` in the server's `env` or start it in the project directory, then restart it. Local `.fig` paths, `status` (which reports the refusal as `webCallsRefused`), `accounts`, `use` and `help` work from any directory. With `default` the only account, or a login named by `FIGMA_USER_DATA_DIR` or `FIGMA_CDP_URL`, nothing is refused.
 
 `.figma-reader.json` can also set the project's `.fig` folders; relative paths resolve against the file's directory:
 
@@ -208,7 +212,7 @@ A managed browser is shared by all servers and CLI calls using the same profile 
 
 | Env | Default | |
 | --- | --- | --- |
-| `FIGMA_ACCOUNT` | from `.figma-reader.json`, else `default` | Account: which Figma login and snapshot cache to use |
+| `FIGMA_ACCOUNT` | from `.figma-reader.json`, else `default` (refused for figma.com while other accounts exist) | Account: which Figma login and snapshot cache to use |
 | `FIGMA_FILES_DIRS` | `filesDirs` from `.figma-reader.json`, else `~/Downloads` | Dirs scanned (2 levels) for `.fig` files, separated like `PATH` (`:`, `;` on Windows) |
 | `FIGMA_BROWSER_PATH` | Brave › Chromium › Chrome › Playwright | Browser executable |
 | `FIGMA_USER_DATA_DIR` | `<data>/accounts/<account>/profile-<browser>` | Browser profile holding the Figma login (one per browser: cookie keys differ). Without an account set, a custom profile gets its own cache |

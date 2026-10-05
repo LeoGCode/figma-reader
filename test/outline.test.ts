@@ -183,6 +183,13 @@ test("parents on one level share it evenly, and a level that cannot give each on
   assert.match(outline(two, root(two), 2, 6), /level 2 not shown/, "and one less does not");
 });
 
+test("a document with no visible page is an empty outline, not a level the budget left out", () => {
+  for (const nodes of [[], [{ id: "0:9", type: "CANVAS", parent: "0:0", name: "Internal", internalOnly: true }]] as TestNode[][]) {
+    const empty = figDoc(nodes);
+    assert.equal(outline(empty, root(empty), 2, 400), "", JSON.stringify(nodes));
+  }
+});
+
 test("a parent with one child needs no marker line to start a level", () => {
   // The needed max_nodes counts one line for an only child and two (a child and its marker) for more.
   const mixed = figDoc([

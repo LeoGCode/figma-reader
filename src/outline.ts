@@ -103,8 +103,10 @@ export function outline(doc: FigDocument, start: FigNode, depth: number, maxNode
     const take = share(counts, budget);
     // Every parent on the level got nothing (share starts a level for all of them or for none): the outline stops at
     // the level above in full, and "truncated, use a smaller depth" was false of it. To start the level, every parent
-    // needs one child shown, and one with more children a marker line besides.
-    if (take.every((t) => !t)) {
+    // needs one child shown, and one with more children a marker line besides. Only where there were children to
+    // withhold: a document with no visible page (none at all, or only the internal one) is a root group with nothing
+    // in it, which got nothing too and was reported as "level 0 not shown", fixed by max_nodes 1.
+    if (take.every((t) => !t) && counts.some((c) => c > 0)) {
       unstarted = { level: l, parents: level.length, left: budget, need: maxNodes - budget + counts.reduce((sum, c) => sum + linesFor(c, 1), 0) };
     }
     const next: typeof level = [];

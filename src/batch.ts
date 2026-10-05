@@ -1,8 +1,8 @@
 // figma-reader batch: many tool calls in one process. Every CLI call is a process of its own that decodes its file
 // again, which takes seconds on a large export: an agent reviewing a design ran some 130 of them, mostly in loops over
 // node ids, and spent 805 s of an 18 minute run inside figma-reader. A batch runs its calls in one process, where the
-// store keeps each decoded file for the next call and every web call shares one browser launch. Kept free of side
-// effects, like cli-args.ts, so it can be tested on its own: the tools are passed in.
+// store keeps the four decoded files used last for the next call, and every web call shares one browser launch. Kept
+// free of side effects, like cli-args.ts, so it can be tested on its own: the tools are passed in.
 import { checkArgs, commandName } from "./cli-args.ts";
 import { outPath, writePrivateTemp } from "./local-files.ts";
 import type { Tool } from "./tools.ts";
@@ -66,8 +66,10 @@ async function answer(line: string, byName: Map<string, Tool>): Promise<Outcome>
     // base64 in one line of the caller's context, and no shell tool reads a picture out of a JSON string.
     const images = res.content.flatMap((c) => {
       if (c.type !== "image") return [];
-      // The tool has already written it there, so this only says where that was.
-      if (typeof checked.save_path === "string") return [outPath(checked.save_path)];
+      // The tool has already written it there, so this only says where that was. An empty one is no path, as the
+      // tool and the command alone read it: reporting it resolved to the working directory, where nothing was saved.
+      const saved = typeof checked.save_path === "string" ? checked.save_path : "";
+      if (saved) return [outPath(saved)];
       return [writePrivateTemp(commandName(tool.name), c.mimeType.split("/")[1] ?? "bin", Buffer.from(c.data, "base64"))];
     });
     return { ok: true, result: value(text), ...(images.length ? { images } : {}) };
@@ -102,14 +104,15 @@ export async function runBatch(lines: AsyncIterable<string> | Iterable<string>, 
   return summary;
 }
 
-export const BATCH_SUMMARY = "Run tool calls given as JSON lines on stdin in one process, so each file is decoded once.";
+export const BATCH_SUMMARY = "Run tool calls given as JSON lines on stdin in one process, which keeps files decoded between calls.";
 
 export function batchUsage(bin: string): string {
   return [
     `Usage: ${bin} batch < calls.jsonl`,
     "",
-    "Run many tool calls in one process, so a file is decoded once for all of them rather than once per call (seconds",
-    "for a large file), and web calls share one browser. Each line of stdin is one call, run in order:",
+    "Run many tool calls in one process, so a file is not decoded again for every call (seconds for a large file),",
+    "and web calls share one browser. The process keeps the four files used last decoded, so each file is decoded",
+    "once while at most four are in play: group calls by file. Each line of stdin is one call, run in order:",
     "",
     '  {"tool": "get-text", "args": {"file": "app.fig", "node_id": "1:2"}}',
     "",

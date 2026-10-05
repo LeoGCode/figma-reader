@@ -1,13 +1,14 @@
 // figma-reader batch, run in this process against the real tools so that decodes can be counted: a batch exists to
-// decode each file once, and one that decoded per line would answer exactly the same, only as slowly as separate
-// processes. test/cli.test.ts runs the command itself, over stdin.
+// decode each file once (while at most four are in play), and one that decoded per line would answer exactly the
+// same, only as slowly as separate processes. test/cli.test.ts runs the command itself, over stdin.
 import { after, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join } from "node:path";
 import { z } from "zod";
 import { FigDocument } from "../src/fig-file.ts";
+import { FigmaWeb } from "../src/figma-web.ts";
 import { figBytes, type TestNode } from "./fixtures.ts";
 
 const root = mkdtempSync(join(tmpdir(), "figma-reader-batch-"));
@@ -122,6 +123,58 @@ describe("batch", () => {
     }
   });
 
+  it("reads a snapshot by its key and by its path from one decode, dating each the way it was named", async () => {
+    // A task pins itself to one snapshot by passing its path after reading by key, and the two names decoded the same
+    // file twice. How the file was named still decides the date: by key it is our export, by path a file like any.
+    const cache = join(root, "cache", "accounts", "batch-test");
+    mkdirSync(cache, { recursive: true });
+    const snapshot = (key: string) => {
+      const path = join(cache, `${key}.fig`);
+      writeFileSync(path, figBytes(nodes));
+      return path;
+    };
+    const keyFirst = snapshot("KEYFIRST1234");
+    const pathFirst = snapshot("PATHFIRST123");
+    const decode = mock.method(FigDocument, "fromFile");
+    try {
+      const { out, failed } = await batch([
+        line("locate", { file: "KEYFIRST1234", node_ids: ["1:1"] }),
+        line("locate", { file: keyFirst, node_ids: ["1:1"] }),
+        line("get-node", { file: keyFirst, node_id: "1:1", depth: 0 }),
+        line("locate", { file: pathFirst, node_ids: ["1:1"] }),
+        line("locate", { file: "PATHFIRST123", node_ids: ["1:1"] }),
+      ]);
+      assert.deepEqual(failed, []);
+      assert.deepEqual(decode.mock.calls.map((c) => basename(c.arguments[1])), ["KEYFIRST1234.fig", "PATHFIRST123.fig"]);
+      const taken = (path: string) => statSync(path).mtime.toISOString();
+      const dates = out.map((o) => [o.result.exportedAt, o.result.fileModifiedAt]);
+      assert.deepEqual(dates, [
+        [taken(keyFirst), undefined],
+        [undefined, taken(keyFirst)],
+        [undefined, taken(keyFirst)],
+        [undefined, taken(pathFirst)],
+        [taken(pathFirst), undefined],
+      ]);
+    } finally {
+      decode.mock.restore();
+    }
+  });
+
+  it("keeps four files decoded, so a batch over more decodes again the one it used longest ago", async () => {
+    // The bound the help and the README state: within four files each is decoded once, and a fifth evicts the file
+    // used longest ago, which is decoded again when it comes back. A smaller bound would decode the second round
+    // again; a larger one would not decode the first file a second time at the end.
+    const [f1, f2, f3, f4, f5] = ["held-1", "held-2", "held-3", "held-4", "held-5"].map((name) => fig(name));
+    const decode = mock.method(FigDocument, "fromFile");
+    try {
+      const { failed } = await batch([f1, f2, f3, f4, f1, f2, f3, f4, f5, f1].map((file) => line("locate", { file, node_ids: ["1:1"] })));
+      assert.deepEqual(failed, []);
+      assert.deepEqual(decode.mock.calls.map((c) => c.arguments[1]), [f1, f2, f3, f4, f5, f1].map((p) => realpathSync(p)));
+    } finally {
+      decode.mock.restore();
+    }
+  });
+
   it("answers each line with what the command alone prints: JSON as a value, text as a string", async () => {
     const { out, failed, answered } = await batch([line("get-tree", { file: a }), line("get-node", { file: a, node_id: "1:1", depth: 0 })]);
     assert.deepEqual([failed, answered], [[], 2]);
@@ -191,24 +244,33 @@ describe("batch", () => {
     assert.equal(ran, false);
   });
 
-  it("writes an image to a file and answers with its path, never inline", async () => {
+  it("writes an image to a file and answers with the path that holds it, never inline", async () => {
+    // The real screenshot tool, with only the capture in the browser replaced: the check is that the file a line
+    // names holds the image, so the tool's own write is under test along with the batch's.
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
-    const shot = {
-      name: "figma_screenshot",
-      description: "",
-      readOnly: false,
-      shape: { save_path: z.string().optional() },
-      run: async () => ({ content: [{ type: "image" as const, data: png.toString("base64"), mimeType: "image/png" }, { type: "text" as const, text: "node 1:1: 7x1" }] }),
-    };
-    const { out } = await batch([line("screenshot", {}), line("screenshot", { save_path: "out/shot.png" })], [shot]);
-    // Without a save path the image goes where the command alone puts it: a private temp file, named after it.
-    assert.equal(out[0].result, "node 1:1: 7x1");
-    assert.equal(out[0].images.length, 1);
-    assert.match(out[0].images[0], new RegExp(`^${join(root, "tmp").replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}.*screenshot-.*\\.png$`));
-    assert.deepEqual(readFileSync(out[0].images[0]), png);
-    assert.doesNotMatch(JSON.stringify(out[0]), new RegExp(png.toString("base64").slice(0, 8)));
-    // With one, the tool wrote it there, and the line says where that resolved to.
-    assert.deepEqual(out[1].images, [resolve("out/shot.png")]);
+    const capture = mock.method(FigmaWeb.prototype, "copyAsPng", async () => ({ base64: png.toString("base64"), width: 7, height: 1, originalWidth: 7, originalHeight: 1 }));
+    const shot = (save_path?: string) => line("screenshot", { file: "SHOTKEY12345", node_id: "1:1", ...(save_path === undefined ? {} : { save_path }) });
+    try {
+      const { out, failed } = await batch([shot(), shot(""), shot("~/shots/a.png"), shot(join(root, "out", "b.png"))]);
+      assert.deepEqual(failed, []);
+      assert.equal(capture.mock.callCount(), 4);
+      // Without a save path, and with an empty one, which the tool does not write to either, the image goes where the
+      // command alone puts it: a private temp file named after it. The empty one was answered with the working
+      // directory, where nothing had been saved.
+      const temp = new RegExp(`^${join(root, "tmp").replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}.*screenshot-.*\\.png$`);
+      for (const o of out.slice(0, 2)) assert.match(o.images[0], temp);
+      assert.notEqual(out[0].images[0], out[1].images[0]);
+      // With one, the tool wrote it there, and the line names where that resolved to, ~ included.
+      assert.deepEqual([out[2].images, out[3].images], [[join(root, "home", "shots", "a.png")], [join(root, "out", "b.png")]]);
+      for (const o of out) {
+        assert.equal(o.images.length, 1);
+        assert.deepEqual(readFileSync(o.images[0]), png, o.images[0]);
+        assert.match(o.result, /^node 1:1: 7x1/);
+        assert.doesNotMatch(JSON.stringify(o), new RegExp(png.toString("base64").slice(0, 8)));
+      }
+    } finally {
+      capture.mock.restore();
+    }
   });
 
   it("stops once nobody reads the answers", async () => {

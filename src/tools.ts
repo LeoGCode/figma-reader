@@ -12,7 +12,7 @@ import { componentUsage, componentUses } from "./component-usage.ts";
 import type { Raw } from "./fig-file.ts";
 import { cleanStaleDownloads, FigmaWeb, parseFileRef } from "./figma-web.ts";
 import { groupUnresolved, scanText } from "./instance-text.ts";
-import { imageExt, localFigFiles } from "./local-files.ts";
+import { imageExt, localFigFiles, outPath } from "./local-files.ts";
 import { bytesHex, displayType, Normalizer } from "./normalize.ts";
 import { outline } from "./outline.ts";
 import { searchPattern } from "./search-query.ts";
@@ -151,7 +151,7 @@ const json = (v: unknown) => text(JSON.stringify(v, null, 1));
  * tools taking such a path publish readOnlyHint: false, so the client asks the user rather than auto-approving.
  */
 function writeOut(path: string, content: string | Uint8Array) {
-  const abs = resolve(path.replace(/^~(?=\/)/, homedir()));
+  const abs = outPath(path);
   mkdirSync(dirname(abs), { recursive: true });
   writeFileSync(abs, content);
   return abs;

@@ -2,10 +2,12 @@
 // figma-reader: the same read-only Figma tools as the MCP server, as shell commands.
 // Text and JSON go to stdout, errors to stderr; images are written to files and their paths printed.
 import { writeSync } from "node:fs";
+import { createInterface } from "node:readline";
 import {
   accountProfileDir, checkAccountName, CONFIG_FILE, DEFAULT_ACCOUNT, expandHome, listAccounts, readAccountInfo,
   resolveAccount, writeProjectAccount,
 } from "./account.ts";
+import { BATCH_SUMMARY, batchUsage, runBatch } from "./batch.ts";
 import { defaultExecutable, profileHasLoginCookie } from "./browser.ts";
 import { commandName, commandUsage, parseArgs, UsageError, wantsHelp } from "./cli-args.ts";
 import { writePrivateTemp } from "./local-files.ts";
@@ -150,6 +152,9 @@ function overview() {
     "Accounts:",
     ...[...ACCOUNT_COMMANDS.values()].map((c) => `  ${c.usage.padEnd(width)}${c.description}`),
     "",
+    "Many calls in one process:",
+    `  ${"batch".padEnd(width)}${BATCH_SUMMARY}`,
+    "",
     `Every command takes --account <name> to override the account; this directory uses "${account.name}".`,
     "<file> is a local .fig path, a Figma file key, or a figma.com/design/... URL (its node-id is used when --node-id is omitted).",
     "Output is JSON or text on stdout. Images are written to --save-path, or to a temp file, and the path is printed.",
@@ -165,12 +170,38 @@ process.on("SIGTERM", () => void exit(143));
 
 if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
   const t = argv[0] ? byCommand.get(argv[0]) : undefined;
-  if (argv[0] && !t && !ACCOUNT_COMMANDS.has(argv[0])) {
+  if (argv[0] && !t && !ACCOUNT_COMMANDS.has(argv[0]) && argv[0] !== "batch") {
     console.error(`${BIN}: unknown command ${JSON.stringify(argv[0])}\n\n${overview()}`);
     await exit(2);
   }
-  console.log(t ? commandUsage(BIN, t) : argv[0] ? accountUsage(argv[0]) : overview());
+  console.log(t ? commandUsage(BIN, t) : argv[0] === "batch" ? batchUsage(BIN) : argv[0] ? accountUsage(argv[0]) : overview());
   await exit(0);
+}
+
+if (cmd === "batch") {
+  if (wantsHelp({}, argv)) {
+    console.log(batchUsage(BIN));
+    await exit(0);
+  }
+  if (argv.length) {
+    console.error(`${BIN} batch: unexpected argument ${JSON.stringify(argv[0])}; the calls are read from stdin.\nRun '${BIN} help batch' for usage.`);
+    await exit(2);
+  }
+  // Each answer waits until it has been handed to the OS, which is the backpressure a slow reader needs, and an error
+  // there (EPIPE, the reader is gone) is what stops the batch.
+  const write = (line: string) => new Promise<boolean>((done) => process.stdout.write(`${line}\n`, (e) => done(!e)));
+  try {
+    const { answered, failed } = await runBatch(createInterface({ input: process.stdin, crlfDelay: Infinity }), tools, write);
+    if (failed.length) {
+      const which = failed.length > 20 ? `${failed.slice(0, 20).join(", ")}, ...` : failed.join(", ");
+      console.error(`${BIN} batch: ${failed.length} of ${answered} calls failed (i = ${which})`);
+    }
+    await exit(failed.length ? 1 : 0);
+  } catch (e) {
+    // Only reading stdin can throw here, every call's own failure being its line's answer; the browser is released.
+    console.error(`${BIN} batch: ${e instanceof Error ? e.message : String(e)}`);
+    await exit(1);
+  }
 }
 
 const tool = byCommand.get(cmd);

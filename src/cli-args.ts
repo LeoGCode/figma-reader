@@ -133,7 +133,15 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
   // A required argument that is not a string (locate's --node-ids) is a flag that must be given, not a positional.
   const missing = required.filter((k) => out[k] === undefined).map((k) => (pos.includes(k) ? `<${k}>` : flagName(k)));
   if (missing.length) throw new UsageError(`missing ${missing.join(" ")}`);
-  const parsed = z.object(shape).strict().safeParse(out);
+  return checkArgs(shape, out);
+}
+
+/**
+ * Tool arguments checked against the tool's schema as strictly as the MCP server checks them: an unknown key is an
+ * error, not dropped. A batch line's arguments go through here too, so it refuses exactly what a single call does.
+ */
+export function checkArgs(shape: z.ZodRawShape, args: unknown): Record<string, unknown> {
+  const parsed = z.object(shape).strict().safeParse(args);
   if (!parsed.success) throw new UsageError(z.prettifyError(parsed.error));
   return parsed.data;
 }

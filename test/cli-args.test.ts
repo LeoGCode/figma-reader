@@ -156,6 +156,12 @@ test("--no-<list> empties only a list that may be empty, and help offers it only
   const text = { file: z.string(), fields: z.array(z.string()).min(1).optional(), exclude_pages: z.array(z.string()).optional() };
   assert.deepEqual(parseArgs(text, ["a.fig", "--no-exclude-page", "--fields", "id,text"]), { file: "a.fig", exclude_pages: [], fields: ["id", "text"] });
   assert.throws(() => parseArgs(text, ["a.fig", "--no-fields"]), (e) => e instanceof UsageError && e.message === "--no-fields: fields cannot be empty; leave --fields out for the default");
+  // A required list has no default to leave it to: locate without --node-ids is missing it, so the way out is a value.
+  const locate = { file: z.string(), node_ids: z.array(z.string()).min(1) };
+  for (const flag of ["--no-node-ids", "--no-node-id"]) {
+    assert.throws(() => parseArgs(locate, ["a.fig", flag]), (e) => e instanceof UsageError && e.message === `${flag}: node_ids cannot be empty; give --node-ids at least one value`);
+  }
+  assert.throws(() => parseArgs(locate, ["a.fig"]), (e) => e instanceof UsageError && e.message === "missing --node-ids");
   assert.throws(() => parseArgs(text, ["a.fig", "--fields="]), (e) => e instanceof UsageError && e.message === "--fields needs at least one value");
   assert.throws(() => parseArgs(text, ["a.fig", "--exclude-page="]), /--exclude-page needs at least one value; --no-exclude-page gives an empty list/);
   const usage = commandUsage("fr", { name: "figma_get_text", description: "Text.", shape: text });

@@ -124,7 +124,9 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
     if (!p) throw new UsageError(`unknown option ${flag}`);
     if (negate && inline !== undefined) throw new UsageError(`${flag} takes no value`);
     if (p.type === "array" && negate && !emptiable(p, required.includes(key))) {
-      throw new UsageError(`${flag}: ${key} cannot be empty; leave ${flagName(key)} out for the default`);
+      // A required list has no default to fall back on: "leave --node-ids out" only led on to "missing --node-ids".
+      const instead = required.includes(key) ? `give ${flagName(key)} at least one value` : `leave ${flagName(key)} out for the default`;
+      throw new UsageError(`${flag}: ${key} cannot be empty; ${instead}`);
     }
     if (p.type === "array" && negate) {
       // Whatever else gives the list values is a contradiction, said once the whole command line is read (below).

@@ -31,7 +31,7 @@ Read this before parsing a command the skill's Output list does not cover. Shape
 
 ## Flags
 
-Lists take commas (`--types FRAME,TEXT`) or repeat (`--exclude-page A --exclude-page B`), and a list flag with `no-` in front gives it empty: `--no-exclude-page` turns off the project's `excludePages` (which `search`, `diff` and `changes` apply when you give no `--page`). Booleans are bare. Every `<file>` command but `screenshot` takes `--refresh` (export again; ignored on a `.fig` path). `--json '<object>'` passes MCP argument names directly. `figma-reader help <command>` has the rest.
+Lists take commas (`--types FRAME,TEXT`) or repeat (`--exclude-page A --exclude-page B`), and a list flag with `no-` in front gives it empty (not `--fields`, which cannot be): `--no-exclude-page` turns off the project's `excludePages` (which `search`, `diff` and `changes` apply when you give no `--page`). Booleans are bare. Every `<file>` command but `screenshot` takes `--refresh` (export again; ignored on a `.fig` path). `--json '<object>'` passes MCP argument names directly. `figma-reader help <command>` has the rest.
 
 - `get-tree`: `--node-id`, `--depth` (2, pages being level 0), `--max-nodes` (400)
 - `get-node`: `--node-id`, `--depth` (3)

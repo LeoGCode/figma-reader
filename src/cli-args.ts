@@ -9,6 +9,7 @@ interface Prop {
   enum?: string[];
   description?: string;
   items?: { type?: string };
+  minItems?: number;
 }
 
 /** figma_get_tree -> get-tree */
@@ -28,6 +29,13 @@ function schemaOf(shape: z.ZodRawShape) {
  * --exclude-page Archive --exclude-page Old for exclude_pages. Only where no argument has the singular name itself.
  */
 const argName = (props: Record<string, Prop>, key: string) => (!props[key] && props[`${key}s`]?.type === "array" ? `${key}s` : key);
+
+/**
+ * Whether --no-<flag> may give this argument as an empty list: an optional list its schema lets be empty. get-text's
+ * fields cannot be ([] would keep no key at all), and its help offered --no-fields all the same, which the schema then
+ * refused in zod's words; the message for an empty --fields= pointed to it too.
+ */
+const emptiable = (p: Prop | undefined, required: boolean) => p?.type === "array" && !required && !(p.minItems && p.minItems > 0);
 
 /** The arguments that take a list, which a batch line or --json has to give as a JSON array. */
 export const listArguments = (shape: z.ZodRawShape): string[] =>
@@ -115,6 +123,9 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
     const p = props[key];
     if (!p) throw new UsageError(`unknown option ${flag}`);
     if (negate && inline !== undefined) throw new UsageError(`${flag} takes no value`);
+    if (p.type === "array" && negate && !emptiable(p, required.includes(key))) {
+      throw new UsageError(`${flag}: ${key} cannot be empty; leave ${flagName(key)} out for the default`);
+    }
     if (p.type === "array" && negate) {
       // Whatever else gives the list values is a contradiction, said once the whole command line is read (below).
       // Only an unset list starts empty: ??= took a null from --json for unset too, so {"exclude_pages":null} passed
@@ -136,7 +147,7 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
       // meant to be empty says so with --no-<flag>, so a value left empty by mistake (--exclude-page "$UNSET") never
       // turns off the project's excludePages.
       if (!items.length) {
-        throw new UsageError(`${flag} needs at least one value${required.includes(key) ? "" : `; --no-${flag.slice(2)} gives an empty list`}`);
+        throw new UsageError(`${flag} needs at least one value${emptiable(p, required.includes(key)) ? `; --no-${flag.slice(2)} gives an empty list` : ""}`);
       }
       // Whatever --json seeded is added to, so it has to be a list: a number threw a raw TypeError out of the CLI,
       // and a string was spread into its characters and then searched for as ["F","R","A","M","E"].
@@ -202,7 +213,7 @@ export function commandUsage(bin: string, tool: { name: string; description: str
     .flatMap(([k, p]) => [
       [`${flagName(k)}${kindOf(p)}`, p.description ?? ""],
       // The one way to give an optional list as empty, which is what turns off a default such as excludePages.
-      ...(p.type === "array" && !required.includes(k) ? [[`--no-${flagName(k).slice(2)}`, `Give ${k} as an empty list`]] : []),
+      ...(emptiable(p, required.includes(k)) ? [[`--no-${flagName(k).slice(2)}`, `Give ${k} as an empty list`]] : []),
     ]);
   // Shown on the usage line too, since under [options] alone a flag the command cannot run without reads as optional.
   const flags = required.filter((k) => !pos.includes(k)).map((k) => ` ${flagName(k)}${kindOf(props[k])}`);

@@ -229,8 +229,10 @@ test("results are compact JSON, and text stays as the tool wrote it", async () =
     call(5, "figma_get_tree", { file: fig, depth: 0 }),
     // An answer that is a JSON array, not an object: the variable collections of a real export.
     call(6, "figma_get_variables", { file: realExport }),
+    // get-text with only the keys asked for, which F2's fields made the cheapest answer: compact too.
+    call(7, "figma_get_text", { file: realExport, fields: ["id", "text"] }),
   ]);
-  for (const id of [2, 3, 4, 6]) {
+  for (const id of [2, 3, 4, 6, 7]) {
     const text: string = answers.get(id)!.result.content[0].text;
     assert.equal(text, JSON.stringify(JSON.parse(text)), `answer ${id} is indented`);
   }
@@ -239,6 +241,8 @@ test("results are compact JSON, and text stays as the tool wrote it", async () =
   const variables = JSON.parse(answers.get(6)!.result.content[0].text);
   assert.ok(Array.isArray(variables) && variables.length > 0, "the export defines variable collections");
   assert.deepEqual(variables, JSON.parse(JSON.stringify(extractVariables(FigDocument.fromFile("k", realExport, new Date())))));
+  const texts = JSON.parse(answers.get(7)!.result.content[0].text).text as object[];
+  assert.ok(texts.length > 0 && texts.every((t) => Object.keys(t).join() === "id,text"), "only the keys asked for");
   // get-tree's outline is text: its lines and their indentation are the answer.
   assert.match(answers.get(5)!.result.content[0].text, /^# \{"fileModifiedAt":"[^"]+"\}\n- 0:1 PAGE "Page"/);
 });

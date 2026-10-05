@@ -150,6 +150,19 @@ test("a required list is a flag the command cannot run without, and says so", ()
   assert.match(commandUsage("fr", { name: "figma_search", description: "Search.", shape }), /^ {2}--no-types +Give types as an empty list$/m);
 });
 
+test("--no-<list> empties only a list that may be empty, and help offers it only there", () => {
+  // get-text's fields cannot be empty ([] keeps no key): its help offered --no-fields, which the schema then refused in
+  // zod's words, and an empty --fields= pointed to it. exclude_pages beside it can be emptied, as search's can.
+  const text = { file: z.string(), fields: z.array(z.string()).min(1).optional(), exclude_pages: z.array(z.string()).optional() };
+  assert.deepEqual(parseArgs(text, ["a.fig", "--no-exclude-page", "--fields", "id,text"]), { file: "a.fig", exclude_pages: [], fields: ["id", "text"] });
+  assert.throws(() => parseArgs(text, ["a.fig", "--no-fields"]), (e) => e instanceof UsageError && e.message === "--no-fields: fields cannot be empty; leave --fields out for the default");
+  assert.throws(() => parseArgs(text, ["a.fig", "--fields="]), (e) => e instanceof UsageError && e.message === "--fields needs at least one value");
+  assert.throws(() => parseArgs(text, ["a.fig", "--exclude-page="]), /--exclude-page needs at least one value; --no-exclude-page gives an empty list/);
+  const usage = commandUsage("fr", { name: "figma_get_text", description: "Text.", shape: text });
+  assert.match(usage, /--no-exclude-pages/);
+  assert.doesNotMatch(usage, /--no-fields/);
+});
+
 test("a required list answers to its singular as a flag, and only to its own name in --json and a batch line", () => {
   // The singular is the CLI's way of writing a repeated flag (--node-id 1:2 --node-id 3:4, as --exclude-page reads),
   // so it counts as the required list it stands for. --json and a batch line take MCP argument names, where node_id

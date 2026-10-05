@@ -31,10 +31,19 @@ const SHAPES = new Set(["VECTOR", "BOOLEAN_OPERATION", "STAR", "LINE", "ELLIPSE"
  * something to count away. Strokes as well as fills, as figma_export_image_fills reads both: an image stroke on an
  * ellipse used to hide the layer holding the image inside its frame's "(1 vector)".
  */
-const isDrawing = (n: FigNode) =>
-  SHAPES.has(n.type) &&
-  (n.type === "BOOLEAN_OPERATION" || !n.childIds.length) &&
-  ![...(n.fillPaints ?? []), ...(n.strokePaints ?? [])].some((p: { type?: string }) => p.type === "IMAGE");
+const image = (p: { type?: string }) => p.type === "IMAGE";
+const hasImage = (n: FigNode) => Boolean(n.fillPaints?.some(image) || n.strokePaints?.some(image));
+const isDrawing = (n: FigNode) => SHAPES.has(n.type) && (n.type === "BOOLEAN_OPERATION" || !n.childIds.length) && !hasImage(n);
+
+/**
+ * Layers that are part of a drawing when all they hold is drawing. Drawings nest groups in groups, and counting the
+ * shapes of one level at a time still printed 3,532 lines of a real export inside layers that drew nothing else: 961
+ * GROUP, 205 FRAME and 2,366 VECTOR. Not an instance, whose component names the icon, nor a component or a component
+ * set, nor a frame painted with an image. A group or frame that holds nothing is not part of one either: the 704 next
+ * to the shapes still listed on that export were each a filled frame the size of its parent, a background, as a
+ * rectangle is.
+ */
+const isHolder = (n: FigNode) => ["GROUP", "FRAME"].includes(displayType(n)) && !hasImage(n);
 
 /** Lines a parent's children take when it shows some of them: one each, and one for the "... N more children". */
 const linesFor = (count: number, shown: number) => shown + (shown > 0 && shown < count ? 1 : 0);
@@ -81,15 +90,70 @@ function share(counts: number[], budget: number): number[] {
 export function outline(doc: FigDocument, start: FigNode, depth: number, maxNodes: number): string {
   const roots = start.type === "DOCUMENT" ? doc.pages() : [start];
   /**
-   * The children of a drawing are counted on its line, not listed, except under the node asked for: get-tree with a
-   * drawing's id is how its shapes are seen.
+   * The shapes a layer's subtree draws, when it draws nothing else (0 when it holds anything else, or nothing): a shape
+   * counts one, a group or frame of them what it holds. Only a layer the outline prints is asked, and the walk ends at
+   * the first thing in it that does not draw, a layer's own children read before any of them is opened. Kept per node:
+   * each layer under a printed one that is printed in turn would walk its part again.
+   *
+   * A loop with its own stack, not recursion: a group nested 10,000 deep overflowed the call stack even for an outline
+   * of one line. A layer met again while it is being counted is a parent cycle, which only a broken file has: not a
+   * drawing, so the walk ends there too.
    */
-  const drawing = (n: FigNode, kids: FigNode[]) => n !== start && kids.length > 0 && kids.every(isDrawing);
-  const listed = (n: FigNode, level: number) => {
-    if (level >= depth) return [];
-    const kids = doc.children(n);
-    return drawing(n, kids) ? [] : kids;
+  const drawn = new Map<FigNode, number>();
+  /** The layers being counted, outermost first, and the same as a set: empty between two counts. */
+  const path: { n: FigNode; kids: FigNode[]; next: number; total: number }[] = [];
+  const counting = new Set<FigNode>();
+  /** The count of the layer that just finished, or was known, for the layer above it to take. */
+  let last: number | undefined;
+  const finish = (total: number) => {
+    const f = path.pop()!;
+    counting.delete(f.n);
+    drawn.set(f.n, total);
+    last = total;
   };
+  const open = (n: FigNode) => {
+    const kids = doc.children(n);
+    counting.add(n);
+    path.push({ n, kids, next: 0, total: 0 });
+    // A text beside a large drawing ends the walk before the drawing is opened.
+    if (!kids.length || !kids.every((c) => isDrawing(c) || isHolder(c))) finish(0);
+  };
+  const shapes = (top: FigNode): number => {
+    const known = drawn.get(top);
+    if (known !== undefined) return known;
+    last = undefined;
+    open(top);
+    while (path.length) {
+      const f = path.at(-1)!;
+      if (last !== undefined) {
+        // A layer that is not a drawing makes every layer holding it not one either.
+        if (!last) {
+          finish(0);
+          continue;
+        }
+        f.total += last;
+        f.next++;
+        last = undefined;
+      }
+      if (f.next === f.kids.length) {
+        finish(f.total);
+        continue;
+      }
+      const c = f.kids[f.next];
+      if (isDrawing(c)) {
+        f.total++;
+        f.next++;
+      } else if (drawn.has(c) || counting.has(c)) last = drawn.get(c) ?? 0;
+      else open(c);
+    }
+    return last!;
+  };
+  /**
+   * A drawing is counted on its line, its subtree not listed, except the node asked for: get-tree with a drawing's id
+   * is how its parts are seen.
+   */
+  const drawing = (n: FigNode) => (n === start ? 0 : shapes(n));
+  const listed = (n: FigNode, level: number) => (level >= depth || drawing(n) ? [] : doc.children(n));
 
   // Breadth first: how many children each parent shows, the roots under null.
   const shown = new Map<FigNode | null, number>();
@@ -142,7 +206,8 @@ export function outline(doc: FigDocument, start: FigNode, depth: number, maxNode
     const kids = doc.children(n);
     const list = listed(n, level);
     const count = list.length ? (shown.get(n) ?? 0) : 0;
-    if (drawing(n, kids)) extra.push(`${kids.length} ${kids.length === 1 ? "vector" : "vectors"}`);
+    const vectors = drawing(n);
+    if (vectors) extra.push(`${vectors} ${vectors === 1 ? "vector" : "vectors"}`);
     else if (kids.length && !count) extra.push(`${kids.length} ${kids.length === 1 ? "child" : "children"}`);
     lines.push(`${"  ".repeat(level)}- ${n.id} ${displayType(n)} "${n.name}"${size}${extra.length ? ` (${extra.join(", ")})` : ""}`);
     for (const c of list.slice(0, count)) visit(c, level + 1);

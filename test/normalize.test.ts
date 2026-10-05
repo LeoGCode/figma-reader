@@ -1,7 +1,7 @@
 // Turning raw kiwi values into the JSON the tools return.
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { devStatus, Normalizer, propValue, propValueOf } from "../src/normalize.ts";
+import { devStatus, labelMarkdown, Normalizer, propValue, propValueOf } from "../src/normalize.ts";
 import { figDoc, guid, internalPage, variable, variableSet } from "./fixtures.ts";
 
 describe("propValue", () => {
@@ -395,19 +395,27 @@ describe("Dev Mode status, annotations and measurements", () => {
         { label: "", properties: [{ type: "FILL" }, { type: "TEXT_STYLE" }], categoryId: guid("9:2") },
         // labelV2 is the later field and wins when it is set; a category the document does not name keeps its id.
         { label: "<p>old</p>", labelV2: "new", categoryId: guid("9:7") },
+        // Set and empty, it is still the label: falling back to label brought back an instruction someone cleared.
+        { label: "<p>Obsolete instruction</p>", labelV2: "" },
+        { label: "<p>Obsolete instruction</p>", labelV2: "<p><br></p>" },
       ],
     },
     { id: "1:2", type: "FRAME", parent: "1:1", name: "Card" },
     { id: "1:4", type: "FRAME", parent: "0:1", name: "Never marked", sectionStatusInfo: { status: "NONE", prevStatus: "NONE", lastUpdateUnixTimestamp: at } },
+    // None and none, but a person left them: no record Figma writes on its own names a user or carries a note.
+    { id: "1:5", type: "FRAME", parent: "0:1", name: "Touched", sectionStatusInfo: { status: "NONE", prevStatus: "NONE", userId: "1234567" } },
+    { id: "1:6", type: "FRAME", parent: "0:1", name: "Noted", sectionStatusInfo: { status: "NONE", prevStatus: "NONE", description: "Not this sprint" } },
   ]);
   const node = (id: string) => new Normalizer(doc).node(doc.require(id), 0);
 
   it("puts the status on the node, unless the record never said anything but none", () => {
     assert.equal(node("1:1").devStatus.status, "ready_for_dev");
     // Figma writes none-and-was-none records on components nobody marked, by the thousand in a library: a dated
-    // "none" on every variant would read as a status. figma_dev_status with status any still lists them.
+    // "none" on every variant would read as a status. figma_dev_status with status none or any still lists them.
     assert.equal(node("1:4").devStatus, undefined);
     assert.equal(node("1:2").devStatus, undefined);
+    assert.deepEqual(node("1:5").devStatus, { status: "none", raw: "NONE", previous: "none", previousRaw: "NONE", by: "1234567" });
+    assert.deepEqual(node("1:6").devStatus, { status: "none", raw: "NONE", previous: "none", previousRaw: "NONE", note: "Not this sprint" });
   });
 
   it("reads annotation labels as markdown, with their category and pinned properties", () => {
@@ -415,6 +423,8 @@ describe("Dev Mode status, annotations and measurements", () => {
       { label: "Use the `aria-label` & see [the spec](https://example.com/spec?a=1&b=2)\n\n**Never** truncate", category: "Development" },
       { category: "Analytics", properties: ["FILL", "TEXT_STYLE"] },
       { label: "new", categoryId: "9:7" },
+      {},
+      {},
     ]);
     assert.equal(node("1:2").annotations, undefined);
   });
@@ -445,5 +455,70 @@ describe("Dev Mode status, annotations and measurements", () => {
       { from: "1:1", fromSide: "BOTTOM", to: "1:3", toSide: "TOP", toPath: ["1:3", "77:5"] },
       { from: "1:3", fromSide: "RIGHT", to: "8:8", toSide: "RIGHT", toMissing: true },
     ]);
+  });
+});
+
+describe("labelMarkdown", () => {
+  const md = (html: string) => labelMarkdown(html).markdown;
+
+  it("writes a line per paragraph, one blank line for an empty one, and a line break for <br>", () => {
+    assert.equal(md("<p>one</p><p>two</p>"), "one\ntwo");
+    assert.equal(md("<p>one</p><p><br></p><p>two</p>"), "one\n\ntwo");
+    assert.equal(md("<p>one<br>two<br/>three</p>"), "one\ntwo\nthree");
+  });
+
+  it("turns bold, italic and code into their markdown", () => {
+    assert.equal(md('<strong style="x">a</strong> <b>b</b>'), "**a** **b**");
+    assert.equal(md("<em>a</em> <i>b</i>"), "*a* *b*");
+    assert.equal(md('<code style="font-family: mono;" spellcheck="false">aria-label</code>'), "`aria-label`");
+  });
+
+  it("reads what a code span holds as text: an escaped tag, backticks, and no markup", () => {
+    // The corpus check took this for leftover HTML: it is the literal text of an element's name.
+    assert.deepEqual(labelMarkdown("<p>Use <code>&lt;button&gt;</code></p>"), { markdown: "Use `<button>`", unconverted: [] });
+    assert.equal(md("<code>a`b</code>"), "``a`b``");
+    assert.equal(md("<code>`x</code>"), "`` `x ``");
+    assert.equal(md("<code><strong>x</strong> [y]</code>"), "`x [y]`");
+  });
+
+  it("keeps a link's address however the attribute is quoted, escaping what would end the link", () => {
+    for (const html of [
+      `<a href="https://example.com/spec">spec</a>`,
+      `<a href='https://example.com/spec'>spec</a>`,
+      `<a href=https://example.com/spec>spec</a>`,
+      // A ">" inside another attribute's quotes does not end the tag.
+      `<a title="a > b" target='_blank' href="https://example.com/spec">spec</a>`,
+    ]) {
+      assert.equal(md(`<p>See ${html}</p>`), "See [spec](https://example.com/spec)", html);
+    }
+    assert.equal(md('<a href="https://example.com/?a=1&amp;b=2">x</a>'), "[x](https://example.com/?a=1&b=2)");
+    assert.equal(md('<a href="https://example.com/Foo_(bar) baz">see [1]</a>'), "[see \\[1\\]](https://example.com/Foo_%28bar%29%20baz)");
+    assert.equal(md('<a href="https://example.com/"></a>'), "[https://example.com/](https://example.com/)");
+    assert.equal(md('<a href="https://example.com/"><code>[x]</code></a>'), "[`[x]`](https://example.com/)");
+    assert.equal(md('<a name="top">plain</a>'), "plain");
+  });
+
+  it("writes lists as bullets or numbers, nested by indentation", () => {
+    assert.equal(md("<ul><li>one</li><li>two</li></ul>"), "- one\n- two");
+    assert.equal(md("<ol><li>a</li><li>b</li></ol>"), "1. a\n2. b");
+    assert.equal(md("<ul><li><p>one</p></li><li><p>two</p></li></ul>"), "- one\n- two");
+    assert.equal(md("<p>Steps:</p><ul><li>one<ul><li>inner</li></ul></li><li>two</li></ul>"), "Steps:\n- one\n  - inner\n- two");
+  });
+
+  it("decodes entities once, and leaves one that names no character as written", () => {
+    assert.equal(md("&amp;lt; &amp; &lt; &gt; &quot; &apos; &#65; &#x42; &#x110000;"), "&lt; & < > \" ' A B &#x110000;");
+  });
+
+  it("keeps the text of markup it cannot convert, and says what that markup was", () => {
+    assert.deepEqual(labelMarkdown('<p>a <u>b</u> <span style="c">c</span></p>'), { markdown: "a b c", unconverted: ["u", "span"] });
+    assert.deepEqual(labelMarkdown('<p>a <a href="x>b</p>'), { markdown: 'a <a href="x>b', unconverted: ["malformed"] });
+    // Text with no markup at all passes through, a "<" that starts no tag included.
+    assert.deepEqual(labelMarkdown("a < b, 2<3, *kept*\nnext"), { markdown: "a < b, 2<3, *kept*\nnext", unconverted: [] });
+  });
+
+  it("ends what was left open, and ignores an end tag that ends nothing", () => {
+    assert.equal(md('<p>see <a href="https://example.com/">the spec'), "see [the spec](https://example.com/)");
+    assert.equal(md("<code>x"), "`x`");
+    assert.equal(md("</code></a>x"), "x");
   });
 });

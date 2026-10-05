@@ -399,9 +399,10 @@ tool(
   "figma_get_node",
   "Detailed design data for a node and its subtree: geometry, fills/strokes/effects (hex), auto-layout, text styling and runs, " +
     "component/instance info, bound variables and style names. Instances are not expanded (see mainComponentId). " +
-    "Dev Mode's handoff data where a node has it: devStatus as figma_dev_status describes it (absent on a node never " +
-    "marked), annotations (label as markdown, category, the properties pinned) and measurements (from/to node ids and " +
-    "sides; the distance itself is not stored). " +
+    "Dev Mode's handoff data where a node has it: devStatus as figma_dev_status describes it, annotations (label as " +
+    "markdown, category, the properties pinned) and measurements (from/to node ids and sides; the distance itself is not " +
+    "stored). devStatus is absent on a node never marked: a record that is none and was none, with no user or note on " +
+    "it, is one Figma keeps on components nobody marked, and only figma_dev_status with status none or any lists it. " +
     EXPORTED_AT_NOTE,
   {
     file: fileArg,
@@ -662,7 +663,9 @@ tool(
     "the fields figma_get_node reports as devStatus: status (ready_for_dev, completed, none, or unknown for a value this " +
     "decoder has no name for), raw (the value Figma stores: BUILD is read as Ready for dev, which has not been confirmed " +
     "against a re-export, so quote it beside status), previous and previousRaw, changedAt (ISO-8601), and by (a Figma " +
-    "user id) and note when the record has them. status none with a previous status is a mark that came off at changedAt. " +
+    "user id) and note when the record has them. status none with a previous status other than none is a mark that came " +
+    "off at changedAt; none with previous none is a record Figma keeps on a node never marked, listed only with status " +
+    "none or any unless a user or note on it says a person left it. " +
     "Internal-only pages, soft-deleted nodes and superseded library copies are left out. " +
     EXPORTED_AT_NOTE,
   {
@@ -670,7 +673,8 @@ tool(
     page: z.string().optional().describe("Only nodes on this page; a name no page has is an error listing the pages"),
     status: z.enum(DEV_STATUS_FILTERS).optional().describe(
       "Only this status: none covers marks that came off as well as records that never said anything else, and any is " +
-        "every record. Default: every node marked now or before, i.e. not none, or none with a previous status",
+        "every record. Default: every node marked now or before (status or previous other than none), and any record " +
+        "with a user or note on it",
     ),
     limit: z.number().int().positive().optional().describe("Default 100"),
     refresh: refreshArg,

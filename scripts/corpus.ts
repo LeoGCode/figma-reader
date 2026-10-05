@@ -11,7 +11,7 @@ import { devStatusList } from "../src/dev-status.ts";
 import { currentCopy, FigDocument, guidId, type FigNode, type Raw } from "../src/fig-file.ts";
 import { keyPath, layerKey, mainOf, scanText } from "../src/instance-text.ts";
 import { localFigFiles } from "../src/local-files.ts";
-import { devStatus, Normalizer } from "../src/normalize.ts";
+import { devStatus, labelMarkdown, Normalizer } from "../src/normalize.ts";
 import { outline } from "../src/outline.ts";
 import { tokenUsage, typographyKey } from "../src/token-usage.ts";
 import { extractStyles, extractVariables, stylesToCss, variablesToCss, variablesToDtcg } from "../src/tokens.ts";
@@ -263,6 +263,7 @@ function check(path: string): Report {
 
   step("devStatus", () => {
     let unknown = 0, bare = 0, annotations = 0, markup = 0, measurements = 0, noTarget = 0, missingTarget = 0;
+    const unconverted = new Set<string>();
     r.counts.devStatusRecords = 0;
     for (const n of doc.nodes.values()) {
       const d = devStatus(n);
@@ -270,9 +271,14 @@ function check(path: string): Report {
         r.counts.devStatusRecords++;
         if (d.status === "unknown" || d.previous === "unknown") unknown++;
       } else if (n.sectionStatus !== undefined && n.sectionStatus !== "NONE") bare++;
-      for (const a of norm.annotations(n) ?? []) {
+      for (const a of (n.annotations ?? []) as Raw[]) {
         annotations++;
-        if (a.label && /<\/?[a-z][^>]*>|&(#x?[0-9a-f]+|[a-z]+);/i.test(a.label)) markup++;
+        // Both fields, whichever of them wins. What the conversion leaves cannot tell markup from text - a code span
+        // showing a <button> holds one, decoded from &lt;button&gt; - so it is the converter that says what it met and
+        // could not turn into markdown.
+        const missed = [a.label, a.labelV2].flatMap((l) => (typeof l === "string" ? labelMarkdown(l).unconverted : []));
+        if (missed.length) markup++;
+        for (const t of missed) unconverted.add(t);
       }
       for (const m of norm.measurements(n) ?? []) {
         measurements++;
@@ -290,8 +296,9 @@ function check(path: string): Report {
     // Only sectionStatusInfo is read. The bare sectionStatus beside it has been on no node of any file seen so far; a
     // node marked through it alone would be a status the tools say nothing about.
     fail(bare === 0, `dev status: ${bare} nodes marked only through the bare sectionStatus field, which is not read`);
-    // Labels are HTML turned into markdown; a tag or entity left over is markup the conversion did not know.
-    fail(markup === 0, `annotations: ${markup} labels with HTML left in them`);
+    // Labels are HTML turned into markdown; a tag the conversion does not know is dropped with its text kept, which is
+    // formatting lost, and a file that uses one is the file to learn it from. Tag names only: no label text.
+    fail(markup === 0, `annotations: ${markup} labels with markup the markdown conversion does not know (${[...unconverted].sort().join(", ")})`);
     // A target that is gone is reported (toMissing); a measurement naming no target at all says nothing.
     fail(noTarget === 0, `measurements: ${noTarget} with no target node`);
   });

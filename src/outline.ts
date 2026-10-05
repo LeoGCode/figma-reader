@@ -1,18 +1,21 @@
 // The compact layer outline figma_get_tree returns: one line per node, indented by depth.
 import type { FigDocument, FigNode } from "./fig-file.ts";
-import { devMarked, devStatus, displayType } from "./normalize.ts";
+import { devStatus, displayType } from "./normalize.ts";
 
 const HINTS: Record<string, string> = { ready_for_dev: "ready for dev", completed: "completed" };
 
 /**
  * The Dev Mode status in a word or three: what the node is marked now, or what it was before the mark came off, since
  * an unmarked frame that was ready for dev is the one a handoff asks about. A value with no name is shown as stored.
+ * A record that is none and was none names no status, whoever left it, so it has no hint: get-node shows it when a
+ * person did.
  */
 function devStatusHint(n: FigNode): string | undefined {
   const d = devStatus(n);
-  if (!d || !devMarked(d)) return undefined;
+  if (!d) return undefined;
   const name = (status: string, raw: string) => HINTS[status] ?? `dev status ${raw}`;
-  return d.status === "none" ? `was ${name(d.previous, d.previousRaw)}` : name(d.status, d.raw);
+  if (d.status !== "none") return name(d.status, d.raw);
+  return d.previous !== "none" ? `was ${name(d.previous, d.previousRaw)}` : undefined;
 }
 
 /** Outline from start (all pages for the DOCUMENT) down depth levels, cut off after maxNodes lines. */

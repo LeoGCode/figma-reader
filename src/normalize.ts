@@ -239,7 +239,9 @@ export class Normalizer {
     return list.map((a) => {
       const category = guidId(a.categoryId);
       return prune({
-        label: annotationLabel(a.labelV2) ?? annotationLabel(a.label),
+        // labelV2 has been set in no export seen. It is the later field, so when it is there it is the label, even
+        // empty: falling back to label then would bring back text someone cleared.
+        label: typeof (a.labelV2 ?? a.label) === "string" ? labelMarkdown(a.labelV2 ?? a.label).markdown || undefined : undefined,
         // A category the document does not name is kept as its id rather than dropped, so the grouping still shows.
         category: category ? this.categories!.get(category) : undefined,
         categoryId: category && !this.categories!.has(category) ? category : undefined,
@@ -346,7 +348,7 @@ export class Normalizer {
       out.exports = n.exportSettings.map((e: Raw) => prune({ format: e.imageType, suffix: e.suffix || undefined, constraint: e.constraint }));
     }
     const dev = devStatus(n);
-    if (dev && devMarked(dev)) out.devStatus = dev;
+    if (dev && devStatusShown(dev)) out.devStatus = dev;
     out.annotations = this.annotations(n);
     out.measurements = this.measurements(n);
 
@@ -381,7 +383,7 @@ export interface DevStatus {
   raw: string;
   previous: string;
   previousRaw: string;
-  /** ISO-8601: when the status last changed, which for status none with a previous status is when the mark came off. */
+  /** ISO-8601: when the status last changed; for status none with a previous status other than none, when the mark came off. */
   changedAt?: string;
   /** The Figma user id that changed it. The export holds no names to go with it. */
   by?: string;
@@ -411,41 +413,114 @@ export function devStatus(n: FigNode): DevStatus | undefined {
 }
 
 /**
- * Whether a status record says anything: marked now, or marked before and since unmarked ("was ready for dev"). Figma
- * also writes records that are none and were none on components nobody marked, by the thousand in a component
- * library; reporting those would put a dated "none" on every variant of it.
+ * Whether a status record says anything: marked now, marked before and since unmarked ("was ready for dev"), or
+ * carrying the user or note a person leaves. Figma also writes records that are none and were none, with neither, on
+ * components nobody marked - by the thousand in a component library - and reporting those would put a dated "none" on
+ * every variant of it. A user id is what tells the two apart: every record a person made in the files checked names
+ * one, and no none-and-none record does, so one that did would be a person's doing and is shown.
  */
-export const devMarked = (d: DevStatus) => d.status !== "none" || d.previous !== "none";
+export const devStatusShown = (d: DevStatus) => d.status !== "none" || d.previous !== "none" || !!d.by || !!d.note;
+
+/** A tag, with attribute values quoted either way or not at all; any other "<" is text. */
+const LABEL_TOKEN = /<(\/?)([a-z][a-z0-9]*)((?:[^>"']|"[^"]*"|'[^']*')*)>|[^<]+|</gi;
+
+function decodeEntities(s: string): string {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (entity, e: string) => {
+    const k = e.toLowerCase();
+    if (k[0] !== "#") return { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " }[k]!;
+    const cp = k[1] === "x" ? parseInt(k.slice(2), 16) : Number(k.slice(1));
+    // fromCodePoint throws past U+10FFFF; such an entity is left as it was written.
+    return cp <= 0x10ffff ? String.fromCodePoint(cp) : entity;
+  });
+}
+
+/** A code span that holds its text whatever backticks are in it: the fence is one longer than any run inside. */
+function codeSpan(s: string): string {
+  if (!s) return "";
+  const fence = "`".repeat(Math.max(0, ...[...s.matchAll(/`+/g)].map((m) => m[0].length)) + 1);
+  const pad = s.startsWith("`") || s.endsWith("`") ? " " : "";
+  return `${fence}${pad}${s}${pad}${fence}`;
+}
 
 /**
- * An annotation's text as markdown. label holds HTML in every export seen (a <p> per line, <br>, <strong>, <code>,
- * <a href>), and markdown keeps the links and code spans that tag stripping would lose; the Plugin API hands the same
- * text out as markdown too. labelV2 has not been seen set in any export: it is the later field, so it wins when it is,
- * and is read the same way - text with no markup passes through unchanged.
+ * An annotation label as markdown, and the markup the conversion met and could not turn into any (tag names, or
+ * "malformed" for a "<" that starts a tag it cannot read). label holds HTML in every export seen: a <p> per line, an
+ * empty one for a blank line, <br>, <strong>, <code> and <a href>. Markdown keeps the links and code spans that
+ * stripping tags would lose, and the Plugin API hands the same text out as markdown too. A tag it does not know is
+ * dropped and its text kept; text with no markup passes through as it is.
+ *
+ * Text is read token by token rather than by rewriting the string, so an entity is decoded once, where it stands: a
+ * "&lt;button&gt;" inside <code> is the literal text "<button>", not a tag, and a "[" in a link's text or a ")" in its
+ * address is escaped against the link it would otherwise end.
  */
-function annotationLabel(html: unknown): string | undefined {
-  if (typeof html !== "string" || !html.trim()) return undefined;
-  const md = html
-    .replace(/<p\b[^>]*>\s*<br\s*\/?>\s*<\/p>/gi, "\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<(strong|b)\b[^>]*>([\s\S]*?)<\/\1>/gi, "**$2**")
-    .replace(/<(em|i)\b[^>]*>([\s\S]*?)<\/\1>/gi, "*$2*")
-    .replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, "`$1`")
-    .replace(/<a\b[^>]*?\bhref="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)")
-    .replace(/<li\b[^>]*>/gi, "- ")
-    .replace(/<\/li>/gi, "\n")
-    .replace(/<\/?[a-z][^>]*>/gi, "")
-    .replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (entity, e: string) => {
-      const k = e.toLowerCase();
-      if (k[0] !== "#") return { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " }[k]!;
-      const cp = k[1] === "x" ? parseInt(k.slice(2), 16) : Number(k.slice(1));
-      // fromCodePoint throws past U+10FFFF; such an entity is left as it was written.
-      return cp <= 0x10ffff ? String.fromCodePoint(cp) : entity;
-    })
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  return md || undefined;
+export function labelMarkdown(html: string): { markdown: string; unconverted: string[] } {
+  const unconverted = new Set<string>();
+  const frames: { kind: "root" | "a" | "code"; text: string; href?: string }[] = [{ kind: "root", text: "" }];
+  const lists: { ordered: boolean; n: number }[] = [];
+  const top = () => frames[frames.length - 1];
+  const put = (s: string) => {
+    top().text += s;
+  };
+  // A paragraph or list item starts on a line of its own, unless its line has nothing on it yet: a <br> just before
+  // it already gave it one - the empty paragraph Figma writes for a blank line is then one blank line, not two - and a
+  // paragraph inside a list item belongs on its bullet's line.
+  const newLine = () => {
+    const t = top().text;
+    if (t && !t.endsWith("\n") && !/^ *(-|\d+\.) $/.test(t.slice(t.lastIndexOf("\n") + 1))) put("\n");
+  };
+  const render = (f: (typeof frames)[number]) => {
+    if (f.kind === "code") return codeSpan(f.text);
+    if (f.href === undefined) return f.text;
+    const url = f.href.replace(/[\s()<>]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+    return `[${f.text || f.href.replace(/[\\[\]]/g, "\\$&")}](${url})`;
+  };
+  /** Ends the innermost open element of this kind, and any opened inside it and left open. A stray end tag is ignored. */
+  const close = (kind: "a" | "code") => {
+    if (!frames.some((f) => f.kind === kind)) return;
+    for (let f = frames.pop()!; ; f = frames.pop()!) {
+      put(render(f));
+      if (f.kind === kind) return;
+    }
+  };
+  for (const m of html.matchAll(LABEL_TOKEN)) {
+    const [token, slash, name, attrs] = m;
+    if (!name) {
+      if (token === "<" && /^<\/?[a-z]/i.test(html.slice(m.index, m.index + 3))) unconverted.add("malformed");
+      const text = decodeEntities(token);
+      // Inside a code span nothing is markdown; inside a link's text a bracket would end the text early.
+      put(top().kind === "code" || !frames.some((f) => f.kind === "a") ? text : text.replace(/[\\[\]]/g, "\\$&"));
+      continue;
+    }
+    const tag = name.toLowerCase();
+    const closing = slash === "/";
+    if (top().kind === "code" && tag !== "code") continue;
+    if (tag === "p") newLine();
+    else if (tag === "br") put("\n");
+    else if (tag === "strong" || tag === "b") put("**");
+    else if (tag === "em" || tag === "i") put("*");
+    else if (tag === "code") closing ? close("code") : frames.push({ kind: "code", text: "" });
+    else if (tag === "a") {
+      if (closing) close("a");
+      else {
+        const href = /(?:^|\s)href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(attrs);
+        frames.push({ kind: "a", text: "", href: href ? decodeEntities(href[1] ?? href[2] ?? href[3]) : undefined });
+      }
+    } else if (tag === "ul" || tag === "ol") {
+      if (closing) lists.pop();
+      else lists.push({ ordered: tag === "ol", n: 0 });
+      newLine();
+    } else if (tag === "li") {
+      newLine();
+      const list = lists[lists.length - 1];
+      if (!closing) put(`${"  ".repeat(Math.max(0, lists.length - 1))}${list?.ordered ? `${++list.n}.` : "-"} `);
+    } else unconverted.add(tag);
+  }
+  // An element left open at the end still renders as what it is.
+  while (frames.length > 1) {
+    const f = frames.pop()!;
+    put(render(f));
+  }
+  return { markdown: frames[0].text.replace(/\n{3,}/g, "\n\n").trim(), unconverted: [...unconverted] };
 }
 
 const OPPOSITE_SIDE: Record<string, string> = { TOP: "BOTTOM", BOTTOM: "TOP", LEFT: "RIGHT", RIGHT: "LEFT" };

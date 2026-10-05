@@ -75,6 +75,20 @@ describe("SnapshotStore.get", () => {
     assert.equal(label(a), "export 1");
   });
 
+  it("makes its directory with the first export into it, and not before", async () => {
+    // A process that only reads local files writes nothing, which is what lets it run in a read-only sandbox.
+    const x = exporter();
+    const dir = join(tempDir(), "cache");
+    const local = join(tempDir(), "local.fig");
+    writeFileSync(local, fig("local"));
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    assert.equal(label(await store.getLocal(local)), "local");
+    assert.equal(store.peek("K"), undefined);
+    assert.ok(!existsSync(dir), "made by a store that had only read");
+    assert.equal(label(await store.get("K")), "export 1");
+    assert.ok(existsSync(store.figPath("K")));
+  });
+
   it("serves a snapshot younger than the max age without exporting, decoded once", async () => {
     const x = exporter();
     const dir = tempDir();
@@ -267,6 +281,30 @@ describe("SnapshotStore between processes", () => {
     assert.equal(label(await first), "a 1");
     assert.equal(label(await second), "b 1", "its own export, begun after it asked");
     assert.deepEqual(b.calls, ["K"]);
+  });
+
+  it("says that it may export before it waits for another process's export, and never when a snapshot answers", async () => {
+    // tools.ts registers with the browser when it hears this. Heard only once this load's own export began, the
+    // process it waited for could be the browser's last client and close it on the way out, just as this one needs it.
+    const a = exporter("a"), b = exporter("b");
+    const dir = tempDir();
+    let said = 0;
+    const store = new SnapshotStore({ saveLocalCopy: b.web.saveLocalCopy, mayExport: () => void said++ }, dir, HOUR);
+    a.hold();
+    const first = new SnapshotStore(a.web, dir, HOUR).get("K", true);
+    await exportsStarted(a, 1);
+    const second = store.get("K", true);
+    await new Promise((r) => setTimeout(r, 3 * LEASE_POLL_MS));
+    assert.deepEqual([said, b.calls.length], [1, 0], "said so while it was still waiting");
+    a.release();
+    await first;
+    assert.equal(label(await second), "b 1");
+    // A snapshot fresh enough to answer, and a local file, ask nothing of the browser.
+    assert.equal(await store.get("K"), await second);
+    const local = join(tempDir(), "local.fig");
+    writeFileSync(local, fig("local"));
+    await store.getLocal(local);
+    assert.equal(said, 1);
   });
 
   // A lease of this process's own pid, stamped as this process, is exactly what liveLeases reads as a live holder:
@@ -543,8 +581,8 @@ describe("SnapshotStore between processes", () => {
     const x = exporter();
     const dir = tempDir();
     // The lease of a holder no pid here can judge is aged out by its heartbeat, and this is the holder the age
-    // must not reach: a server in a container is one process for hours, and its client lease is taken once at
-    // startup. Any rule that reads the lease's age instead of its beat collects it while it works.
+    // must not reach: a server in a container is one process for hours, and its client lease is taken once, by its
+    // first call to the browser. Any rule that reads the lease's age instead of its beat collects it while it works.
     const lease = foreignHolder(dir, "long-lived", 20);
     const store = new SnapshotStore(x.web, dir, HOUR);
     const refreshed = store.get("K", true);

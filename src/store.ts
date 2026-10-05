@@ -73,6 +73,15 @@ function floorAt(path: string): Floor {
   return file === UNREADABLE ? { reached: false, file: undefined } : { reached: true, file };
 }
 
+/**
+ * What the store asks of the browser side, and only on the way to an export (see load): a local .fig, or a snapshot
+ * fresh enough to answer, asks nothing of it.
+ */
+type Exporter = Pick<FigmaWeb, "saveLocalCopy"> & {
+  /** This load found no snapshot to answer from and may export; it has yet to wait for another process's export. */
+  mayExport?(): void;
+};
+
 interface Inflight {
   promise: Promise<FigDocument>;
   /** It exports the live file, so it can serve a refresh request too. */
@@ -88,7 +97,7 @@ export class SnapshotStore {
   /** Loads in progress, at most one per key: a new one is only ever queued behind the one already there. */
   private inflight = new Map<string, Inflight>();
 
-  private web: FigmaWeb;
+  private web: Exporter;
   readonly dir: string;
   private maxAgeMs: number;
   private maxDocs: number;
@@ -98,13 +107,12 @@ export class SnapshotStore {
    * `otherExportWaitMs` is a parameter only so that a test can reach the ceiling: what it leaves behind is an
    * export still running that this one has to answer around, and no test can wait out the ten real minutes.
    */
-  constructor(web: FigmaWeb, dir: string, maxAgeMs: number, maxDocs = 4, otherExportWaitMs = OTHER_EXPORT_WAIT_MS) {
+  constructor(web: Exporter, dir: string, maxAgeMs: number, maxDocs = 4, otherExportWaitMs = OTHER_EXPORT_WAIT_MS) {
     this.web = web;
     this.dir = dir;
     this.maxAgeMs = maxAgeMs;
     this.maxDocs = maxDocs;
     this.otherExportWaitMs = otherExportWaitMs;
-    mkdirSync(dir, { recursive: true });
   }
 
   figPath(fileKey: string) {
@@ -226,6 +234,9 @@ export class SnapshotStore {
     const since = Date.now();
     const fresh = () => existsSync(path) && Date.now() - statSync(path).mtimeMs < this.maxAgeMs;
     if (!refresh && fresh()) return this.fromDisk(fileKey, path);
+    // Said before the wait below, not when this load's own export begins: whatever the exporter readies for one has
+    // to be in place by the time the export waited for ends (tools.ts says why).
+    this.web.mayExport?.();
     // Every process on this cache exports this key to the same .fig, so one export should answer them all where it
     // can. Two at once also settle the snapshot by which of them renamed last, which neither of them asked for.
     const floor = await this.awaitOtherExport(fileKey, since);
@@ -240,6 +251,9 @@ export class SnapshotStore {
         return this.fromDisk(fileKey, path);
       }
     }
+    // Made by the first export rather than by the store: a process that only reads local files or fresh snapshots
+    // writes nothing here, which is all a read-only sandbox lets it do.
+    mkdirSync(this.dir, { recursive: true });
     const tag = Math.random().toString(36).slice(2, 8);
     const lease = takeLease(this.leaseDir(fileKey), `${process.pid}-${Date.now()}-${tag}`);
     // Export onto a name no other process writes, and swap that onto the snapshot; reading the snapshot back read

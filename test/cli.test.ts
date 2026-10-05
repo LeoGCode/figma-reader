@@ -3,9 +3,11 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import { figBytes, type TestNode } from "./fixtures.ts";
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
@@ -219,5 +221,107 @@ test("the download directory follows the browser profile, not the cache each pro
   assert.ok(one, "and status reports it, since it is where a download nobody waited for would be sitting");
   // Two profiles are two browsers, each with a download directory of its own.
   assert.notEqual(await dirOf({ FIGMA_USER_DATA_DIR: join(root, "profile-b"), FIGMA_READER_CACHE: join(root, "cache-1") }), one);
+});
+
+/**
+ * A home of its own, with every root this tool writes below it: state, data and (unless FIGMA_READER_CACHE moves it)
+ * the cache. Windows builds those from APPDATA and LOCALAPPDATA rather than from HOME, so they are moved too.
+ */
+function ownHome(name: string) {
+  const dir = join(root, name);
+  mkdirSync(dir);
+  return { dir, env: { HOME: dir, USERPROFILE: dir, APPDATA: join(dir, "AppData", "Roaming"), LOCALAPPDATA: join(dir, "AppData", "Local") } };
+}
+/** Everything under dir, as paths relative to it. */
+const contents = (dir: string) => readdirSync(dir, { recursive: true }).map(String).sort();
+
+const realFig = join(import.meta.dirname, "files", "real-export.fig");
+const LOCAL_READS = [
+  ["help"],
+  ["load-file", realFig],
+  ["get-tree", realFig, "--depth", "1"],
+  ["search", realFig, "a", "--limit", "1"],
+  ["get-text", realFig, "--limit", "1"],
+  ["list-files"],
+];
+
+test("a local read or help writes nothing: no browser state, no cache directory", async () => {
+  // Loading the tools used to register this process with the shared browser (a lease under the state directory) and
+  // make the account's cache directory, so every call wrote both before it had looked at its arguments.
+  for (const where of ["under HOME", "in FIGMA_READER_CACHE"]) {
+    const { dir, env } = ownHome(`untouched ${where}`);
+    const cache = join(root, `untouched cache ${where}`);
+    mkdirSync(cache);
+    const cacheEnv = { ...env, FIGMA_READER_CACHE: where === "under HOME" ? undefined : cache };
+    const runs = await Promise.all(LOCAL_READS.map((args) => cli(args, { env: cacheEnv })));
+    runs.forEach((r, i) => assert.equal(r.code, 0, `${LOCAL_READS[i][0]}: ${r.stderr}`));
+    assert.deepEqual(contents(dir), [], `cache ${where}: written under HOME`);
+    assert.deepEqual(contents(cache), [], `cache ${where}: written in the cache`);
+  }
+});
+
+test("a local read or help works where nothing may be written", { skip: (process.platform === "win32" || process.getuid?.() === 0) && "permissions do not bind here" }, async () => {
+  // A read-only sandbox (Codex -s read-only) failed a get-tree on a local .fig with EROFS on that lease, before it
+  // decoded anything. Directories this user may not write stand in for it, as the state and cache roots both.
+  const { dir, env } = ownHome("read-only");
+  const cache = join(root, "read-only cache");
+  mkdirSync(cache);
+  chmodSync(dir, 0o555);
+  chmodSync(cache, 0o555);
+  try {
+    for (const cacheRoot of [undefined, cache]) {
+      const runs = await Promise.all(LOCAL_READS.map((args) => cli(args, { env: { ...env, FIGMA_READER_CACHE: cacheRoot } })));
+      runs.forEach((r, i) => assert.equal(r.code, 0, `${LOCAL_READS[i][0]}: ${r.stderr}`));
+      assert.match(runs[0].stdout, /^figma-reader \S+: /);
+      assert.ok(JSON.parse(runs[1].stdout).fileModifiedAt, "load-file answered for the file");
+    }
+  } finally {
+    chmodSync(dir, 0o755);
+    chmodSync(cache, 0o755);
+  }
+});
+
+test("a call that reaches the browser has registered with it by then, and gives that back when it exits", async () => {
+  // The lease is what another process's release() reads before it closes the browser, so it has to be there before
+  // this process first talks to the browser: taken any later, a release in between closes it under this one.
+  const { dir, env } = ownHome("web-lease");
+  const leases = () => contents(dir).filter((p) => basename(dirname(p)) === "clients");
+  let seen: string[] | undefined;
+  const server = createServer((_req, res) => {
+    seen ??= leases();
+    // A DevTools endpoint whose socket refuses the connection: status stops there, before anything reaches figma.com.
+    res.end(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:1/devtools/browser/none", "User-Agent": "Chrome" }));
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const r = await cli(["status"], { env: { ...env, FIGMA_CDP_URL: `http://127.0.0.1:${port}` } });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(JSON.parse(r.stdout).loggedIn, "unknown");
+    assert.equal(seen?.length, 1, `leases when the browser was first asked: ${JSON.stringify(seen)}`);
+    assert.deepEqual(leases(), [], "and none once it had exited");
+  } finally {
+    server.close();
+  }
+});
+
+test("what an unfinished export left behind is swept by the next call that reaches the browser, not by a local read", async () => {
+  // A crash between an export's copy and its rename leaves a full-size partial beside the snapshot. Sweeping it is
+  // cleanup every process used to run as it loaded; only an export ever leaves one, so it waits for a call that may.
+  const { env } = ownHome("leftovers");
+  const cache = join(root, "leftovers cache");
+  const left = join(cache, "accounts", "leftovers", "KEY.fig.12345.abcdef.tmp");
+  mkdirSync(dirname(left), { recursive: true });
+  writeFileSync(left, "half a snapshot");
+  const old = new Date(Date.now() - 3_600_000);
+  utimesSync(left, old, old);
+  const accountEnv = { ...env, FIGMA_ACCOUNT: "leftovers", FIGMA_READER_CACHE: cache };
+  const read = await cli(["get-tree", realFig, "--depth", "0"], { env: accountEnv });
+  assert.equal(read.code, 0, read.stderr);
+  assert.ok(existsSync(left), "a local read deleted it");
+  // Port 1, where nothing listens: status reaches for the browser and finds nothing to start or to talk to.
+  const status = await cli(["status"], { env: { ...accountEnv, FIGMA_CDP_URL: "http://127.0.0.1:1" } });
+  assert.equal(status.code, 0, status.stderr);
+  assert.ok(!existsSync(left), "the call that reached the browser left it there");
 });
 

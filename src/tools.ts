@@ -75,32 +75,56 @@ const cacheName = customProfile && account.source === "default"
   ? `custom-${createHash("sha1").update(process.env.FIGMA_CDP_URL || expandHome(customProfile)).digest("hex").slice(0, 10)}`
   : account.name;
 const cacheDir = accountCacheDir(cacheName);
-let executablePath = process.env.FIGMA_BROWSER_PATH ? expandHome(process.env.FIGMA_BROWSER_PATH) : undefined;
-if (!executablePath && !process.env.FIGMA_CDP_URL) {
-  try {
-    executablePath = defaultExecutable();
-  } catch {}
+
+let browserSide: { browser: BrowserManager; web: FigmaWeb } | undefined;
+/**
+ * The browser and the figma.com app driven through it, made by the first call that needs them. Making the manager
+ * registers this process as one of the browser's clients (a lease in the state directory, see BrowserManager), and
+ * that used to happen as this module loaded: every process wrote browser state, a get-tree on a local .fig in a
+ * read-only sandbox (Codex's -s read-only) failed with EROFS on that lease before decoding anything, and every local
+ * call paid 200-350 ms to look up a browser it would never start (most of it loading playwright-core to ask where its
+ * own is). A local read and help need none of it.
+ *
+ * Every call that reaches the browser comes through here first, so it is registered before it connects, as it was
+ * when the lease was taken at start-up: another process's release() still sees it and leaves the browser open (an
+ * export registers earlier still, see the store below). A process that never comes here holds no lease, and
+ * release() leaves alone a browser it never used.
+ */
+function useBrowser() {
+  if (browserSide) return browserSide;
+  let executablePath = process.env.FIGMA_BROWSER_PATH ? expandHome(process.env.FIGMA_BROWSER_PATH) : undefined;
+  if (!executablePath && !process.env.FIGMA_CDP_URL) {
+    try {
+      executablePath = defaultExecutable();
+    } catch {}
+  }
+  const browser = new BrowserManager({
+    cdpUrl: process.env.FIGMA_CDP_URL || undefined,
+    executablePath,
+    userDataDir: process.env.FIGMA_USER_DATA_DIR
+      ? expandHome(process.env.FIGMA_USER_DATA_DIR)
+      : accountProfileDir(account.name, executablePath ?? "chromium"),
+    ownsProfile: !process.env.FIGMA_USER_DATA_DIR,
+    headless: !/^(0|false|no)$/i.test(process.env.FIGMA_HEADLESS ?? "1"),
+    stateDir: defaultStateDir(),
+  });
+  // Where the browser puts a "Save local copy" download. The setting is browser-wide, so every process on one browser
+  // has to name the same directory; the cache cannot name it, since FIGMA_READER_CACHE moves per process and whoever
+  // armed it second sent the other's download somewhere it was never waited for. The profile is what they share (the
+  // CDP endpoint when the browser is someone else's), and it lives beside the other state we keep about that browser.
+  const downloadDir = join(
+    defaultStateDir(),
+    "downloads",
+    createHash("sha1").update(browserKey(process.env.FIGMA_CDP_URL || undefined, browser.opts.userDataDir)).digest("hex").slice(0, 10),
+  );
+  browserSide = { browser, web: new FigmaWeb(browser, downloadDir) };
+  // What an export that never finished leaves behind. Only an export leaves it, so it is swept where they begin,
+  // still before this process starts one of its own.
+  cleanStaleDownloads(browserSide.web.downloadDir);
+  // Downloads landed under the cache until they were named after the profile, so an upgrade leaves some there.
+  cleanStaleDownloads(cacheDir);
+  return browserSide;
 }
-const browser = new BrowserManager({
-  cdpUrl: process.env.FIGMA_CDP_URL || undefined,
-  executablePath,
-  userDataDir: process.env.FIGMA_USER_DATA_DIR
-    ? expandHome(process.env.FIGMA_USER_DATA_DIR)
-    : accountProfileDir(account.name, executablePath ?? "chromium"),
-  ownsProfile: !process.env.FIGMA_USER_DATA_DIR,
-  headless: !/^(0|false|no)$/i.test(process.env.FIGMA_HEADLESS ?? "1"),
-  stateDir: defaultStateDir(),
-});
-// Where the browser puts a "Save local copy" download. The setting is browser-wide, so every process on one browser
-// has to name the same directory; the cache cannot name it, since FIGMA_READER_CACHE moves per process and whoever
-// armed it second sent the other's download somewhere it was never waited for. The profile is what they share (the
-// CDP endpoint when the browser is someone else's), and it lives beside the other state we keep about that browser.
-const downloadDir = join(
-  defaultStateDir(),
-  "downloads",
-  createHash("sha1").update(browserKey(process.env.FIGMA_CDP_URL || undefined, browser.opts.userDataDir)).digest("hex").slice(0, 10),
-);
-const web = new FigmaWeb(browser, downloadDir);
 
 const DEFAULT_MAX_AGE_MIN = 30;
 /**
@@ -117,10 +141,19 @@ function snapshotMaxAgeMin(raw: string | undefined): number {
   }
   return n;
 }
-const store = new SnapshotStore(web, cacheDir, snapshotMaxAgeMin(process.env.FIGMA_SNAPSHOT_MAX_AGE_MIN) * 60_000);
-cleanStaleDownloads(web.downloadDir);
-// Downloads landed under the cache until they were named after the profile, so an upgrade leaves some there.
-cleanStaleDownloads(cacheDir);
+// The store reaches the browser only on the way to an export, so a local .fig, and a snapshot still fresh in the
+// cache, are read without the browser ever being made. A load that may export registers with the browser before it
+// waits for another process's export of the key, as it was when every process registered at start-up, and not once
+// its own export begins: the process it waits for may be the browser's last client, and close it on its way out just
+// as this one turns to it.
+const store = new SnapshotStore(
+  {
+    mayExport: () => void useBrowser(),
+    saveLocalCopy: (fileKey, destPath) => useBrowser().web.saveLocalCopy(fileKey, destPath),
+  },
+  cacheDir,
+  snapshotMaxAgeMin(process.env.FIGMA_SNAPSHOT_MAX_AGE_MIN) * 60_000,
+);
 
 export type Content = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 export interface ToolResult {
@@ -263,6 +296,7 @@ tool(
   "Account, browser and login state. Does not launch anything: local .fig paths never need the browser.",
   {},
   async () => {
+    const { browser, web } = useBrowser();
     const rec = browser.launchRecord();
     if (rec?.purpose === "login") {
       return json({ ...accountSummary(), mode: "managed", loginWindowOpen: true, loginCookieSeen: browser.loginCookiePresent(), pid: rec.pid, profile: browser.opts.userDataDir });
@@ -300,6 +334,7 @@ tool(
   { wait_seconds: z.number().int().min(0).max(1800).optional() },
   async ({ wait_seconds }) => {
     const who = `account "${account.name}"`;
+    const { browser, web } = useBrowser();
     const user = browser.launchRecord()?.purpose === "login" ? null : verified(await web.whoami());
     if (user) return json({ ...accountSummary(), loggedIn: true, user });
     await web.openLogin();
@@ -325,7 +360,7 @@ tool(
     limit: z.number().int().positive().optional().describe("Default 30"),
   },
   async ({ source, query, limit }) => {
-    const all: Raw[] = source === "web" ? await web.recentFiles() : localFigFiles(localDirs);
+    const all: Raw[] = source === "web" ? await useBrowser().web.recentFiles() : localFigFiles(localDirs);
     const files = query ? all.filter((f) => f.name.toLowerCase().includes(query.toLowerCase())) : all;
     const max = limit ?? 30;
     // An empty answer used to be an English sentence, which a client parsing this schema's JSON threw on. The two
@@ -737,7 +772,7 @@ tool(
     const localPath = ref.path ?? localFileForKey(ref.key);
     const snapshot = localPath ? await store.getLocal(localPath).catch(() => undefined) : store.peek(ref.key);
     const isPage = snapshot?.get(nodeId)?.type === "CANVAS";
-    const png = await web.copyAsPng(ref.key, nodeId, max_dimension ?? 1568, isPage);
+    const png = await useBrowser().web.copyAsPng(ref.key, nodeId, max_dimension ?? 1568, isPage);
     const note = `${isPage ? "page (all top-level layers) " : "node "}${id}: ${png.width}x${png.height}` +
       (png.originalWidth !== png.width ? ` (downscaled from ${png.originalWidth}x${png.originalHeight})` : "") +
       (save_path ? `, saved to ${writeOut(save_path, Buffer.from(png.base64, "base64"))}` : "");
@@ -792,7 +827,10 @@ tool(
   },
 );
 
-/** Unregister from the shared browser, closing it when no other server or CLI process still uses it. */
+/**
+ * Unregister from the shared browser, closing it when no other server or CLI process still uses it. A process that
+ * never reached the browser holds no lease to give back, and a browser it never used is not its to close.
+ */
 export async function release() {
-  await browser.release().catch(() => {});
+  await browserSide?.browser.release().catch(() => {});
 }

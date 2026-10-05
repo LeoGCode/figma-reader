@@ -46,35 +46,41 @@ const STAGED = /^([A-Za-z0-9]+)\.(?:previous\.)?fig\.(\d+)\.([a-z0-9]+)\.tmp/;
  */
 export function stagedByLiveOwner(dir: string, name: string): boolean {
   const m = STAGED.exec(name);
-  if (!m) return false;
-  const [, fileKey, pid, tag] = m;
+  return !!m && claimed(dir, m[1], m[2], m[3]);
+}
+
+/** A live lease of an export or of a diff previous of `fileKey` carries this pid and tag (see stagedByLiveOwner). */
+function claimed(dir: string, fileKey: string, pid: string, tag: string): boolean {
   return [exportLeases(dir, fileKey), readerLeases(dir, fileKey)].some((leases) =>
     liveLeases(leases).some((lease) => lease.split("-")[0] === pid && lease.endsWith(`-${tag}`)),
   );
 }
 
-/** A key's publish lock as underPublishLock stages it, "<key>.publish.<pid>.<tag>", before renaming it onto the lock. */
-const STAGED_LOCK = /^[A-Za-z0-9]+\.publish\.\d+\.[a-z0-9]+$/;
+/**
+ * A key's publish lock as underPublishLock stages it, "<key>.publish.<pid>.<tag>", before renaming it onto the lock:
+ * the pid and tag of the lease its caller holds throughout, the export's own or previousOf's.
+ */
+const STAGED_LOCK = /^([A-Za-z0-9]+)\.publish\.(\d+)\.([a-z0-9]+)$/;
 /** The lock itself, and the directory of a key's reader leases (see previousOf). */
 const LOCK_OR_READERS = /^[A-Za-z0-9]+\.(?:publish|reading)$/;
-/** How old a staged lock holding no lease must be before cleanStaleLocks takes it for a crash's. */
-const UNCLAIMED_STAGED_LOCK_MS = 60_000;
 
 /**
  * Remove the lock directories nobody holds from the snapshot directory `dir`: a publish lock a crash left staged, or
  * held, and a key's reader-lease directory with no reader left in it. Swept with the staging files
- * (cleanStaleDownloads), by the calls that reach the browser. Each is judged by the leases in it, as liveLeases judges
- * every lease here, and rmdir is the only removal, so a lease written into one meanwhile always keeps it.
+ * (cleanStaleDownloads), by the calls that reach the browser. Each is judged by leases, as liveLeases judges every
+ * lease here, and rmdir is the only removal, so a lease written into one meanwhile always keeps it.
  *
  * A staged lock is made, given its holder's lease and renamed onto the lock within a few file operations: a crash in
- * between leaves it, and nothing ever looked at that name again. One whose lease is live is in use; one whose lease
- * liveLeases finds dead goes, emptied by that judgement. One holding no lease at all is a crash between its mkdir and
- * its lease, or an owner in that very moment, which is the one way a sweep could take a staged lock from its owner:
- * so it goes only once it is a minute old, and no owner spends a minute on two file operations. The lock itself and a
- * reader-lease directory hold a lease whenever anyone holds them, so an empty one is held by nobody: the lock comes
- * into being by a rename that carries its holder's lease in (underPublishLock clears an empty one the same way), and a
- * reader that arrives as its directory is removed makes it again (see takeLease). An export's own lease directory is
- * left alone.
+ * between leaves it, and nothing ever looked at that name again. Its own lease goes in only after it is made, so its
+ * name says whose it is before that: the pid and tag of the lease its caller holds from before the lock is staged to
+ * after it is given back (see underPublishLock), the lease stagedByLiveOwner judges staging files by. Either lease live
+ * keeps it, however old the directory looks; with neither, its owner is gone. Its age was the rule, a minute for one
+ * holding no lease yet, and an age holds a filesystem's clock against this process's: on a shared filesystem two
+ * minutes behind, or with its owner stopped for over a minute between its mkdir and its lease, the sweep removed a live
+ * owner's staging. The lock itself and a reader-lease directory hold a lease whenever anyone holds them, so an empty
+ * one is held by nobody: the lock comes into being by a rename that carries its holder's lease in (underPublishLock
+ * clears an empty one the same way), and a reader that arrives as its directory is removed makes it again (see
+ * takeLease). An export's own lease directory is left alone.
  */
 export function cleanStaleLocks(dir: string) {
   const exports = join(dir, "exports");
@@ -85,16 +91,12 @@ export function cleanStaleLocks(dir: string) {
     return;
   }
   for (const name of names) {
-    const staged = STAGED_LOCK.test(name);
+    const staged = STAGED_LOCK.exec(name);
     if (!staged && !LOCK_OR_READERS.test(name)) continue;
     const path = join(exports, name);
     try {
-      const st = statSync(path);
-      if (!st.isDirectory()) continue;
-      // Read before liveLeases, which removes the leases it finds dead: an empty directory then is one it emptied.
-      const leases = readdirSync(path).length;
-      if (liveLeases(path).length) continue;
-      if (staged && !leases && Date.now() - st.mtimeMs < UNCLAIMED_STAGED_LOCK_MS) continue;
+      if (!statSync(path).isDirectory() || liveLeases(path).length) continue;
+      if (staged && claimed(dir, staged[1], staged[2], staged[3])) continue;
       rmdirSync(path);
     } catch {}
   }
@@ -486,7 +488,7 @@ export class SnapshotStore {
       const doc = FigDocument.fromFile(fileKey, mine, st.mtime);
       this.stamps.set(doc, `${st.mtimeMs}:${st.size}`);
       // Only an export that decoded gets this far, so one that failed leaves the snapshot and the previous one alone.
-      await this.underPublishLock(fileKey, () => this.publish(fileKey, mine, tag));
+      await this.underPublishLock(fileKey, tag, () => this.publish(fileKey, mine, tag));
       return this.remember(doc);
     } catch (e) {
       // From here on a failed write may be the browser's or the download directory's, each worded where it happens:
@@ -576,7 +578,7 @@ export class SnapshotStore {
       throw e;
     }
     try {
-      const kept = await this.underPublishLock(fileKey, () => {
+      const kept = await this.underPublishLock(fileKey, tag, () => {
         try {
           linkSync(this.previousPath(fileKey), was);
         } catch (e) {
@@ -664,10 +666,17 @@ export class SnapshotStore {
    *
    * Waiting has the export wait's ceiling, past which the step runs without the lock, as every publish did before
    * there was one; so does a lock that cannot be taken at all, since that is no reason to fail an export.
+   *
+   * `tag` is the tag of the lease the caller holds from before this to after it, the export's own or previousOf's: the
+   * staged lock is named by it, so that a sweep can tell it is in use before its own lease is in it (see
+   * cleanStaleLocks). A staged lock that is taken away before it becomes the lock was not refused, and is staged again,
+   * within the same ceiling. It used to count as a lock that cannot be taken at all, and twice running sent the step
+   * ahead without one: a sweep that judged it by its age did that to a live owner on a filesystem whose clock ran
+   * behind. Failing instead at the ceiling would throw away a finished export to protect only the pairing of the
+   * previous snapshot, which the ceiling already gives up for a holder that never lets go.
    */
-  private async underPublishLock<T>(fileKey: string, step: () => T): Promise<T> {
+  private async underPublishLock<T>(fileKey: string, tag: string, step: () => T): Promise<T> {
     const lock = this.publishLock(fileKey);
-    const tag = Math.random().toString(36).slice(2, 8);
     const name = `${process.pid}-${tag}`;
     const staged = `${lock}.${process.pid}.${tag}`;
     const deadline = Date.now() + this.otherExportWaitMs;
@@ -675,15 +684,25 @@ export class SnapshotStore {
     for (let missing = 0; ; ) {
       // Whether this process could stage a lock of its own at all, which a cache it may only read refuses.
       let staging = false;
+      // Whether it had made the staged lock and found it gone before it became the lock (see above).
+      let made = false;
+      let vanished = false;
       try {
         mkdirSync(staged, { recursive: true });
+        made = true;
         writeFileSync(join(staged, name), processStamp(process.pid));
         staging = true;
         renameSync(staged, lock);
         held = true;
         break;
-      } catch {
+      } catch (e) {
+        vanished = made && (e as NodeJS.ErrnoException | null)?.code === "ENOENT";
         rmSync(staged, { recursive: true, force: true });
+      }
+      if (vanished) {
+        if (Date.now() > deadline) break;
+        await sleep(PUBLISH_POLL_MS);
+        continue;
       }
       if (!existsSync(lock)) {
         // Nothing stood in the way, so the lock cannot be taken here at all; a lock released at that instant is the

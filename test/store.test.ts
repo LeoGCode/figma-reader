@@ -10,7 +10,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { getHeapStatistics } from "node:v8";
-import { LEASE_BEAT_MS, pidNamespace, processStamp, takeLease } from "../src/browser.ts";
+import { dropLease, LEASE_BEAT_MS, pidNamespace, processStamp, takeLease } from "../src/browser.ts";
 import { FigDocument } from "../src/fig-file.ts";
 import { cleanStaleDownloads, type FigmaWeb } from "../src/figma-web.ts";
 import { decodedBudget, LEASE_POLL_MS, SnapshotStore, weigh } from "../src/store.ts";
@@ -1290,69 +1290,90 @@ describe("SnapshotStore beside another process's sweep", () => {
     },
   );
 
-  it("sweeps the lock directories a crash left, and none that anyone holds", () => {
+  it("sweeps the lock directories a crash left, and none that anyone holds, however old they look", () => {
     // The publish lock is staged as a directory holding its holder's lease and renamed onto the lock; a crash before
     // the rename left the staged one for good, a crash while holding left the lock, and diff previous left its reader
-    // directory behind. Judged as the staging files are, by the leases in them.
+    // directory behind. Judged by leases, never by age: every directory here is an hour old by its mtime, as one is on
+    // a filesystem whose clock runs an hour behind, or whose owner was stopped for an hour.
     const dir = tempDir();
     const exports = join(dir, "exports");
     const past = new Date(Date.now() - HOUR);
-    const planted = (name: string, lease?: string, stamp = processStamp(process.pid), old = true) => {
+    const planted = (name: string, lease?: string, stamp = processStamp(process.pid)) => {
       const path = join(exports, name);
       mkdirSync(path, { recursive: true });
       if (lease) writeFileSync(join(path, lease), stamp);
-      if (old) utimesSync(path, past, past);
+      utimesSync(path, past, past);
       return path;
     };
-    // pid 1 is alive but did not write this stamp, which is how liveLeases tells a holder that died.
-    const gone = [
-      planted("K.publish.1.ab12cd", "1-ab12cd"),
-      planted("K.publish.4242.ef34gh"),
-      planted("K.publish", "1-ij56kl"),
-      planted("K.reading", `1-${Date.now()}-mn78op`),
-      planted("L.reading"),
+    // The leases of an export and of a diff previous running here, which a staged lock carrying their pid and tag
+    // belongs to before its own lease is in it.
+    const callers = [
+      takeLease(join(exports, "M"), `${process.pid}-${Date.now()}-uv12wx`),
+      takeLease(join(exports, "N.reading"), `${process.pid}-${Date.now()}-gh78ij`),
     ];
-    const held = [
-      planted(`L.publish.${process.pid}.qr90st`, `${process.pid}-qr90st`),
-      // Staged a moment ago and its lease not yet in it: its owner may be between the two, so it is not a crash's yet.
-      planted(`M.publish.${process.pid}.uv12wx`, undefined, undefined, false),
-      planted("L.publish", `${process.pid}-yz34ab`),
-      planted("M.reading", `${process.pid}-${Date.now()}-cd56ef`),
-      // An export's own lease directory, which every export of the key uses again.
-      planted("K"),
-    ];
-    cleanStaleDownloads(dir);
-    assert.deepEqual(gone.filter((p) => existsSync(p)).map((p) => basename(p)), [], "left with nobody holding them");
-    assert.deepEqual(held.filter((p) => !existsSync(p)).map((p) => basename(p)), [], "removed while held");
+    try {
+      // pid 1 is alive but did not write this stamp, which is how liveLeases tells a holder that died.
+      const gone = [
+        planted("K.publish.1.ab12cd", "1-ab12cd"),
+        // Staged and left before its lease went in, by a process whose own lease is gone.
+        planted("K.publish.4242.ef34gh"),
+        planted("K.publish", "1-ij56kl"),
+        planted("K.reading", `1-${Date.now()}-mn78op`),
+        planted("L.reading"),
+      ];
+      const held = [
+        planted(`L.publish.${process.pid}.qr90st`, `${process.pid}-qr90st`),
+        // Staged, its lease not in it yet: the export and the diff previous it is staged for are still running.
+        planted(`M.publish.${process.pid}.uv12wx`),
+        planted(`N.publish.${process.pid}.gh78ij`),
+        planted("L.publish", `${process.pid}-yz34ab`),
+        planted("M.reading", `${process.pid}-${Date.now()}-cd56ef`),
+        // An export's own lease directory, which every export of the key uses again.
+        planted("K"),
+      ];
+      cleanStaleDownloads(dir);
+      assert.deepEqual(gone.filter((p) => existsSync(p)).map((p) => basename(p)), [], "left with nobody holding them");
+      assert.deepEqual(held.filter((p) => !existsSync(p)).map((p) => basename(p)), [], "removed while held");
+    } finally {
+      callers.forEach(dropLease);
+    }
   });
 
-  it("never takes a staged publish lock from its owner, not even in the moment before its lease is in it", async () => {
-    // The one moment a staged lock holds no lease is its owner's, between its mkdir and its lease. A sweep there that
-    // removed it made the owner's lease write fail, twice running in the worst case, and the publish then went ahead
-    // without the lock. So the sweep runs at that moment, and right after the lease, of every staging this export makes.
+  /**
+   * A refresh of K run with `during(staged)` called right after each staging of its publish lock is made, before its
+   * lease goes in, and the sweep run there - by a clock `ahead` ms ahead of this one - and right after the lease:
+   * whether the swap onto the snapshot was made holding the lock, and how many stagings it took. The lock's ceiling
+   * is two seconds, past which the swap goes ahead without it: a staging taken away every time it is made ends there
+   * rather than ten minutes on.
+   */
+  const publishBesideSweeps = async ({ during = (_staged: string) => {}, ahead = 0 } = {}) => {
     const x = exporter();
     const dir = tempDir();
-    const store = new SnapshotStore(x.web, dir, HOUR);
+    const store = new SnapshotStore(x.web, dir, HOUR, 4, 2000);
     await store.get("K");
     const fs = createRequire(import.meta.url)("node:fs");
     const real = { mkdirSync: fs.mkdirSync, writeFileSync: fs.writeFileSync, renameSync: fs.renameSync };
     const staging = (path: unknown) => /\.publish\.\d+\.[a-z0-9]+$/.test(String(path));
-    let sweeps = 0;
+    let stagings = 0;
     const lockedAtSwap: boolean[] = [];
     fs.mkdirSync = (path: string, ...rest: unknown[]) => {
       const made = real.mkdirSync(path, ...rest);
       if (staging(path)) {
-        sweeps++;
-        cleanStaleDownloads(dir);
+        stagings++;
+        during(String(path));
+        const now = Date.now() + ahead;
+        const clock = mock.method(Date, "now", () => now);
+        try {
+          cleanStaleDownloads(dir);
+        } finally {
+          clock.mock.restore();
+        }
       }
       return made;
     };
     fs.writeFileSync = (path: string, ...rest: unknown[]) => {
       real.writeFileSync(path, ...rest);
-      if (staging(dirname(String(path)))) {
-        sweeps++;
-        cleanStaleDownloads(dir);
-      }
+      if (staging(dirname(String(path)))) cleanStaleDownloads(dir);
     };
     fs.renameSync = (from: string, to: string) => {
       if (to === store.figPath("K")) lockedAtSwap.push(existsSync(join(dir, "exports", "K.publish")));
@@ -1365,9 +1386,37 @@ describe("SnapshotStore beside another process's sweep", () => {
       Object.assign(fs, real);
       syncBuiltinESMExports();
     }
-    assert.equal(sweeps, 2, "a sweep before its lease and one after it");
-    assert.deepEqual(lockedAtSwap, [true], "and the swap was made holding the lock");
     assert.deepEqual(readdirSync(join(dir, "exports")), ["K"], "nothing of the lock left behind");
+    return { stagings, lockedAtSwap };
+  };
+
+  it("never takes a staged publish lock from its owner, before its lease is in it included, whatever the clocks say", async () => {
+    // The one moment a staged lock holds no lease of its own is its owner's, between its mkdir and its lease, and the
+    // sweep judged it there by its age: a minute. A filesystem two minutes behind this process's clock, or an owner
+    // stopped for two minutes in that moment, made it a crash's, and the sweep removed it from under its owner.
+    const minutes = (n: number) => n * 60_000;
+    const behind = await publishBesideSweeps({
+      during: (staged) => {
+        const then = new Date(Date.now() - minutes(2));
+        utimesSync(staged, then, then);
+      },
+    });
+    assert.deepEqual(behind, { stagings: 1, lockedAtSwap: [true] }, "on a filesystem whose clock runs behind");
+    // The sweep runs two minutes after the mkdir, as one would while the owner was stopped there.
+    const stopped = await publishBesideSweeps({ ahead: minutes(2) });
+    assert.deepEqual(stopped, { stagings: 1, lockedAtSwap: [true] }, "with its owner stopped between its mkdir and its lease");
+  });
+
+  it("stages its publish lock again when the staging is taken away, rather than publish without the lock", async () => {
+    // Taken away twice running, a staging counted as a lock that cannot be taken at all, and the swap went ahead
+    // without one: what an age-judging sweep did to a live owner. Three times here, by anything that removes it.
+    let removals = 0;
+    const result = await publishBesideSweeps({
+      during: (staged) => {
+        if (removals++ < 3) rmSync(staged, { recursive: true });
+      },
+    });
+    assert.deepEqual(result, { stagings: 4, lockedAtSwap: [true] });
   });
 
   it("leaves no reader directory behind diff previous, and a reader arriving as the last one leaves takes its lease", async () => {

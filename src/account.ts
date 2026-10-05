@@ -53,6 +53,8 @@ export interface ProjectConfig {
   account?: string;
   /** Absolute; relative entries in the file are resolved against the file's directory. */
   filesDirs?: string[];
+  /** Pages figma_search leaves out by default, by name: archives, templates, a copied design system. */
+  excludePages?: string[];
 }
 
 /** The nearest .figma-reader.json from start upwards. */
@@ -77,6 +79,9 @@ function readConfigObject(path: string): Record<string, any> {
   if (raw.filesDirs !== undefined && !(Array.isArray(raw.filesDirs) && raw.filesDirs.every((d: unknown) => typeof d === "string"))) {
     throw new Error(`${path}: "filesDirs" must be an array of paths`);
   }
+  if (raw.excludePages !== undefined && !(Array.isArray(raw.excludePages) && raw.excludePages.every((p: unknown) => typeof p === "string"))) {
+    throw new Error(`${path}: "excludePages" must be an array of page names`);
+  }
   return raw;
 }
 
@@ -87,6 +92,7 @@ function readProjectConfig(path: string): ProjectConfig {
     path,
     account: raw.account === undefined ? undefined : checkAccountName(raw.account),
     filesDirs: raw.filesDirs?.map((d: string) => resolve(base, tilde(d))),
+    excludePages: raw.excludePages,
   };
 }
 

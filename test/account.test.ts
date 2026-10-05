@@ -57,6 +57,16 @@ test("filesDirs resolve against the project file's directory", () => {
   assert.deepEqual(r.config?.filesDirs, [join(root, "design"), ABS]);
 });
 
+test("excludePages is read as written, and anything but a list of names is refused", () => {
+  const { nested } = project({ excludePages: ["Archive", "Templates"] });
+  assert.deepEqual(resolveAccount({}, nested).config?.excludePages, ["Archive", "Templates"]);
+  // A single name, the likeliest slip, would otherwise be searched for as nothing or spread into its letters.
+  for (const bad of ["Archive", [1], { name: "x" }]) {
+    const { nested: dir } = project({ excludePages: bad });
+    assert.throws(() => resolveAccount({}, dir), /"excludePages" must be an array of page names/, JSON.stringify(bad));
+  }
+});
+
 test("account names cannot escape the accounts directory", () => {
   // Backslash and a drive letter are separators too, on the platform whose roots these directories now live in.
   for (const name of ["../other", "..", ".hidden", "a\\b", "C:\\evil", "a b"]) {

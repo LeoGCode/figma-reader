@@ -130,6 +130,24 @@ test("--page naming no page is an error that lists the pages", async () => {
   assert.equal(JSON.parse((await cli(["search", bigFig, "frame", "--page", "Home", "--limit", "1"])).stdout).total, FRAMES / 2);
 });
 
+test("search skips the project's excludePages, --exclude-page replaces them, and --json can turn them off", async () => {
+  const proj = join(root, "excluding");
+  mkdirSync(proj);
+  writeFileSync(join(proj, ".figma-reader.json"), JSON.stringify({ excludePages: ["Home"] }));
+  const q = async (...args: string[]) => {
+    const r = await cli(["search", bigFig, "frame", "--limit", "1", ...args], { cwd: proj });
+    assert.equal(r.code, 0, r.stderr);
+    return JSON.parse(r.stdout);
+  };
+  const byDefault = await q();
+  assert.deepEqual([byDefault.total, byDefault.results[0].page, byDefault.excludedPages], [FRAMES / 2, "Settings", ["Home"]]);
+  assert.equal(byDefault.excludedPagesFrom, join(proj, ".figma-reader.json"));
+  const own = await q("--exclude-page", "Settings");
+  assert.deepEqual([own.total, own.results[0].page, own.excludedPages, own.excludedPagesFrom], [FRAMES / 2, "Home", ["Settings"], undefined]);
+  // An empty flag is bad usage, as it is for every list; an empty list is still an argument --json can give.
+  assert.equal((await q("--json", '{"exclude_pages":[]}')).total, FRAMES);
+});
+
 test("an empty --types is bad usage, not a filter that matches nothing", async () => {
   const r = await cli(["search", bigFig, "frame", "--types="]);
   assert.equal(r.code, 2);

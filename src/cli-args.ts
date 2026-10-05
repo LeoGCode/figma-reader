@@ -29,6 +29,10 @@ function schemaOf(shape: z.ZodRawShape) {
  */
 const argName = (props: Record<string, Prop>, key: string) => (!props[key] && props[`${key}s`]?.type === "array" ? `${key}s` : key);
 
+/** The arguments that take a list, which a batch line or --json has to give as a JSON array. */
+export const listArguments = (shape: z.ZodRawShape): string[] =>
+  Object.entries(schemaOf(shape).props).filter(([, p]) => p.type === "array").map(([k]) => k);
+
 /** Required string arguments are positional, in declaration order: <file>, then <query> or <out_dir>. */
 export function positionals(shape: z.ZodRawShape): string[] {
   const { props, required } = schemaOf(shape);
@@ -65,6 +69,8 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
   const pos = positionals(shape);
   const out: Record<string, unknown> = {};
   const rest: string[] = [];
+  /** The lists a --no-<flag> gave as empty, and the flag that did. */
+  const emptied = new Map<string, string>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--") {
@@ -100,15 +106,22 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
       }
       continue;
     }
-    let negate = false;
-    if (!props[key] && key.startsWith("no_") && props[key.slice(3)]?.type === "boolean") {
-      key = key.slice(3);
-      negate = true;
-    }
+    // --no-refresh turns a switch off, and --no-exclude-pages (or --no-exclude-page, as the list's singular reads)
+    // gives a list as empty: the one way to write [] here, so that the project's excludePages can be turned off
+    // without --json '{"exclude_pages":[]}'.
+    const negated = !props[key] && key.startsWith("no_") ? argName(props, key.slice(3)) : undefined;
+    const negate = negated !== undefined && (props[negated]?.type === "boolean" || props[negated]?.type === "array");
+    if (negate) key = negated!;
     const p = props[key];
     if (!p) throw new UsageError(`unknown option ${flag}`);
-    if (p.type === "boolean") {
-      if (negate && inline !== undefined) throw new UsageError(`${flag} takes no value`);
+    if (negate && inline !== undefined) throw new UsageError(`${flag} takes no value`);
+    if (p.type === "array" && negate) {
+      // Whatever else gives the list values is a contradiction, said once the whole command line is read (below).
+      // Only an unset list starts empty: ??= took a null from --json for unset too, so {"exclude_pages":null} passed
+      // before --no-exclude-page and was refused after it.
+      emptied.set(key, flag);
+      if (out[key] === undefined) out[key] = [];
+    } else if (p.type === "boolean") {
       const on = inline === undefined || TRUE.test(inline);
       if (!on && !FALSE.test(inline!)) throw new UsageError(`${flag} takes true/false, got ${JSON.stringify(inline)}`);
       out[key] = negate ? false : on;
@@ -119,8 +132,12 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
       out[key] = n;
     } else if (p.type === "array") {
       const items = value().split(",").map((s) => s.trim()).filter(Boolean);
-      // An empty list would filter out everything (--types= matched nothing) rather than mean "any".
-      if (!items.length) throw new UsageError(`${flag} needs at least one value`);
+      // An empty list would filter out everything (--types= matched nothing) rather than mean "any". One that is
+      // meant to be empty says so with --no-<flag>, so a value left empty by mistake (--exclude-page "$UNSET") never
+      // turns off the project's excludePages.
+      if (!items.length) {
+        throw new UsageError(`${flag} needs at least one value${required.includes(key) ? "" : `; --no-${flag.slice(2)} gives an empty list`}`);
+      }
       // Whatever --json seeded is added to, so it has to be a list: a number threw a raw TypeError out of the CLI,
       // and a string was spread into its characters and then searched for as ["F","R","A","M","E"].
       const prior = out[key] as unknown[] | undefined;
@@ -129,6 +146,12 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
     } else {
       out[key] = value();
     }
+  }
+  // A list adds up whichever side of --json or of each other its flags are written on, so --no-exclude-page next to
+  // --exclude-page Archive cannot mean "drop what came before": the two contradict each other, and that is said.
+  for (const [k, flag] of emptied) {
+    const v = out[k];
+    if (!Array.isArray(v) || v.length) throw new UsageError(`${flag} gives ${k} as an empty list, but it was also given ${JSON.stringify(v)}`);
   }
   // Positionals fill the slots no flag or --json already set, in order.
   const open = pos.filter((k) => out[k] === undefined);
@@ -176,7 +199,11 @@ export function commandUsage(bin: string, tool: { name: string; description: str
   const pos = positionals(tool.shape);
   const opts = Object.entries(props)
     .filter(([k]) => !pos.includes(k))
-    .map(([k, p]) => [`${flagName(k)}${kindOf(p)}`, p.description ?? ""]);
+    .flatMap(([k, p]) => [
+      [`${flagName(k)}${kindOf(p)}`, p.description ?? ""],
+      // The one way to give an optional list as empty, which is what turns off a default such as excludePages.
+      ...(p.type === "array" && !required.includes(k) ? [[`--no-${flagName(k).slice(2)}`, `Give ${k} as an empty list`]] : []),
+    ]);
   // Shown on the usage line too, since under [options] alone a flag the command cannot run without reads as optional.
   const flags = required.filter((k) => !pos.includes(k)).map((k) => ` ${flagName(k)}${kindOf(props[k])}`);
   // --json is always there, so a command without options of its own still gets a header and an aligned column.

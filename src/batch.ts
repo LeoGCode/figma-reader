@@ -4,7 +4,7 @@
 // store keeps the four decoded files used last for the next call, and every web call shares one browser launch. Kept
 // free of side effects, like cli-args.ts, so it can be tested on its own: the tools are passed in.
 import { AccountNotChosen } from "./account.ts";
-import { checkArgs, commandName } from "./cli-args.ts";
+import { checkArgs, commandName, listArguments, wrap } from "./cli-args.ts";
 import { outPath, writePrivateTemp } from "./local-files.ts";
 import type { Tool } from "./tools.ts";
 
@@ -117,7 +117,17 @@ export async function runBatch(lines: AsyncIterable<string> | Iterable<string>, 
 
 export const BATCH_SUMMARY = "Run tool calls given as JSON lines on stdin in one process, which keeps files decoded between calls.";
 
-export function batchUsage(bin: string): string {
+/**
+ * Every argument that takes a list, with the commands that take it, read off the schemas so that a list a tool gains
+ * is named here too: an agent wrote "node_ids": "1:2,3:4", the way the flag takes it, and lost the call.
+ */
+function lists(tools: Tool[]): string {
+  const takers = new Map<string, string[]>();
+  for (const t of tools) for (const k of listArguments(t.shape)) takers.set(k, [...(takers.get(k) ?? []), commandName(t.name)]);
+  return [...takers].map(([k, commands]) => `${k} (${commands.join(", ")})`).join(", ");
+}
+
+export function batchUsage(bin: string, tools: Tool[]): string {
   return [
     `Usage: ${bin} batch < calls.jsonl`,
     "",
@@ -130,6 +140,15 @@ export function batchUsage(bin: string): string {
     "tool is a command (get-text) or an MCP tool name (figma_get_text). args are the MCP argument names, as --json takes",
     "them, checked as strictly as a single call's. Blank lines are skipped. Each call with refresh exports the file",
     "again, as it would on its own, so pass it only on the first call that needs it.",
+    "",
+    wrap(
+      'args take JSON values: a number or a switch as a JSON number or boolean ("limit": 20, "include_text": true), and ' +
+        `a list as a JSON array, even of one value, never as a comma-separated string. The lists are ${lists(tools)}:`,
+      116,
+      "",
+    ),
+    "",
+    '  {"tool": "search", "args": {"file": "app.fig", "query": "Button", "types": ["FRAME"], "exclude_pages": []}}',
     "",
     "Each call is answered by one JSON line on stdout, in the same order:",
     "",

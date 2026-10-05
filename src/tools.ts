@@ -210,13 +210,9 @@ function writeOut(path: string, content: string | Uint8Array) {
   return abs;
 }
 
-const fileArg = z
-  .string()
-  .describe(
-    "Path to a local .fig file, or a Figma file key / figma.com/design/... URL. A node-id in the URL is used when this " +
-      "tool takes node_id and it is omitted; a tool that answers about the whole file ignores it. " +
-      "A key or URL uses a local '<name> [<key>].fig' from FIGMA_FILES_DIRS when one exists, otherwise exports through the browser.",
-  );
+/** Where an argument's one-line description sends the reader for the rest (see fileRule). */
+const SEE_RULES = "(see the server's instructions, or figma-reader help)";
+const fileArg = z.string().describe(`A local .fig path, a Figma file key or a figma.com/design/... URL ${SEE_RULES}`);
 /**
  * figma_screenshot never reads a local .fig for the image: it renders the live file in the browser, and reads a local
  * copy only to recognise a page id, which cannot be selected. fileArg promising it would be used was wrong there.
@@ -228,13 +224,25 @@ const screenshotFileArg = z
       "comes from the live file in the browser, so a local .fig path works only if its name carries the key " +
       "('<name> [<key>].fig'), and is read only to tell whether node_id is a page.",
   );
-const refreshArg = z
-  .boolean()
-  .optional()
-  .describe(
-    "Skip local/cached copies and export the live file through the browser. Has no effect when file is a path to a .fig: " +
-      "that file is read as it is on disk and the result carries refreshIgnored; pass the key or URL to export the live file instead.",
-  );
+const refreshArg = z.boolean().optional().describe(`Export the live file again rather than read a local or cached copy ${SEE_RULES}`);
+/**
+ * What file and refresh take and do, said once, as the dating rule is (see below): as the MCP server's instructions
+ * and in the CLI's help overview. Written out in each tool that reads a file, the same two descriptions were 7.4 KB
+ * of the 35 KB tool list every MCP session pays for before its first call; each tool's own now says in a line what it
+ * takes and points here. `name` and `arg` spell a tool and an argument as the reader calls them.
+ */
+export function fileRule(name = (tool: string) => tool, arg = (a: string) => a): string {
+  return [
+    `${arg("file")} is a local .fig path, a Figma file key, or a figma.com/design/... URL. A node-id in the URL is used by`,
+    `a tool that takes ${arg("node_id")} when that is omitted; a tool that answers about the whole file ignores it. A key`,
+    "or URL is read from a local '<name> [<key>].fig' under FIGMA_FILES_DIRS when one exists, otherwise from this",
+    "account's snapshot cache, which exports the file through the browser when it holds no snapshot of it or one older",
+    `than FIGMA_SNAPSHOT_MAX_AGE_MIN (30 minutes unless set). ${arg("refresh")} skips both and exports the live file`,
+    `through the browser. It has no effect when ${arg("file")} is a path to a .fig: that file is read as it is on disk`,
+    "and the result carries refreshIgnored; pass the key or URL to export the live file instead.",
+    `${name("figma_screenshot")} and ${name("figma_diff")} describe their own file arguments and, for diff, refresh.`,
+  ].join(" ");
+}
 /**
  * How a result is dated, said once: as the MCP server's instructions (mcp.ts) and in the CLI's help overview (cli.ts).
  * A snapshot answers for the file as it was, and a reader who is only told the answer is "fresh" cannot tell one taken

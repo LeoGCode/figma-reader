@@ -27,7 +27,7 @@ Read-only CLI: `figma-reader <command> <file> [flags]`. `<file>` is a local `.fi
 | Tokens, styles, components, images | `get-variables <file> --format css`, `get-styles <file>`, `token-usage <file> --node-id <id>`, `get-components <file>`, `export-image-fills <file> <dir>` |
 | Three or more calls | `batch` (below) |
 
-`load-file <file>` summarises a file (pages, counts, collections); rarely needed first.
+`load-file <file>` summarises a file; rarely needed first.
 
 ## Output
 
@@ -35,14 +35,14 @@ JSON on stdout unless marked text; exit 0 ok, 1 failed (message on stderr), 2 ba
 
 - `get-tree` (**text**: `grep`, not `jq`): line 1 `# {D}`, then `- <id> <TYPE> "<name>" <w>x<h> (<hints>)`, two spaces per level. Hints: `hidden`, `of "<component>"`, a text preview, `ready for dev`, `<n> children` (not opened), `<n> vectors`. A cut branch ends `- ... N more children`; a last line `level N not shown` names the `--max-nodes` that shows it.
 - `get-node`: one flat object, no wrapper: `{D, page, path, id, name, type, width, height, fills, layout, component, devStatus?, children[] or childCount}`. On TEXT, `characters` is the string and `text` the **style**.
-- `search`: `{D, total, truncated, excludedPages?, results[{id, type, name, page, characters?}]}`; a TEXT hit's string is `characters`, `name` the layer name.
+- `search`: `{D, total, truncated, excludedPages?, results[{id, type, name, page, characters?}]}`; a TEXT hit's string is `characters`, `name` the layer name. `--no-exclude-page` drops the project's default `excludedPages`.
 - `get-text`: `{D, total, truncated, unresolvedInstances, text[{id, text, frame?}]}`: `jq -r '.text[] | "\(.id) \(.text)"'`.
 - `locate`: `{D, found, missing, invalid, results[{id, found, type?, name?, page?, path?}]}`.
 - `dev-status`: `{D, total, neverMarked?, nodes[{id, name, page, status, raw, previous, changedAt}]}`; `neverMarked`: records left out, which `--status any` lists.
 - `diff`: `{old{D}, new{D}, counts, byPage, layers{added, removed, renamed, moved}, removedNodes[{id, page, path, removedCount}], truncated}`; `changes`: `{D, total, byPage, layers[{id, name, page, lastEditedAt, created, editedNodes}]}`.
 - Any other command, every key and every flag: read `references/output.md` (beside this file) before you parse it.
 
-**batch**: one JSON call per stdin line, `{"tool": "locate", "args": {"file": "<file>", "node_ids": ["1:2", "3:4"]}}`: MCP argument names and types (`node_ids` and `exclude_pages` are arrays, `include_text` a boolean). One decode for all; one line back per call, `{"i": 0, "ok": true, "result": <its JSON, or text as a string>}` or `{"i": 1, "ok": false, "error": "…"}`; exit 1 if any failed, 2 if any was refused for want of an account. Pipe it through `jq` for the fields you need, or into a file you then query: a long answer is cut before you see it.
+**batch**: one JSON call per stdin line, `{"tool": "locate", "args": {"file": "<file>", "node_ids": ["1:2", "3:4"]}}`: MCP argument names and types (`node_ids` an array, `include_text` a boolean; `figma-reader help batch` lists the arrays). One decode for all; one line back per call, `{"i": 0, "ok": true, "result": <its JSON, or text as a string>}` or `{"i": 1, "ok": false, "error": "…"}`; exit 1 if any failed, 2 if any was refused for want of an account. Pipe it through `jq` for the fields you need, or into a file you then query: a long answer is cut before you see it.
 
 ## Rules
 
@@ -50,7 +50,7 @@ JSON on stdout unless marked text; exit 0 ok, 1 failed (message on stderr), 2 ba
 - **Few calls.** Each call decodes the whole file (3–5 s on a large one) and each of your turns re-reads your context, so a call costs far more than its output. Scope with `--node-id`, `--page`, `--types`; put three or more calls in one `batch`; in a long conversation, hand the Figma reading to a subagent with a checklist of what to return (ids, values, date).
 - **Date what you report.** A snapshot this tool exported carries `exportedAt`, when it exported it, and `account`: say "as of <time>", never "currently". Keep passing the key; if `exportedAt` changes between your calls, it was exported again in between: say which answers came from which. A file read from disk (a `.fig` path, or a key or URL that a local `<name> [<key>].fig` answers) carries `fileModifiedAt` and no account: the copy's file time, which copying resets, so quote it as the file's time.
 - **Account.** If a call exits 2 with "no Figma account chosen", ask the user which account the project uses and pass only that with `--account`; never pick one yourself. If a file is not found or not accessible, say which account was used rather than trying another. If the browser is not logged in, run `figma-reader login`, ask the user to sign in in the window it opens, and retry.
-- **What writes.** A `.fig` path (but for `screenshot`) or a key whose cached snapshot is fresh writes nothing. A browser call (export, `screenshot`, `status`, `login`) writes only figma-reader's state, cache and data dirs (browser profile, `account.json`; or the `FIGMA_USER_DATA_DIR` profile), never your working tree; if state or cache is read-only, its error says which. Images go to a private temp file or `--save-path`; `--out-file` and `export-image-fills` write where you say. So use it under "read-only" instructions; if they forbid creating any file, read by path or ask.
+- **What writes.** A `.fig` path (not for `screenshot`) or a key whose cached snapshot is fresh writes nothing. A browser call (export, `screenshot`, `status`, `login`) writes only figma-reader's own state, cache and data dirs (its browser profile among them), never your working tree; a read-only one is named in the error. Images go to a private temp file or `--save-path`; `--out-file` and `export-image-fills` write where you say. So use it under "read-only" instructions; if they forbid creating any file, read by path or ask.
 - **Dev status:** quote the raw value beside the name until the mapping is confirmed ("marked `BUILD`, read as Ready for dev, on <changedAt>"). `status: none` with `previous` other than `none` is a mark removed at `changedAt`. Never infer readiness from names or pages.
 - **diff and changes** compare ids, names, parents and edit times only: an edited text, colour or size shows in neither. Read `byPage` first, then pass `--page <p>` for the page you need, or `--exclude-page` for one that churns.
 - A non-zero `unresolvedInstances` means some text is missing from the result (`get-text` names the components in `unresolved`). `get-node` refuses results over 200 KB: lower `--depth`.

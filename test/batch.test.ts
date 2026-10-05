@@ -9,6 +9,7 @@ import { basename, join } from "node:path";
 import { z } from "zod";
 import { FigDocument } from "../src/fig-file.ts";
 import { FigmaWeb } from "../src/figma-web.ts";
+import type { Tool } from "../src/tools.ts";
 import { figBytes, type TestNode } from "./fixtures.ts";
 
 const root = mkdtempSync(join(tmpdir(), "figma-reader-batch-"));
@@ -28,7 +29,7 @@ process.env.FIGMA_FILES_DIRS = listed;
 process.env.FIGMA_BROWSER_PATH = join(root, "no-such-browser");
 for (const k of ["FIGMA_CDP_URL", "FIGMA_USER_DATA_DIR", "FIGMA_SNAPSHOT_MAX_AGE_MIN"]) delete process.env[k];
 const { release, tools } = await import("../src/tools.ts");
-const { runBatch } = await import("../src/batch.ts");
+const { batchUsage, runBatch } = await import("../src/batch.ts");
 after(async () => {
   await release();
   rmSync(root, { recursive: true, force: true });
@@ -280,5 +281,18 @@ describe("batch", () => {
     const count = { name: "figma_count", description: "", readOnly: true, shape: {}, run: async () => (runs++, { content: [{ type: "text" as const, text: "{}" }] }) };
     const summary = await runBatch([line("count"), line("count"), line("count")], [count], async () => false);
     assert.deepEqual([summary.answered, runs], [1, 1]);
+  });
+
+  it("names in its help every argument a line gives as a list, from the tools it is given", () => {
+    // A trial agent passed node_ids as "1:2,3:4", the way --node-ids takes them, and lost the call. Read off the
+    // schemas, so a list a tool gains is named too: here two tools sharing one, and a required one.
+    const run = async () => ({ content: [] });
+    const fake: Tool[] = [
+      { name: "figma_pick", description: "", readOnly: true, shape: { ids: z.array(z.string()).min(1), tags: z.array(z.string()).optional() }, run },
+      { name: "figma_sort", description: "", readOnly: true, shape: { tags: z.array(z.string()).optional(), limit: z.number().optional() }, run },
+    ];
+    const usage = batchUsage("fr", fake).replace(/\s+/g, " ");
+    assert.match(usage, /a list as a JSON array, even of one value, never as a comma-separated string\. The lists are ids \(pick\), tags \(pick, sort\):/);
+    assert.doesNotMatch(usage, /limit \(/);
   });
 });

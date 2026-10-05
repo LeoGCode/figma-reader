@@ -85,12 +85,13 @@ async function refused(name: string, args: Record<string, unknown>, why: RegExp)
 describe("a call nothing chose an account for, with another account on this machine", { skip: stray && `${stray} is above the temp dir` }, () => {
   it("is refused before it reaches the cache or the browser, for every tool that takes a file", async () => {
     // Every tool with a file argument, so that one added later is held to the same rule. node_id is given because
-    // figma_screenshot asks for it before anything else; the other tools reach the refusal before they look at it.
+    // figma_screenshot asks for it before anything else, and since because figma_changes reads it before the file (a
+    // typo is reported without an export); the other tools reach the refusal before they look at either.
     const fileTools = tools.filter((t) => "file" in t.shape).map((t) => t.name);
     assert.ok(fileTools.length >= 11, fileTools.join(", "));
     for (const name of fileTools) {
       for (const file of [KEY, `https://www.figma.com/design/${KEY}/App?node-id=1-1`]) {
-        assert.deepEqual(await refused(name, { file, node_id: "1:1" }, /other accounts exist \(acme\)/), [], `${name} on ${file}`);
+        assert.deepEqual(await refused(name, { file, node_id: "1:1", since: "7d" }, /other accounts exist \(acme\)/), [], `${name} on ${file}`);
       }
     }
     // A refresh asks for the live file however the key would otherwise be served.

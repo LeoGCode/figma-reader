@@ -243,6 +243,24 @@ test("locate takes its ids from --node-ids, and cannot run without them", async 
   assert.match(without.stderr, /^figma-reader locate: missing --node-ids\n/);
 });
 
+test("diff takes the older file first, and changes its since as a flag or a positional", async () => {
+  // Not in the work directory, whose .fig files list-files counts.
+  mkdirSync(join(root, "diff"));
+  const smaller = join(root, "diff", "smaller.fig");
+  writeFileSync(smaller, figBytes(big.slice(0, 3)));
+  const r = await cli(["diff", bigFig, smaller, "--limit", "1"]);
+  assert.equal(r.code, 0, r.stderr);
+  const d = JSON.parse(r.stdout);
+  assert.deepEqual([d.old.path, d.new.path, d.counts.layersRemoved, d.layers.removed.length], [bigFig, smaller, FRAMES - 1, 1]);
+  const flag = await cli(["changes", smaller, "--since", "7d"]);
+  const positional = await cli(["changes", smaller, "7d"]);
+  assert.equal(flag.code, 0, flag.stderr);
+  assert.deepEqual(Object.keys(JSON.parse(flag.stdout)), Object.keys(JSON.parse(positional.stdout)));
+  const missing = await cli(["changes", smaller]);
+  assert.equal(missing.code, 2);
+  assert.match(missing.stderr, /missing <since>/);
+});
+
 test("account commands have help and exit 2 on bad usage", async () => {
   for (const args of [["help", "use"], ["help", "accounts"], ["use", "--help"], ["accounts", "-h"]]) {
     const r = await cli(args);

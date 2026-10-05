@@ -11,6 +11,7 @@ import {
   accountCacheDir, accountProfileDir, CONFIG_FILE, DEFAULT_ACCOUNT, expandHome, otherAccounts, resolveAccount, writeAccountInfo,
 } from "./account.ts";
 import { BrowserManager, defaultExecutable, defaultStateDir } from "./browser.ts";
+import { changesSince, diffDocuments, parseSince } from "./changes.ts";
 import { componentUsage, componentUses } from "./component-usage.ts";
 import { DEV_STATUS_FILTERS, devStatusList } from "./dev-status.ts";
 import type { Raw } from "./fig-file.ts";
@@ -1079,6 +1080,96 @@ tool(
       written.push({ hash, path, bytes: bytes.length, ...usedBy(names) });
     }
     return json(written);
+  },
+);
+
+/** The keyword figma_diff takes for old. parseFileRef refuses it, so it can never name a file of its own. */
+const PREVIOUS = "previous";
+
+tool(
+  "figma_diff",
+  "Compare two snapshots of one file by node id. Figma keeps a node's id through renames and moves, so the id says " +
+    "what is the same layer: pages added, removed or renamed; top-level layers (a page's children, and the children of " +
+    "its sections) added, removed, renamed (same id, other name) or moved (same id, other parent, so a move to another " +
+    "page shows in from.page/to.page; a layer carried inside a moved section keeps its parent and is not listed); and " +
+    "removedNodes, every node gone from the visible pages at any depth with the page and path it had, the topmost of " +
+    "each removed subtree first and the rest naming it in removedWith. Only ids, names and parents are compared: an " +
+    "edit to text, fills, sizes or any other property is reported nowhere. Every list stops at limit, counts has each " +
+    "total, and truncated says whether any list was cut. A node created and deleted between the two snapshots is in " +
+    "neither. old may be the word previous: the snapshot this account's cache held for new's key before its latest " +
+    "export (one per key, kept by every export that replaces a snapshot). new is then read from that cache, never from " +
+    "a local copy, and refresh exports it again first, which keeps the snapshot it replaces as previous: so " +
+    "'previous <key>' with refresh compares the last export with the live file. old and new are each dated as the " +
+    "other tools date a result, exportedAt for a snapshot this tool exported and fileModifiedAt for a local .fig: " +
+    "report the changes as between those two times.",
+  {
+    old: z.string().describe("The older file: a .fig path, file key or figma.com URL, or the word previous for the snapshot that new's latest export replaced"),
+    new: z.string().describe("The newer file: a .fig path, file key or figma.com URL; a key or URL when old is previous. A node-id in a URL is ignored"),
+    limit: z.number().int().positive().optional().describe("Most entries in each list (default 100)"),
+    refresh: z.boolean().optional().describe(
+      "Export new again through the browser first (old is never refreshed). Has no effect when new is a path to a .fig, " +
+        "and the result's new carries refreshIgnored",
+    ),
+  },
+  async ({ old, new: next, limit, refresh }) => {
+    const max = limit ?? 100;
+    if (old.trim().toLowerCase() !== PREVIOUS) {
+      const n = await open(next, refresh);
+      const o = await open(old);
+      const side = (s: typeof n) => ({ key: s.key, source: s.source, path: s.path, ...s.dated });
+      return json({ old: side(o), new: side(n), ...diffDocuments(o.doc, n.doc, max) });
+    }
+    const ref = parseFileRef(next);
+    if (ref.path) {
+      throw new Error(
+        `previous is the snapshot this account's cache kept for a file key, so new must be that key or URL, not a path ` +
+          `(${ref.path}); to compare two .fig files, pass both paths`,
+      );
+    }
+    // new first: an export it makes is what decides which snapshot is the previous one.
+    const doc = await store.get(ref.key, refresh);
+    // The one this snapshot replaced, read with it as one pair: it throws rather than pair it with another one.
+    const prev = await store.previousOf(ref.key, doc);
+    if (!prev) {
+      throw new Error(
+        `no previous snapshot of ${ref.key} in account "${account.name}"'s cache, only the current one (exported ` +
+          `${doc.exportedAt.toISOString()}): one is kept when an export replaces a snapshot. Pass refresh to export ` +
+          `again, which keeps the current one as previous, or pass two files`,
+      );
+    }
+    // A snapshot this tool exported, like the current one, and dated the same way: the link kept that export's time.
+    return json({
+      old: { key: ref.key, source: PREVIOUS, path: store.previousPath(ref.key), exportedAt: prev.exportedAt.toISOString() },
+      new: { key: ref.key, source: "web", exportedAt: doc.exportedAt.toISOString() },
+      ...diffDocuments(prev, doc, max),
+    });
+  },
+);
+
+tool(
+  "figma_changes",
+  "Top-level layers created or edited since a date or duration, from Figma's edit times per node. A top-level layer " +
+    "is a page's child or a child of its sections, rolled up from everything under it: lastEditedAt is the newest time " +
+    "in it, editedNodes how many of its nodes were created or edited at or after since, created whether the layer " +
+    "itself was; page and path say where it is. Newest first; the editedNodes beside the list counts each such node " +
+    "once. This is edit metadata from one snapshot: it shows nothing deleted (figma_diff lists removals) and never what " +
+    "an edit was, only when. A node that records no time counts only where Figma also moved an ancestor's; " +
+    "undatedNodes counts those, and text layers are among them in every export seen. " +
+    EXPORTED_AT_NOTE,
+  {
+    file: fileArg,
+    since: z.string().describe(
+      "An ISO-8601 date (2026-10-01, midnight UTC) or date and time (2026-10-01T09:30:00Z; local time without an offset), " +
+        "or a duration back from now: 30m, 12h, 7d, 2w. The result's since is the instant it was read as",
+    ),
+    limit: z.number().int().positive().optional().describe("Default 50"),
+    refresh: refreshArg,
+  },
+  async ({ file, since, limit, refresh }) => {
+    // Read before the file, so a typo is reported without waiting for an export.
+    const at = parseSince(since);
+    const { doc, dated } = await open(file, refresh);
+    return json({ ...dated, ...changesSince(doc, at, limit ?? 50) });
   },
 );
 

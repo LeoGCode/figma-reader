@@ -4,7 +4,7 @@
 // hardcoded false, with the whole suite green. These call the handlers directly, on .fig files written here.
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync, zipSync } from "fflate";
@@ -79,11 +79,13 @@ const SCHEMA = parseSchema(`
   message SectionStatusInfo {
     SectionStatus status = 1; uint lastUpdateUnixTimestamp = 2; string description = 3; string userId = 4; SectionStatus prevStatus = 5;
   }
+  message EditInfo { uint createdAt = 1; uint lastEditedAt = 2; }
   message NodeChange {
     GUID guid = 1; ParentIndex parentIndex = 2; string type = 3; string name = 4; string key = 5;
     TextData textData = 6; SymbolData symbolData = 7; string sourceLibraryKey = 8; string componentKey = 9;
     VariableSetMode[] variableSetModes = 10; string styleType = 11;
     Paint[] fillPaints = 12; Paint[] strokePaints = 13; SectionStatusInfo sectionStatusInfo = 14;
+    EditInfo editInfo = 15;
   }
   message Message { NodeChange[] nodeChanges = 1; }
 `);
@@ -516,6 +518,7 @@ describe("dating a result", () => {
       ["figma_get_components", {}],
       ["figma_dev_status", {}],
       ["figma_locate", { node_ids: ["1:1"] }],
+      ["figma_changes", { since: "7d" }],
     ] as [string, Record<string, unknown>][]) {
       const r = await call(name, { file, ...args });
       assert.equal(r.fileModifiedAt, taken.toISOString(), name);
@@ -722,6 +725,107 @@ describe("figma_dev_status", () => {
     await assert.rejects(body("figma_dev_status", { file, page: "Pag" }), /no page named "Pag"; pages: "Page"/);
     // The CLI and the MCP server both validate against this shape, so a status nobody spells this way is refused there.
     assert.equal(z.object(byName.get("figma_dev_status")!.shape).strict().safeParse({ file, status: "ready" }).success, false);
+  });
+});
+
+describe("figma_diff", () => {
+  const before = figFile("diff-before", [
+    page,
+    { id: "1:1", type: "FRAME", parent: "0:1", name: "Login" },
+    ...many(101, (i) => ({ id: `2:${i + 1}`, type: "FRAME", parent: "1:1", name: `field ${i}` })),
+  ]);
+  const after = figFile("diff-after", [page, { id: "1:1", type: "FRAME", parent: "0:1", name: "Sign in" }]);
+  const old = new Date("2026-09-25T13:44:10.000Z");
+  const now = new Date("2026-10-05T14:15:09.000Z");
+  utimesSync(before, old, old);
+  utimesSync(after, now, now);
+
+  it("compares two .fig files, each dated as the other tools date a local file", async () => {
+    const r = await call("figma_diff", { old: before, new: after });
+    assert.deepEqual(r.old, { source: "local", path: before, fileModifiedAt: old.toISOString() });
+    assert.deepEqual(r.new, { source: "local", path: after, fileModifiedAt: now.toISOString() });
+    assert.deepEqual(r.layers.renamed.map((l: { id: string; oldName: string }) => [l.id, l.oldName]), [["1:1", "Login"]]);
+    // 101 nodes went from inside a frame still there: one more than the default limit.
+    assert.deepEqual([r.limit, r.truncated, r.counts.removedNodes, r.removedNodes.length], [100, true, 101, 100]);
+    assert.equal(r.removedNodes[0].path, "Page / Login / field 0");
+    const all = await call("figma_diff", { old: before, new: after, limit: 101 });
+    assert.deepEqual([all.truncated, all.removedNodes.length], [false, 101]);
+  });
+
+  it("says a refresh could not be honoured for a path, on the side it was asked for", async () => {
+    const r = await call("figma_diff", { old: before, new: after, refresh: true });
+    assert.deepEqual([r.old.refreshIgnored, r.new.refreshIgnored], [undefined, true]);
+  });
+
+  describe("against previous", () => {
+    const key = "PREVKEY12345";
+    const cache = join(root, "cache", "accounts", "tools-test");
+    mkdirSync(cache, { recursive: true });
+    copyFileSync(before, join(cache, `${key}.previous.fig`));
+    copyFileSync(after, join(cache, `${key}.fig`));
+    utimesSync(join(cache, `${key}.previous.fig`), old, old);
+
+    it("compares the key's previous snapshot with its current one, both dated as exports", async () => {
+      const current = statSync(join(cache, `${key}.fig`)).mtime.toISOString();
+      // A local copy named for the key would answer any other tool. previous is the cache's, so the snapshot it is
+      // compared with has to be the cache's too: a copy the user saved is some other moment of the file.
+      const local = join(listed, `Diff [${key}].fig`);
+      copyFileSync(before, local);
+      try {
+        for (const old of ["previous", "Previous"]) {
+          const r = await call("figma_diff", { old, new: `https://www.figma.com/design/${key}/Diff?node-id=1-1` });
+          assert.deepEqual(r.old, { key, source: "previous", path: join(cache, `${key}.previous.fig`), exportedAt: "2026-09-25T13:44:10.000Z" });
+          assert.deepEqual(r.new, { key, source: "web", exportedAt: current });
+          assert.deepEqual([r.counts.layersRenamed, r.counts.removedNodes], [1, 101]);
+        }
+      } finally {
+        rmSync(local, { force: true });
+      }
+    });
+
+    it("says there is none rather than comparing with something else", async () => {
+      copyFileSync(after, join(cache, "NOPREVKEY123.fig"));
+      await assert.rejects(
+        byName.get("figma_diff")!.run({ old: "previous", new: "NOPREVKEY123" }),
+        /no previous snapshot of NOPREVKEY123 in account "tools-test"'s cache, only the current one \(exported .*\).*Pass refresh/,
+      );
+    });
+
+    it("needs the key, since a path has no previous snapshot", async () => {
+      await assert.rejects(byName.get("figma_diff")!.run({ old: "previous", new: after }), /new must be that key or URL, not a path/);
+    });
+  });
+});
+
+describe("figma_changes", () => {
+  const T = Date.parse("2026-10-01T00:00:00Z") / 1000;
+  const file = figFile("changes", [
+    page,
+    { id: "1:1", type: "FRAME", parent: "0:1", name: "Login", editInfo: { createdAt: T - 100, lastEditedAt: T - 100 } },
+    { id: "1:2", type: "FRAME", parent: "1:1", name: "Form", editInfo: { createdAt: T - 100, lastEditedAt: T + 60 } },
+    ...many(51, (i) => ({ id: `2:${i + 1}`, type: "FRAME", parent: "0:1", name: `new ${i}`, editInfo: { createdAt: T + i, lastEditedAt: T + i } })),
+  ]);
+
+  it("lists the top-level layers edited since, rolled up, newest first, 50 by default", async () => {
+    const r = await call("figma_changes", { file, since: "2026-10-01" });
+    assert.deepEqual([r.since, r.returned, r.total, r.truncated, r.limit], ["2026-10-01T00:00:00.000Z", 50, 52, true, 50]);
+    assert.deepEqual(r.layers[0], {
+      id: "1:1", name: "Login", type: "FRAME", page: "Page", path: "Page / Login",
+      lastEditedAt: new Date((T + 60) * 1000).toISOString(), created: false, editedNodes: 1,
+    });
+    assert.deepEqual([r.layers[1].id, r.layers[1].created], ["2:51", true]);
+  });
+
+  it("reports a since it cannot read, instead of reading it somehow", async () => {
+    await assert.rejects(byName.get("figma_changes")!.run({ file, since: "last week" }), /since "last week" is neither an ISO-8601 date/);
+  });
+
+  it("reports a bad since before it reads any file", async () => {
+    // A file that is not there would answer "not found" if it were opened first; for a key it would be an export.
+    const missing = join(root, "not-there.fig");
+    for (const since of ["2026-02-29", "99999999999w"]) {
+      await assert.rejects(byName.get("figma_changes")!.run({ file: missing, since }), /since "[^"]+" (names a date|reaches back)/, since);
+    }
   });
 });
 

@@ -1,7 +1,7 @@
-// Snapshot cache: one exported .fig per file key on disk, decoded documents kept in memory.
-import { existsSync, mkdirSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
+// Snapshot cache: the latest exported .fig per file key on disk, and the one it replaced; decoded documents in memory.
+import { existsSync, linkSync, mkdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { dropLease, liveLeases, takeLease } from "./browser.ts";
+import { dropLease, liveLeases, processStamp, takeLease } from "./browser.ts";
 import { FigDocument } from "./fig-file.ts";
 import type { FigmaWeb } from "./figma-web.ts";
 
@@ -16,6 +16,8 @@ export const LEASE_POLL_MS = 100;
  * costs the duplicate export the wait would have saved, which is what every export did before the wait existed.
  */
 const OTHER_EXPORT_WAIT_MS = 600_000;
+/** How often a held publish lock is looked at again: it is held for a few file operations (see underPublishLock). */
+const PUBLISH_POLL_MS = 10;
 
 /**
  * An export whose lease name says it began at or before `since`, so it may be exporting the file as it was before
@@ -117,6 +119,15 @@ export class SnapshotStore {
 
   figPath(fileKey: string) {
     return join(this.dir, `${fileKey}.fig`);
+  }
+
+  /**
+   * The snapshot the key's latest export replaced, kept for figma_diff: exactly one per key, so each export that
+   * replaces a snapshot replaces this one too (see keepPrevious). A key is letters and digits only, so this name is
+   * never another key's figPath; it is not the shape cleanStaleDownloads sweeps either.
+   */
+  previousPath(fileKey: string) {
+    return join(this.dir, `${fileKey}.previous.fig`);
   }
 
   /**
@@ -291,13 +302,167 @@ export class SnapshotStore {
       // reading the snapshot back finds this document rather than decoding the same bytes again.
       const doc = FigDocument.fromFile(fileKey, mine, st.mtime);
       this.stamps.set(doc, `${st.mtimeMs}:${st.size}`);
-      renameSync(mine, path);
+      // Only an export that decoded gets this far, so one that failed leaves the snapshot and the previous one alone.
+      await this.underPublishLock(fileKey, () => this.publish(fileKey, mine, tag));
       return this.remember(doc);
     } finally {
       // The lease goes only once the export it announces has written the file, which is what lets another process
       // read the lease being gone as that export's work being on disk.
       dropLease(lease);
       rmSync(mine, { force: true });
+    }
+  }
+
+  /**
+   * Swap this export onto the snapshot, keeping the one it replaces as the key's previous snapshot. Always under the
+   * key's publish lock (see underPublishLock).
+   *
+   * The snapshot being replaced is given a second name rather than moved: a hard link to the file at figPath, which
+   * the export then renames over as it always has. Moving it first would leave the snapshot path empty until that
+   * rename, and every reading of it above relies on there being a file: a process finding none there would export
+   * again, take "no file" as the floor a refresh is judged by, or fail a decode it had just stat'ed for. The link
+   * costs no copy and carries the old export's mtime, which is what dates the previous snapshot.
+   *
+   * The link becomes previousPath only once the export is the snapshot. The other order lost the history it was
+   * there to keep: a rename onto the snapshot that failed (Windows refuses to replace a file another process has open)
+   * left the old previous replaced by the snapshot that was still current, so the two were one file and the older
+   * one was gone. Now a failed swap changes neither.
+   *
+   * Best effort past the swap: an export is never failed for its history. Without hard links (FAT, some network
+   * mounts) nothing is kept; where the old previous cannot be replaced it stays as it was, older than it should be but
+   * dated by its own time, which figma_diff reports. The staging name is the shape cleanStaleDownloads sweeps, for a
+   * crash in between.
+   */
+  private publish(fileKey: string, mine: string, tag: string) {
+    const staged = `${this.previousPath(fileKey)}.${process.pid}.${tag}.tmp`;
+    let kept = false;
+    try {
+      try {
+        linkSync(this.figPath(fileKey), staged);
+        kept = true;
+      } catch {
+        // ENOENT is the first export of a key, which has nothing to keep.
+      }
+      renameSync(mine, this.figPath(fileKey));
+      if (kept) {
+        try {
+          renameSync(staged, this.previousPath(fileKey));
+        } catch {}
+      }
+    } finally {
+      rmSync(staged, { force: true });
+    }
+  }
+
+  /**
+   * The previous snapshot of a key whose current snapshot is `current`, or undefined when none was kept. The two are
+   * read as one generation: under the publish lock both files are given private names, so no export can publish
+   * between the two readings and pair a previous snapshot with a current one that did not replace it. If an export
+   * has published since `current` was read, this throws rather than answer about a pair nobody asked about; so it
+   * does for a previous snapshot that is the current one, which no export here leaves behind, since a diff of the two
+   * would report no change at all.
+   */
+  async previousOf(fileKey: string, current: FigDocument): Promise<FigDocument | undefined> {
+    const tag = Math.random().toString(36).slice(2, 8);
+    // The shape cleanStaleDownloads sweeps, for a crash before they are removed below.
+    const now = `${this.figPath(fileKey)}.${process.pid}.${tag}.tmp`;
+    const was = `${this.previousPath(fileKey)}.${process.pid}.${tag}.tmp`;
+    try {
+      const kept = await this.underPublishLock(fileKey, () => {
+        try {
+          linkSync(this.previousPath(fileKey), was);
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw e;
+        }
+        try {
+          linkSync(this.figPath(fileKey), now);
+        } catch {
+          // No snapshot to pair it with: the reading below then differs from current's, which says so.
+        }
+        return true;
+      });
+      if (!kept) return undefined;
+      const seen = asSeen(now);
+      if (seen !== this.stamps.get(current)) {
+        throw new Error(`the snapshot of ${fileKey} changed while it was being read (another export replaced it, or it was removed); ask again`);
+      }
+      if (asSeen(was) === seen) {
+        throw new Error(`the previous snapshot of ${fileKey} is the same file as its current one, so a diff of the two could only report no change`);
+      }
+      return this.fromDisk(this.previousPath(fileKey), was);
+    } finally {
+      rmSync(now, { force: true });
+      rmSync(was, { force: true });
+    }
+  }
+
+  /** Where the process holding the key's publish lock names itself (see underPublishLock). */
+  private publishLock(fileKey: string) {
+    return join(this.dir, "exports", `${fileKey}.publish`);
+  }
+
+  /**
+   * Run `step`, a few file operations, while holding the key's publish lock: every change to the pair of snapshot
+   * and previous snapshot, and every reading of the pair, goes through it. The export lease cannot be that: it says
+   * an export is under way, and two processes can each find none and both export (see awaitOtherExport), or one can
+   * reach the ceiling and export beside the other. Interleaved by injection, two publishes left a previous snapshot
+   * that the current one never replaced - export B linked and swapped between export A's link and A's swap, so A kept
+   * the snapshot B had replaced and B's was in neither name - and a diff reading the pair while an export published
+   * compared a snapshot with itself and reported nothing changed.
+   *
+   * The lock is a directory holding one lease, as liveLeases reads one, moved into place whole by a rename: renaming
+   * a directory fails where a directory that is not empty stands, so whoever's rename lands holds it, and nobody
+   * holds it without having said who. A holder that died there has its lease dropped by liveLeases by the same rules
+   * as an export lease (at once by pid; by its silence, for one in another pid namespace), and the empty directory it
+   * leaves is removed: POSIX renames over an empty directory, Windows does not, and rmdir takes only an empty one, so
+   * a holder that has just moved its own into place keeps it.
+   *
+   * Waiting has the export wait's ceiling, past which the step runs without the lock, as every publish did before
+   * there was one; so does a lock that cannot be taken at all, since that is no reason to fail an export.
+   */
+  private async underPublishLock<T>(fileKey: string, step: () => T): Promise<T> {
+    const lock = this.publishLock(fileKey);
+    const tag = Math.random().toString(36).slice(2, 8);
+    const name = `${process.pid}-${tag}`;
+    const staged = `${lock}.${process.pid}.${tag}`;
+    const deadline = Date.now() + this.otherExportWaitMs;
+    let held = false;
+    for (let missing = 0; ; ) {
+      try {
+        mkdirSync(staged, { recursive: true });
+        writeFileSync(join(staged, name), processStamp(process.pid));
+        renameSync(staged, lock);
+        held = true;
+        break;
+      } catch {
+        rmSync(staged, { recursive: true, force: true });
+      }
+      if (!existsSync(lock)) {
+        // Nothing stood in the way, so the lock cannot be taken here at all; a lock released at that instant is the
+        // other way to get here, and that does not happen twice running.
+        if (++missing > 1) break;
+        continue;
+      }
+      missing = 0;
+      if (Date.now() > deadline) break;
+      if (!liveLeases(lock).length) {
+        try {
+          rmdirSync(lock);
+          continue;
+        } catch {}
+      }
+      await sleep(PUBLISH_POLL_MS);
+    }
+    try {
+      return step();
+    } finally {
+      if (held) {
+        rmSync(join(lock, name), { force: true });
+        try {
+          rmdirSync(lock);
+        } catch {}
+      }
     }
   }
 

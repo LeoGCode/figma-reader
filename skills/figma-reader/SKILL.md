@@ -44,7 +44,7 @@ JSON on stdout unless marked text. Shapes name the keys you need, not every key;
 | `screenshot` | Text: `image written to <path>`, then `node <id>: <w>x<h>` (`page (all top-level layers) <id>: …` for a page); with `--save-path`, only that line, ending `saved to <path>` |
 | `export-image-fills` | `[{hash, path, bytes, usedBy, usedByTotal?}]`, one per image; `{hash, missing: true, usedBy}` where the export lacks it |
 
-With `--out-file`, `get-variables` and `get-styles` print `(written to <path>)` after the body: read the file.
+With `--out-file`, `get-variables` and `get-styles` print `(written to <path>; exportedAt <time>, account "<name>" (source: …))` after the body (`fileModifiedAt` for a local `.fig`); the file holds the body only: read it.
 
 ## Flags
 

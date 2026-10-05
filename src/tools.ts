@@ -802,6 +802,21 @@ tool(
   },
 );
 
+/**
+ * What out_file says of the file it wrote. figma_get_variables and figma_get_styles answer with the tokens or the
+ * stylesheet themselves and nothing else, so that what they write is that artifact alone: a date or an account in it
+ * would put a time that changes on every run, and the project file's absolute path, into a file people commit. The
+ * note printed after the body is not written, and an agent that writes a file reads that note rather than the body:
+ * it says where the file went, and when and through which account the copy it came from was read.
+ */
+const OUT_FILE_NOTE =
+  "Also write the result to this path. The answer then ends with a note, not written to the file: '(written to <path>; " +
+  "exportedAt <time>, account \"<name>\" (source: <source>))', or '(written to <path>; fileModifiedAt <time>)' for a local .fig";
+function writtenNote(path: string, dated: Raw) {
+  const when = dated.exportedAt ? `exportedAt ${dated.exportedAt}` : `fileModifiedAt ${dated.fileModifiedAt}`;
+  return `\n\n(written to ${path}; ${when}${dated.account ? `, ${accountLabel()}` : ""})`;
+}
+
 tool(
   "figma_get_variables",
   "Design variables (tokens) with collections, modes, per-mode values and resolved aliases. Works on any plan (no Enterprise REST API). " +
@@ -814,11 +829,11 @@ tool(
     collection: z.string().optional().describe("Only this collection name; a name no collection in the file has is an error listing the ones it has"),
     include_remote: z.boolean().optional().describe("Include library variables copied into the file (default true)"),
     css_prefix: z.string().optional(),
-    out_file: z.string().optional().describe("Also write the result to this path"),
+    out_file: z.string().optional().describe(OUT_FILE_NOTE),
     refresh: refreshArg,
   },
   async ({ file, format, collection, include_remote, css_prefix, out_file, refresh }) => {
-    const { doc } = await open(file, refresh);
+    const { doc, dated } = await open(file, refresh);
     // Filters pick what is written; names and alias references are still computed over every collection.
     const all = extractVariables(doc);
     // A collection name that matches nothing is a typo, not an answer. It used to be reported as "No variables found
@@ -838,8 +853,7 @@ tool(
       format === "css" ? variablesToCss(all, css_prefix ?? "", include)
       : format === "dtcg" ? JSON.stringify(variablesToDtcg(all, include), null, 2)
       : JSON.stringify(cols, null, 1);
-    const saved = out_file ? `\n\n(written to ${writeOut(out_file, body)})` : "";
-    return text(body + saved);
+    return text(body + (out_file ? writtenNote(writeOut(out_file, body), dated) : ""));
   },
 );
 
@@ -854,17 +868,16 @@ tool(
     type: z.enum(["FILL", "STROKE", "TEXT", "EFFECT", "GRID"]).optional().describe("Only styles of this type"),
     format: z.enum(["json", "css"]).optional(),
     css_prefix: z.string().optional(),
-    out_file: z.string().optional().describe("Also write the result to this path"),
+    out_file: z.string().optional().describe(OUT_FILE_NOTE),
     refresh: refreshArg,
   },
   async ({ file, type, format, css_prefix, out_file, refresh }) => {
-    const { doc } = await open(file, refresh);
+    const { doc, dated } = await open(file, refresh);
     let styles = extractStyles(doc);
     if (type) styles = styles.filter((s) => s.type === type);
     // Empty in the format that was asked for, as in figma_get_variables: a sentence is not JSON and not CSS.
     const body = format === "css" ? stylesToCss(styles, css_prefix ?? "") : JSON.stringify(styles, null, 1);
-    const saved = out_file ? `\n\n(written to ${writeOut(out_file, body)})` : "";
-    return text(body + saved);
+    return text(body + (out_file ? writtenNote(writeOut(out_file, body), dated) : ""));
   },
 );
 

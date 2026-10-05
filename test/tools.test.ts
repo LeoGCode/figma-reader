@@ -508,6 +508,18 @@ describe("dating a result", () => {
   const taken = new Date("2024-03-04T05:06:07.000Z");
   utimesSync(file, taken, taken);
 
+  it("dates a file out_file wrote in the note after the answer, and never in the file", async () => {
+    // get-variables and get-styles answer with the artifact itself, so a date or an account inside it would land in
+    // a committed tokens.css and change on every run. The note after it says when the copy it came from was read.
+    for (const [name, args] of [["figma_get_variables", { format: "css" }], ["figma_get_variables", {}], ["figma_get_styles", {}]] as const) {
+      const out = join(root, "written", `${name}-${Object.keys(args).length}.out`);
+      const answer = await body(name, { file, ...args, out_file: out });
+      const note = `\n\n(written to ${out}; fileModifiedAt ${taken.toISOString()})`;
+      assert.ok(answer.endsWith(note), answer);
+      assert.equal(readFileSync(out, "utf8"), answer.slice(0, -note.length), `${name}: the file is the answer without its note`);
+    }
+  });
+
   it("dates a local .fig by its file time, without claiming to have exported it", async () => {
     for (const [name, args] of [
       ["figma_load_file", {}],
@@ -626,6 +638,17 @@ describe("an answer through the account's snapshot cache", () => {
     const d = await call("figma_diff", { old: key, new: key });
     assert.deepEqual([d.old.exportedAt, d.old.account, d.new.exportedAt, d.new.account], [exported.toISOString(), named, exported.toISOString(), named]);
     assert.deepEqual((await call("figma_load_file", { file: `https://www.figma.com/design/${key}/Cached` })).account, named, "a URL is the same key");
+  });
+
+  it("names the date and the account in the note out_file adds, and puts neither in the file", async () => {
+    for (const name of ["figma_get_variables", "figma_get_styles"]) {
+      const out = join(root, "written", `${name}-cached.json`);
+      const answer = await body(name, { file: key, out_file: out });
+      const note = `\n\n(written to ${out}; exportedAt ${exported.toISOString()}, ${label})`;
+      assert.ok(answer.endsWith(note), answer);
+      assert.equal(readFileSync(out, "utf8"), answer.slice(0, -note.length), name);
+      assert.doesNotMatch(readFileSync(out, "utf8"), /exportedAt|tools-test/);
+    }
   });
 
   it("gives get-tree a header with both, and leaves the outline as it was", async () => {

@@ -87,7 +87,7 @@ const textOf = (r: { content: { type: string; text?: string }[] }) => r.content[
  */
 const fileArgs = (t: (typeof tools)[number]) =>
   Object.entries((z.toJSONSchema(z.object(t.shape)) as { properties: Record<string, { type?: string; description?: string }> }).properties)
-    .filter(([, p]) => p.type === "string" && /\.fig\b/.test(p.description ?? ""))
+    .filter(([, p]) => p.type === "string" && /\.fig\b/.test(p.description ?? "") && /\bkey\b/.test(p.description ?? ""))
     .map(([k]) => k);
 
 /** Everything under the roots a call through the account writes: state (the client lease, downloads) and the cache. */
@@ -125,6 +125,8 @@ describe("a call nothing chose an account for, with another account on this mach
     const fileTools = tools.filter((t) => fileArgs(t).length);
     assert.ok(fileTools.length >= 15, fileTools.map((t) => t.name).join(", "));
     assert.deepEqual(fileArgs(byName.get("figma_diff")!), ["old", "new"]);
+    // A path the tool writes is no file it reads, though its description may mention a .fig.
+    assert.deepEqual(fileArgs(byName.get("figma_get_variables")!), ["file"]);
     for (const t of fileTools) {
       for (const arg of fileArgs(t)) {
         const others = Object.fromEntries(fileArgs(t).filter((k) => k !== arg).map((k) => [k, plain]));

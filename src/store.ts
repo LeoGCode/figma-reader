@@ -1,6 +1,7 @@
 // Snapshot cache: the latest exported .fig per file key on disk, and the one it replaced; decoded documents in memory.
 import { existsSync, linkSync, mkdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { cannotWrite } from "./account.ts";
 import { dropLease, liveLeases, processStamp, takeLease } from "./browser.ts";
 import { FigDocument } from "./fig-file.ts";
 import type { FigmaWeb } from "./figma-web.ts";
@@ -314,11 +315,17 @@ export class SnapshotStore {
         return this.fromDisk(fileKey, path);
       }
     }
-    // Made by the first export rather than by the store: a process that only reads local files or fresh snapshots
-    // writes nothing here, which is all a read-only sandbox lets it do.
-    mkdirSync(this.dir, { recursive: true });
     const tag = Math.random().toString(36).slice(2, 8);
-    const lease = takeLease(this.leaseDir(fileKey), `${process.pid}-${Date.now()}-${tag}`);
+    let lease: string;
+    try {
+      // Made by the first export rather than by the store: a process that only reads local files or fresh snapshots
+      // writes nothing here, which is all a read-only sandbox lets it do.
+      mkdirSync(this.dir, { recursive: true });
+      lease = takeLease(this.leaseDir(fileKey), `${process.pid}-${Date.now()}-${tag}`);
+    } catch (e) {
+      // Before the browser is asked to export anything: the file it would save could not be kept.
+      throw cannotWrite(e, `exporting ${fileKey} saves its snapshot in figma-reader's cache,`, this.dir, "Run it where that directory is writable, or set FIGMA_READER_CACHE to a directory that is.");
+    }
     // Export onto a name no other process writes, and swap that onto the snapshot; reading the snapshot back read
     // whatever stood there. Every process on this cache renames its own export onto the one path, and one landing
     // between this export's rename and that read answered with a file this process had not exported - 39 answers

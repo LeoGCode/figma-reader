@@ -2,6 +2,7 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { cannotWrite } from "./account.ts";
 import { bootId, BrowserManager, dropLease, liveLeases, pidNamespace, processStart, sameBoot, sameProcess, takeLease } from "./browser.ts";
 import { CdpSession, MOD, sleep, type TargetInfo } from "./cdp.ts";
 import type { Raw } from "./fig-file.ts";
@@ -588,8 +589,13 @@ export class FigmaWeb {
     // and whoever armed second sent the other's download somewhere it was never waited for.
     const dir = join(this.downloadDir, "downloads");
     const leases = join(this.downloadDir, "download-leases");
-    mkdirSync(dir, { recursive: true });
-    const lease = takeLease(leases, `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    let lease: string;
+    try {
+      mkdirSync(dir, { recursive: true });
+      lease = takeLease(leases, `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    } catch (e) {
+      throw cannotWrite(e, `exporting ${fileKey} has the browser download it into figma-reader's state directory, under`, this.downloadDir, "Run it where that directory is writable.");
+    }
 
     let guid: string | undefined;
     let done: ((state: string) => void) | undefined;

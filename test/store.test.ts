@@ -1185,6 +1185,29 @@ describe("SnapshotStore beside another process's sweep", () => {
     assert.equal(label((await sweptAtEveryLink(dir, () => store.previousOf("K", current)))!), "export 1");
     assert.deepEqual(readdirSync(dir).filter((f) => f.endsWith(".tmp")), [], "and its own names are gone");
   });
+
+  it(
+    "says which directory an export could not write, what needed it, and what reads without writing",
+    { skip: (process.platform === "win32" || process.getuid?.() === 0) && "permissions do not bind here" },
+    async () => {
+      // A read-only sandbox answered with the system's "EACCES: permission denied, mkdir '<path>'" and nothing else.
+      const x = exporter();
+      const dir = tempDir();
+      chmodSync(dir, 0o555);
+      try {
+        await assert.rejects(new SnapshotStore(x.web, dir, HOUR).get("K"), (e: Error) => {
+          const said = `exporting K saves its snapshot in figma-reader's cache, ${dir}, which this process may not write (EACCES: `;
+          assert.ok(e.message.startsWith(said), e.message);
+          assert.match(e.message, /FIGMA_READER_CACHE/);
+          assert.match(e.message, /Reading a local \.fig by its path, or a key whose cached snapshot is still fresh .*, writes nothing\.$/);
+          return true;
+        });
+        assert.deepEqual(x.calls, [], "and the browser was never asked for an export there was nowhere to keep");
+      } finally {
+        chmodSync(dir, 0o755);
+      }
+    },
+  );
 });
 
 describe("SnapshotStore.getLocal and peek", () => {

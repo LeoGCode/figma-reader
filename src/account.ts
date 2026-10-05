@@ -43,6 +43,24 @@ export const accountCacheDir = (name: string) => join(cacheRoot(), "accounts", n
 export const accountProfileDir = (name: string, exe: string) =>
   join(accountDir(name), `profile-${basename(exe).replace(/[^a-z0-9-]/gi, "")}`);
 
+/**
+ * The error for a write into one of the directories above that this process may not make: a read-only sandbox
+ * (Codex's -s read-only), a read-only mount, a directory another user owns. A macOS sandbox answers EPERM, as does
+ * Windows for a write its ACLs deny, where Linux says EACCES or EROFS.
+ * Raw, it was "EACCES: permission denied, mkdir '<path>'", which says neither what needed the directory nor that a
+ * read needs none of it, and agents guessed. `doing` says what needed `dir`, `fix` what would let it; the system's
+ * message stays in it, code and path included. Any other error comes back as it is, to be thrown unchanged.
+ */
+export function cannotWrite(e: unknown, doing: string, dir: string, fix: string): unknown {
+  const code = (e as NodeJS.ErrnoException | null)?.code;
+  if (code !== "EROFS" && code !== "EACCES" && code !== "EPERM") return e;
+  return new Error(
+    `${doing} ${dir}, which this process may not write (${(e as Error).message}). ${fix} Reading a local .fig by its ` +
+      "path, or a key whose cached snapshot is still fresh (younger than FIGMA_SNAPSHOT_MAX_AGE_MIN, 30 minutes unless set), writes nothing.",
+    { cause: e },
+  );
+}
+
 export function checkAccountName(name: string): string {
   if (!NAME.test(name)) throw new Error(`invalid account name ${JSON.stringify(name)}: use letters, digits, '.', '_' or '-'`);
   return name;

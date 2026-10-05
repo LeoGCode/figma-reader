@@ -8,8 +8,8 @@ import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import {
-  AccountNotChosen, accountCacheDir, accountProfileDir, CONFIG_FILE, DEFAULT_ACCOUNT, expandHome, otherAccounts, resolveAccount,
-  writeAccountInfo,
+  AccountNotChosen, accountCacheDir, accountProfileDir, cannotWrite, CONFIG_FILE, DEFAULT_ACCOUNT, expandHome, otherAccounts,
+  resolveAccount, writeAccountInfo,
 } from "./account.ts";
 import { BrowserManager, defaultExecutable, defaultStateDir } from "./browser.ts";
 import { changesSince, diffDocuments, parseSince } from "./changes.ts";
@@ -106,16 +106,28 @@ function useBrowser() {
       executablePath = defaultExecutable();
     } catch {}
   }
-  const browser = new BrowserManager({
-    cdpUrl: process.env.FIGMA_CDP_URL || undefined,
-    executablePath,
-    userDataDir: process.env.FIGMA_USER_DATA_DIR
-      ? expandHome(process.env.FIGMA_USER_DATA_DIR)
-      : accountProfileDir(account.name, executablePath ?? "chromium"),
-    ownsProfile: !process.env.FIGMA_USER_DATA_DIR,
-    headless: !/^(0|false|no)$/i.test(process.env.FIGMA_HEADLESS ?? "1"),
-    stateDir: defaultStateDir(),
-  });
+  let browser: BrowserManager;
+  try {
+    browser = new BrowserManager({
+      cdpUrl: process.env.FIGMA_CDP_URL || undefined,
+      executablePath,
+      userDataDir: process.env.FIGMA_USER_DATA_DIR
+        ? expandHome(process.env.FIGMA_USER_DATA_DIR)
+        : accountProfileDir(account.name, executablePath ?? "chromium"),
+      ownsProfile: !process.env.FIGMA_USER_DATA_DIR,
+      headless: !/^(0|false|no)$/i.test(process.env.FIGMA_HEADLESS ?? "1"),
+      stateDir: defaultStateDir(),
+    });
+  } catch (e) {
+    // The manager registers this process with the browser, its first write into the state directory, so a state
+    // directory it may not write is met here, before anything else is tried.
+    throw cannotWrite(
+      e,
+      "a call through the browser (status, login, an export, a screenshot) registers with it in figma-reader's state directory,",
+      defaultStateDir(),
+      "Run it where that directory is writable.",
+    );
+  }
   // Where the browser puts a "Save local copy" download. The setting is browser-wide, so every process on one browser
   // has to name the same directory; the cache cannot name it, since FIGMA_READER_CACHE moves per process and whoever
   // armed it second sent the other's download somewhere it was never waited for. The profile is what they share (the

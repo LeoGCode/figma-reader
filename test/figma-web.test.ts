@@ -3,7 +3,7 @@
 import { after, afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import vm from "node:vm";
@@ -841,6 +841,29 @@ test("the query reaches the Quick actions box or nothing at all", async () => {
   await assert.rejects(quiet.web.saveLocalCopy(KEY, join(root, "never.fig"), 500), /data-testid=save-as/);
   assert.deepEqual([...none.tabs.values()][0]!.typed, []);
 });
+
+test(
+  "an export whose download directory may not be written says which, and points the browser's downloads nowhere",
+  { skip: (process.platform === "win32" || process.getuid?.() === 0) && "permissions do not bind here" },
+  async () => {
+    loggedIn();
+    const dir = workDir();
+    chmodSync(dir, 0o555);
+    try {
+      const { world } = tabWorld();
+      const b = fakeBrowser(world, { dir });
+      await assert.rejects(b.web.saveLocalCopy(KEY, join(root, "never.fig"), 500), (e: Error) => {
+        const said = `exporting ${KEY} has the browser download it into figma-reader's state directory, under ${dir}, which this process may not write (EACCES: `;
+        assert.ok(e.message.startsWith(said), e.message);
+        assert.match(e.message, /Run it where that directory is writable\./);
+        return true;
+      });
+      assert.deepEqual(b.cdp.sent.filter((s) => s.method === "Browser.setDownloadBehavior"), [], "downloads were never sent there");
+    } finally {
+      chmodSync(dir, 0o755);
+    }
+  },
+);
 
 test("any one of the three signals is enough to recognise the Quick actions box", async () => {
   // Figma's markup is the only evidence available, so the box is accepted on its placeholder or aria-label, on its

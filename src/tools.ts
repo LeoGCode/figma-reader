@@ -16,7 +16,7 @@ import { DEV_STATUS_FILTERS, devStatusList } from "./dev-status.ts";
 import type { Raw } from "./fig-file.ts";
 import { cleanStaleDownloads, FigmaWeb, parseFileRef } from "./figma-web.ts";
 import { groupUnresolved, scanText } from "./instance-text.ts";
-import { imageExt, localFigFiles } from "./local-files.ts";
+import { imageExt, localFigFiles, outPath } from "./local-files.ts";
 import { bytesHex, displayType, Normalizer } from "./normalize.ts";
 import { outline } from "./outline.ts";
 import { searchPattern } from "./search-query.ts";
@@ -190,7 +190,7 @@ const json = (v: unknown) => text(JSON.stringify(v, null, 1));
  * tools taking such a path publish readOnlyHint: false, so the client asks the user rather than auto-approving.
  */
 function writeOut(path: string, content: string | Uint8Array) {
-  const abs = resolve(path.replace(/^~(?=\/)/, homedir()));
+  const abs = outPath(path);
   mkdirSync(dirname(abs), { recursive: true });
   writeFileSync(abs, content);
   return abs;
@@ -589,6 +589,55 @@ tool(
     const out = JSON.stringify({ ...dated, page: doc.pageOf(n)?.name, path: doc.path(n), ...data }, null, 1);
     if (out.length > 200_000) throw new Error(`result is ${Math.round(out.length / 1000)}KB; use a smaller depth or a deeper node_id`);
     return text(out);
+  },
+);
+
+/** A node id as the tools take one: 12:34, or 12-34 as a figma.com URL writes it. */
+const NODE_ID = /^\d+[:-]\d+$/;
+
+/**
+ * Why a string is not a node id. figma_get_text and figma_search address text rendered through an instance as
+ * "<instance id>/<layer ids>", which makes it the likeliest non-id to be handed back here, and only its first part is
+ * a node of the file.
+ */
+function notNodeId(s: string) {
+  const instance = /^(\d+[:-]\d+)\//.exec(s)?.[1]?.replace("-", ":");
+  return instance
+    ? `not a node id: figma_get_text and figma_search name text inside an instance "<instance>/<layer>", and only the instance, ${instance}, is a node of the file`
+    : "not a node id: node ids look like 12:34 (or 12-34)";
+}
+
+tool(
+  "figma_locate",
+  "Look up a list of node ids in one call, such as the ids a document or an earlier answer cites. One entry per id, in " +
+    "the order given, with the id written 12:34 whichever spelling was passed: {id, found: true, type, name, page, path} " +
+    "for a node the file has (path from the page down, as figma_get_node gives it), {id, found: false} for one it has " +
+    "not, and {id, error} for a string that is not a node id. found, missing and invalid count the entries. found: false " +
+    "is said only of a file that was read: one that cannot be read fails the whole call. " +
+    EXPORTED_AT_NOTE,
+  {
+    file: fileArg,
+    node_ids: z.array(z.string()).min(1).describe("The node ids to look up, like 12:34 (or 12-34)"),
+    refresh: refreshArg,
+  },
+  async ({ file, node_ids, refresh }) => {
+    const { doc, dated } = await open(file, refresh);
+    const count = { found: 0, missing: 0, invalid: 0 };
+    const results = node_ids.map((given): Raw => {
+      if (!NODE_ID.test(given)) {
+        count.invalid++;
+        return { id: given, error: notNodeId(given) };
+      }
+      const id = given.replace("-", ":");
+      const n = doc.get(id);
+      if (!n) {
+        count.missing++;
+        return { id, found: false };
+      }
+      count.found++;
+      return { id, found: true, type: displayType(n), name: n.name, page: doc.pageOf(n)?.name, path: doc.path(n) };
+    });
+    return json({ ...dated, ...count, results });
   },
 );
 

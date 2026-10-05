@@ -1,9 +1,9 @@
-// Files on disk: the local .fig files a key can be served from, the type of exported image-fill bytes, and where the
-// CLI puts images nobody gave a path for.
+// Files on disk: the local .fig files a key can be served from, the type of exported image-fill bytes, where the CLI
+// puts images nobody gave a path for, and where a path somebody gave lands.
 import { randomBytes } from "node:crypto";
 import { type Dirent, lstatSync, mkdirSync, readdirSync, realpathSync, type Stats, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import type { Raw } from "./fig-file.ts";
 import { keyFromFileName } from "./figma-web.ts";
 
@@ -84,3 +84,9 @@ export function writePrivateTemp(name: string, ext: string, bytes: Uint8Array, s
   writeFileSync(path, bytes, { flag: "wx", mode: 0o600 });
   return path;
 }
+
+/**
+ * The file a path the caller gave names: "~/" is their home, anything relative is against the working directory. The
+ * tools write there (writeOut) and a batch line reports where its image went, so both resolve it here.
+ */
+export const outPath = (p: string) => resolve(p.replace(/^~(?=\/)/, homedir()));

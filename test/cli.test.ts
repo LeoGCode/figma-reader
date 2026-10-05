@@ -40,8 +40,8 @@ interface Run {
   stderr: string;
 }
 
-/** Run the CLI with stdout and stderr on pipes, the way `figma-reader ... | jq` runs it. */
-function cli(args: string[], opts: { cwd?: string; env?: Record<string, string | undefined> } = {}): Promise<Run> {
+/** Run the CLI with stdout and stderr on pipes, the way `figma-reader ... | jq` runs it; `input` is written to its stdin. */
+function cli(args: string[], opts: { cwd?: string; env?: Record<string, string | undefined>; input?: string } = {}): Promise<Run> {
   const env: Record<string, string | undefined> = { ...process.env, HOME: home, FIGMA_FILES_DIRS: work, FIGMA_ACCOUNT: undefined, FIGMA_READER_CACHE: undefined, ...opts.env };
   for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
   return new Promise((resolve, reject) => {
@@ -50,6 +50,7 @@ function cli(args: string[], opts: { cwd?: string; env?: Record<string, string |
     const err: Buffer[] = [];
     child.stdout.on("data", (b) => out.push(b));
     child.stderr.on("data", (b) => err.push(b));
+    if (opts.input !== undefined) child.stdin.end(opts.input);
     child.on("error", reject);
     child.on("close", (code) => resolve({ code, stdout: Buffer.concat(out).toString(), stderr: Buffer.concat(err).toString() }));
   });
@@ -193,6 +194,53 @@ test("search reads a query as a pattern only when asked", async () => {
   // The same query without --regex is the layer name a file could really hold, so it matches nothing here.
   assert.deepEqual([(await q("/FRAME 1\\d{4}$/")).total, (await q("/FRAME 1\\d{4}$/")).queryAs], [0, "substring"]);
   assert.deepEqual([(await q("/frame/")).total, (await q("/frame/")).queryAs], [0, "substring"]);
+});
+
+test("batch answers each stdin line with a JSON line, and exits 1 when any call failed", async () => {
+  const calls = [
+    JSON.stringify({ tool: "locate", args: { file: bigFig, node_ids: ["1-1", "1:2", "99:99"] } }),
+    JSON.stringify({ tool: "get-tree", args: { file: bigFig, node_id: "1:1", depth: 0 } }),
+    "{not json",
+    JSON.stringify({ tool: "get-node", args: { file: bigFig, node_id: "99:99" } }),
+  ];
+  const r = await cli(["batch"], { input: `${calls.join("\n")}\n` });
+  assert.equal(r.code, 1, r.stderr);
+  const out = r.stdout.trimEnd().split("\n").map((l) => JSON.parse(l));
+  assert.deepEqual(out.map((o) => [o.i, o.ok]), [[0, true], [1, true], [2, false], [3, false]]);
+  assert.deepEqual([out[0].result.found, out[0].result.missing], [2, 1]);
+  assert.match(out[1].result, /^# \{"fileModifiedAt":"[^"]+"\}\n- 1:1 FRAME "frame 0"$/);
+  // The answers say what failed; stderr says that something did, for a reader who only sees the exit code.
+  assert.equal(r.stderr, "figma-reader batch: 2 of 4 calls failed (i = 2, 3)\n");
+
+  // A last line with no newline after it is still a call.
+  const ok = await cli(["batch"], { input: calls.slice(0, 2).join("\n") });
+  assert.deepEqual([ok.code, ok.stderr, ok.stdout.trimEnd().split("\n").length], [0, "", 2]);
+  const none = await cli(["batch"], { input: "" });
+  assert.deepEqual([none.code, none.stdout, none.stderr], [0, "", ""]);
+});
+
+test("batch is bad usage only when the command itself is", async () => {
+  const extra = await cli(["batch", "calls.jsonl"], { input: "" });
+  assert.equal(extra.code, 2);
+  assert.match(extra.stderr, /batch: unexpected argument "calls.jsonl"; the calls are read from stdin/);
+  for (const args of [["help", "batch"], ["batch", "--help"]]) {
+    const r = await cli(args, { input: "" });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /^Usage: figma-reader batch < calls\.jsonl\n/, args.join(" "));
+  }
+  assert.match((await cli(["help"])).stdout, /^ {2}batch +Run tool calls given as JSON lines on stdin/m);
+});
+
+test("locate takes its ids from --node-ids, and cannot run without them", async () => {
+  const r = await cli(["locate", bigFig, "--node-ids", "1-1,99:99", "--node-ids", "nope"]);
+  // Ids the file does not have are an answer, not a failed call.
+  assert.equal(r.code, 0, r.stderr);
+  const res = JSON.parse(r.stdout);
+  assert.deepEqual([res.found, res.missing, res.invalid], [1, 1, 1]);
+  assert.deepEqual(res.results[0], { id: "1:1", found: true, type: "FRAME", name: "frame 0", page: "Home", path: "Home / frame 0" });
+  const without = await cli(["locate", bigFig]);
+  assert.equal(without.code, 2);
+  assert.match(without.stderr, /^figma-reader locate: missing --node-ids\n/);
 });
 
 test("account commands have help and exit 2 on bad usage", async () => {

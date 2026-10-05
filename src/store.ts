@@ -1,6 +1,6 @@
 // Snapshot cache: one exported .fig per file key on disk, decoded documents kept in memory.
 import { existsSync, mkdirSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { dropLease, liveLeases, takeLease } from "./browser.ts";
 import { FigDocument } from "./fig-file.ts";
 import type { FigmaWeb } from "./figma-web.ts";
@@ -142,15 +142,35 @@ export class SnapshotStore {
   /**
    * The decoded file, reusing the one in memory only while the file is unchanged. Size is compared too: a
    * replacement written within the mtime granularity (or with its mtime preserved) would otherwise never reload.
+   *
+   * A snapshot of ours goes by two names: its key, and its path, which getLocal keeps under the real path. Reading by
+   * key and then by that path is how a task pins itself to one snapshot, and it decoded the same file twice and kept
+   * both. Under either name, a document kept under the other is that same file when its stamp agrees. Which name the
+   * caller used still decides how the answer is dated (open in tools.ts), and both read the one file time.
    */
   private fromDisk(fileKey: string, path: string): FigDocument {
     const st = statSync(path);
     const stamp = `${st.mtimeMs}:${st.size}`;
-    const cached = this.docs.get(fileKey);
-    if (cached && this.stamps.get(cached) === stamp) return this.remember(cached);
+    for (const name of [fileKey, this.otherName(fileKey, path)]) {
+      const cached = name === undefined ? undefined : this.docs.get(name);
+      if (cached && this.stamps.get(cached) === stamp) return this.remember(cached);
+    }
     const doc = FigDocument.fromFile(fileKey, path, st.mtime);
     this.stamps.set(doc, stamp);
     return this.remember(doc);
+  }
+
+  /**
+   * The name fromDisk's other reading of the same file is kept under: the real path of a key's snapshot, or the key
+   * of a real path that is a snapshot here (<dir>/<key>.fig). A spelling this cannot resolve only costs a decode.
+   */
+  private otherName(fileKey: string, path: string): string | undefined {
+    try {
+      if (fileKey !== path) return realpathSync(path);
+      return path.endsWith(".fig") && dirname(path) === realpathSync(this.dir) ? basename(path, ".fig") : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Get a decoded snapshot, exporting a fresh copy when missing, stale, or refresh is requested. */

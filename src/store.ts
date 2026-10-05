@@ -1,5 +1,5 @@
-// Snapshot cache: one exported .fig per file key on disk, decoded documents kept in memory.
-import { existsSync, mkdirSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
+// Snapshot cache: the latest exported .fig per file key on disk, and the one it replaced; decoded documents in memory.
+import { existsSync, linkSync, mkdirSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { dropLease, liveLeases, takeLease } from "./browser.ts";
 import { FigDocument } from "./fig-file.ts";
@@ -109,6 +109,15 @@ export class SnapshotStore {
 
   figPath(fileKey: string) {
     return join(this.dir, `${fileKey}.fig`);
+  }
+
+  /**
+   * The snapshot the key's latest export replaced, kept for figma_diff: exactly one per key, so each export that
+   * replaces a snapshot replaces this one too (see keepPrevious). A key is letters and digits only, so this name is
+   * never another key's figPath; it is not the shape cleanStaleDownloads sweeps either.
+   */
+  previousPath(fileKey: string) {
+    return join(this.dir, `${fileKey}.previous.fig`);
   }
 
   /**
@@ -257,6 +266,8 @@ export class SnapshotStore {
       // reading the snapshot back finds this document rather than decoding the same bytes again.
       const doc = FigDocument.fromFile(fileKey, mine, st.mtime);
       this.stamps.set(doc, `${st.mtimeMs}:${st.size}`);
+      // Only an export that decoded gets this far, so one that failed leaves the snapshot and the previous one alone.
+      this.keepPrevious(fileKey, tag);
       renameSync(mine, path);
       return this.remember(doc);
     } finally {
@@ -264,6 +275,36 @@ export class SnapshotStore {
       // read the lease being gone as that export's work being on disk.
       dropLease(lease);
       rmSync(mine, { force: true });
+    }
+  }
+
+  /**
+   * Keep the snapshot this export is about to replace as the key's previous one. It is given a second name rather
+   * than moved: a hard link to the file at figPath, which the export then renames over as it always has. Moving it
+   * first would leave the snapshot path empty until that rename, and every reading of it above relies on there being
+   * a file: a process finding none there would export again, take "no file" as the floor a refresh is judged by, or
+   * fail a decode it had just stat'ed for. The link costs no copy and carries the old export's mtime, which is what
+   * dates the previous snapshot. It goes up under a name of its own and is renamed onto previousPath, replacing the
+   * old previous in one step, so a diff reading it finds one file or the other.
+   *
+   * Two exports at once each link whatever stands at figPath at that instant, so the previous one is always a
+   * snapshot that stood there before the current one did. All of it runs under the export's lease.
+   *
+   * Best effort: an export is never failed for its history. Without hard links (FAT, some network mounts) nothing is
+   * kept. Where the old previous cannot be replaced it stays as it was, older than it should be but dated by its own
+   * time, which figma_diff reports; Windows may refuse to replace a file another process has open (read from its
+   * rename semantics, not measured there). The staging name is the shape cleanStaleDownloads sweeps, for a crash
+   * between the link and the rename.
+   */
+  private keepPrevious(fileKey: string, tag: string) {
+    const staged = `${this.previousPath(fileKey)}.${process.pid}.${tag}.tmp`;
+    try {
+      linkSync(this.figPath(fileKey), staged);
+      renameSync(staged, this.previousPath(fileKey));
+    } catch {
+      // ENOENT is the first export of a key, which has nothing to keep.
+    } finally {
+      rmSync(staged, { force: true });
     }
   }
 

@@ -92,6 +92,7 @@ test("only the tools that cannot write are published as read-only", async () => 
   ]);
   const readOnly = published.filter((t) => t.annotations?.readOnlyHint === true).map((t) => t.name).sort();
   assert.deepEqual(readOnly, [
+    "figma_changes", "figma_diff",
     "figma_get_components", "figma_get_node", "figma_get_text", "figma_get_tree",
     "figma_list_files", "figma_load_file", "figma_search", "figma_token_usage",
   ]);

@@ -8,6 +8,8 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
+import { dropLease, takeLease } from "../src/browser.ts";
+import { LEASE_POLL_MS } from "../src/store.ts";
 import { figBytes, type TestNode } from "./fixtures.ts";
 
 const CLI = join(import.meta.dirname, "..", "src", "cli.ts");
@@ -303,6 +305,39 @@ test("a call that reaches the browser has registered with it by then, and gives 
   } finally {
     server.close();
   }
+});
+
+test("a call that may export has registered with the browser while it waits for another process's export", async () => {
+  // Registered only once its own export began, it would be unannounced for the whole wait, and the process it waits
+  // for may be the browser's last client: that one closes the browser on its way out, just as this one turns to it.
+  // Its own process, since this has to be the first time it reaches for the browser.
+  const { dir, env } = ownHome("waits");
+  const cache = join(root, "waits cache");
+  const key = "WAITINGKEY1234";
+  // A lease of this test's own pid, stamped as this process, is what the CLI reads as another process exporting the
+  // key, and it waits for as long as the lease is there.
+  const exportsDir = join(cache, "accounts", "waits", "exports", key);
+  const other = takeLease(exportsDir, `${process.pid}-${Date.now()}-other`);
+  const leases = () => contents(dir).filter((p) => basename(dirname(p)) === "clients");
+  let exited = false;
+  const run = cli(["load-file", key], {
+    env: { ...env, FIGMA_ACCOUNT: "waits", FIGMA_READER_CACHE: cache, FIGMA_BROWSER_PATH: join(dir, "no-such-browser") },
+  }).finally(() => (exited = true));
+  try {
+    const deadline = Date.now() + 10_000;
+    while (!leases().length && !exited && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    const registered = leases();
+    await new Promise((r) => setTimeout(r, 3 * LEASE_POLL_MS));
+    assert.deepEqual([exited, readdirSync(exportsDir)], [false, [basename(other)]], "still waiting, with no export of its own");
+    assert.equal(registered.length, 1, `client leases while it waited: ${JSON.stringify(registered)}`);
+  } finally {
+    dropLease(other);
+    // Then it exports, which here is a browser that cannot start rather than a launch.
+    const r = await run;
+    assert.equal(r.code, 1);
+    assert.match(r.stderr, /Cannot start browser/);
+  }
+  assert.deepEqual(leases(), [], "and none once it had exited");
 });
 
 test("what an unfinished export left behind is swept by the next call that reaches the browser, not by a local read", async () => {

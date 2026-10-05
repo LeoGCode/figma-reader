@@ -190,7 +190,7 @@ Account data lives in `<data>/accounts/<name>/` (profile, last verified email) a
 
 macOS keeps the Linux paths rather than `~/Library`: they work there, and moving them would leave every account logged in somewhere the tool no longer looks. Account names are compared the way the filesystem compares them, so `acme` and `Acme` are two accounts on Linux and one on Windows and macOS.
 
-Reading a local `.fig` and `help` write to none of them: `<state>` and `<cache>` are first written by a call that needs the browser (an export, a screenshot, `list-files --source web`, `login`, `status`), so local reads work in a read-only sandbox, CI job or container.
+`help`, and reading a local `.fig` with any command but `screenshot`, write to none of them, and nowhere else but the files asked for (`--out-file`, the directory given to `export-image-fills`): `<state>` and `<cache>` are first written by a call that goes through the browser (an export, any `screenshot`, `list-files --source web`, `login`, `status`), so local reads work in a read-only sandbox, CI job or container.
 
 ### Browser and login
 

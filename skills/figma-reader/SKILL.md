@@ -6,7 +6,7 @@ description: Read Figma designs from the shell with the figma-reader CLI (layer 
 
 # figma-reader CLI
 
-Read-only access to Figma files: `figma-reader <command> <file> [flags]`. `<file>` is a local `.fig` path, a Figma file key, or a `figma.com/design/...` URL, whose `?node-id=` stands in for a missing `--node-id`. Node 22+, and a Chromium-family browser for anything that reads figma.com. The commands that take `--node-id` use it: `get-tree`, `get-node`, `search` (that node's subtree, echoed as `searchedNode`), `token-usage`, `get-text`, `screenshot`, `export-image-fills`. `load-file`, `get-variables`, `get-styles`, `get-components`, `dev-status`, `diff` and `changes` answer about the whole file and ignore it.
+Read-only access to Figma files: `figma-reader <command> <file> [flags]`. `<file>` is a local `.fig` path, a Figma file key, or a `figma.com/design/...` URL, whose `?node-id=` stands in for a missing `--node-id`. Node 22+, and a Chromium-family browser for anything that reads figma.com. The commands that take `--node-id` use it: `get-tree`, `get-node`, `search` (that node's subtree, echoed as `searchedNode`), `token-usage`, `get-text`, `screenshot`, `export-image-fills`. `load-file`, `get-variables`, `get-styles`, `get-components`, `dev-status`, `diff` and `changes` answer about the whole file and ignore it, and so does `locate`, which takes its ids in `--node-ids`.
 
 **Setup, once:** `command -v figma-reader`. If it is missing, use `npx -y @leogcode/figma-reader@0.3.2` (the version this skill describes) or a clone's `node <repo>/dist/cli.js` in its place. Never send stderr to `/dev/null` on a call whose output you will interpret: a hidden "command not found" reads as zero results.
 

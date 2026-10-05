@@ -132,6 +132,63 @@ describe("the agent skill", () => {
   });
 });
 
+// The README's lists of tools are what someone reads to know which tools do what, and seven lanes each added to them.
+// They are checked against the tools themselves: a tool missing from a list, or listed where it does not belong, fails.
+describe("the README's inventories of tools", () => {
+  const readme = readFileSync(join(repo, "README.md"), "utf8");
+  const names = (s: string) => [...s.matchAll(/`(figma_[a-z_]+)`/g)].map((m) => m[1]).sort();
+  /** The tool names in the first span of the README between `from` and `to`. */
+  const between = (from: string, to: string) => {
+    const at = readme.indexOf(from);
+    assert.ok(at >= 0, `README has no ${JSON.stringify(from)}`);
+    const end = readme.indexOf(to, at + from.length);
+    assert.ok(end >= 0, `README has no ${JSON.stringify(to)} after ${JSON.stringify(from)}`);
+    return names(readme.slice(at + from.length, end));
+  };
+  const all = tools.map((t) => t.name).sort();
+  const takes = (arg: string) => tools.filter((t) => arg in t.shape).map((t) => t.name).sort();
+
+  it("gives every tool one row of the tools table, and no row to a tool there is not", () => {
+    const rows = [...readme.matchAll(/^\| `(figma_[a-z_]+)` \|/gm)].map((m) => m[1]).sort();
+    assert.deepEqual(rows, all);
+  });
+
+  it("lists the tools a URL's node-id scopes, and the ones that answer about the whole file", () => {
+    assert.deepEqual(between("used by the seven tools that take a `node_id` —", "— when"), takes("node_id"));
+    // Every tool that reads a file and takes no node_id ignores a URL's node-id; locate takes its ids in node_ids.
+    const reads = tools.filter((t) => ["file", "old", "new"].some((k) => k in t.shape)).map((t) => t.name);
+    const whole = between("that answer about the whole file (", ")");
+    assert.deepEqual([...whole, "figma_locate"].sort(), reads.filter((n) => !takes("node_id").includes(n)).sort());
+  });
+
+  it("names as dated, and as naming the account, exactly the tools whose answers are dated", async () => {
+    // Run every tool that reads a file and writes nothing on a local .fig, and see which answers carry the date: a
+    // JSON fileModifiedAt, or get-tree's header line. diff dates its two sides, and is said apart.
+    const file = join(repo, "test", "files", "real-export.fig");
+    const textOf = async (command: string, args: object) => {
+      const c = (await byCommand.get(command)!.run(args)).content[0];
+      return c.type === "text" ? c.text : "";
+    };
+    const pageId = JSON.parse(await textOf("load-file", { file })).pages[0].id;
+    const extra: Record<string, object> = {
+      figma_get_node: { node_id: pageId, depth: 0 }, figma_locate: { node_ids: [pageId] }, figma_search: { query: "a" }, figma_changes: { since: "7d" },
+    };
+    const dated: string[] = [];
+    for (const t of tools.filter((t) => t.readOnly && "file" in t.shape)) {
+      const out = await textOf(commandName(t.name), { file, ...extra[t.name] });
+      const head = out.startsWith("# ") ? out.slice(2, out.indexOf("\n")) : out;
+      if (/^\{/.test(head) && "fileModifiedAt" in JSON.parse(head)) dated.push(t.name);
+    }
+    dated.sort();
+    assert.ok(dated.length >= 10, dated.join(", "));
+    assert.deepEqual(between("tools date their results —", "— and `figma_diff` dates each of its two sides"), dated);
+    const sides = JSON.parse(await textOf("diff", { old: file, new: file }));
+    assert.ok(sides.old.fileModifiedAt && sides.new.fileModifiedAt, "diff dates both sides");
+    // The same tools carry account when a key is read through one, get-tree in its header; diff on each side.
+    assert.deepEqual(between("That field is in the JSON of", "given a key or URL"), dated.filter((n) => n !== "figma_get_tree"));
+  });
+});
+
 /** What the CLI's parser says to `figma-reader <command> <argv>`: undefined when it parses, else its complaint. */
 function usageError(command: string, argv: string[]): string | undefined {
   const tool = byCommand.get(command);

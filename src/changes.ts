@@ -31,7 +31,10 @@ export function topLevelLayers(doc: FigDocument, page: FigNode): FigNode[] {
 const entry = (doc: FigDocument, n: FigNode): Raw => ({ id: n.id, type: displayType(n), name: n.name, page: doc.pageOf(n)?.name, path: doc.path(n) });
 const place = (doc: FigDocument, n: FigNode): Raw => ({ page: doc.pageOf(n)?.name, parentId: n.parentId, path: doc.path(n) });
 
-/** The pages an answer covers: the one asked for, or every page but the excluded ones. */
+/**
+ * The pages an answer covers, by name: the one asked for, or every page but the excluded ones. diffDocuments resolves
+ * the names to the pages bearing them in either file; changesSince reads one file, where a name is a page.
+ */
 export interface PageFilter {
   page?: string;
   exclude?: Set<string>;
@@ -105,8 +108,11 @@ const byPageOf = (counts: PageCounts) => Object.fromEntries([...counts].map(([pa
  *
  * `pages` narrows every list to the pages it covers (a layer moved between pages, to either of its two), before the
  * limit; byPage counts every page all the same, the excluded ones too, since it is how a reader learns where to look.
- * A page is named as the new file names it, or as the old one did if it is gone. Every list stops at limit, shared
- * between pages (see sharedByPage); counts holds the totals of what the lists cover.
+ * A page is named in byPage as the new file names it, or as the old one did if it is gone. The names `pages` gives are
+ * resolved to the pages that bear them in either file, and the lists are filtered by those pages, not by name: a page
+ * renamed between the two is the same page by both its names. Filtered by the new name alone, "the page it was"
+ * selected nothing and excluded nothing, and its removals vanished from an answer that was not truncated. Every list
+ * stops at limit, shared between pages (see sharedByPage); counts holds the totals of what the lists cover.
  */
 export function diffDocuments(old: FigDocument, cur: FigDocument, limit: number, pages?: PageFilter) {
   const oldPages = new Map(old.pages().map((p) => [p.id, p]));
@@ -117,17 +123,23 @@ export function diffDocuments(old: FigDocument, cur: FigDocument, limit: number,
     .filter((p) => oldPages.has(p.id) && oldPages.get(p.id)!.name !== p.name)
     .map((p) => ({ id: p.id, oldName: oldPages.get(p.id)!.name, name: p.name }));
 
-  // The name a page goes by in the answer's byPage and page filter: the new file's, or the old one's for a page gone.
-  const pageName = (doc: FigDocument, n: FigNode) => {
-    const p = doc.pageOf(n);
-    return p && (newPages.get(p.id)?.name ?? p.name);
+  // Changes are filed by page id, which a rename keeps. A page goes by the new file's name in byPage, or the old
+  // one's if it is gone; a page asked for or excluded by name is every page that bears it in either file.
+  const pageOf = (doc: FigDocument, n: FigNode) => doc.pageOf(n)?.id;
+  const nameOf = (id: string | undefined) => id && (newPages.get(id)?.name ?? oldPages.get(id)?.name);
+  const bearing = (names: Iterable<string>) => {
+    const want = new Set(names);
+    return new Set([...oldPages.values(), ...newPages.values()].filter((p) => want.has(p.name)).map((p) => p.id));
   };
+  const chosen = pages?.page !== undefined ? bearing([pages.page]) : undefined;
+  const left = bearing(pages?.exclude ?? []);
+  const covered = (id: string | undefined) => id !== undefined && (chosen ? chosen.has(id) : !left.has(id));
   const topOf = (doc: FigDocument) => new Map(doc.pages().flatMap((p) => topLevelLayers(doc, p)).map((n) => [n.id, n]));
   const oldTop = topOf(old);
   const newTop = topOf(cur);
   type Found = { out: Raw; on: (string | undefined)[] };
-  const added: Found[] = [...newTop.values()].filter((n) => !old.get(n.id)).map((n) => ({ out: entry(cur, n), on: [pageName(cur, n)] }));
-  const removed: Found[] = [...oldTop.values()].filter((n) => !cur.get(n.id)).map((n) => ({ out: entry(old, n), on: [pageName(old, n)] }));
+  const added: Found[] = [...newTop.values()].filter((n) => !old.get(n.id)).map((n) => ({ out: entry(cur, n), on: [pageOf(cur, n)] }));
+  const removed: Found[] = [...oldTop.values()].filter((n) => !cur.get(n.id)).map((n) => ({ out: entry(old, n), on: [pageOf(old, n)] }));
   const renamed: Found[] = [];
   const moved: Found[] = [];
   // A layer that stopped being top-level (dropped into a frame) or became one (pulled out of a frame) has moved too:
@@ -136,11 +148,11 @@ export function diffDocuments(old: FigDocument, cur: FigDocument, limit: number,
     const was = old.get(id), is = cur.get(id);
     if (!was || !is) continue;
     if (was.name !== is.name) {
-      renamed.push({ out: { id, type: displayType(is), oldName: was.name, name: is.name, page: cur.pageOf(is)?.name, path: cur.path(is) }, on: [pageName(cur, is)] });
+      renamed.push({ out: { id, type: displayType(is), oldName: was.name, name: is.name, page: cur.pageOf(is)?.name, path: cur.path(is) }, on: [pageOf(cur, is)] });
     }
     // Moved to the page it is on now, and from the one it left: the page it left lost a layer as surely.
     if (was.parentId !== is.parentId) {
-      moved.push({ out: { id, type: displayType(is), name: is.name, from: place(old, was), to: place(cur, is) }, on: [pageName(cur, is), pageName(old, was)] });
+      moved.push({ out: { id, type: displayType(is), name: is.name, from: place(old, was), to: place(cur, is) }, on: [pageOf(cur, is), pageOf(old, was)] });
     }
   }
 
@@ -153,23 +165,22 @@ export function diffDocuments(old: FigDocument, cur: FigDocument, limit: number,
       if (n === page || cur.get(n.id)) continue;
       const root = n.parentId ? rootOf.get(n.parentId) : undefined;
       if (root) root.out.removedCount++;
-      else roots.push({ out: { ...entry(old, n), removedCount: 1 }, on: [pageName(old, n)] });
+      else roots.push({ out: { ...entry(old, n), removedCount: 1 }, on: [pageOf(old, n)] });
       rootOf.set(n.id, root ?? roots.at(-1)!);
-      tally(byPage, pageName(old, n), "removedNodes");
+      tally(byPage, nameOf(pageOf(old, n)), "removedNodes");
     }
   }
-  for (const f of added) tally(byPage, f.on[0], "added");
-  for (const f of removed) tally(byPage, f.on[0], "removed");
-  for (const f of renamed) tally(byPage, f.on[0], "renamed");
+  for (const f of added) tally(byPage, nameOf(f.on[0]), "added");
+  for (const f of removed) tally(byPage, nameOf(f.on[0]), "removed");
+  for (const f of renamed) tally(byPage, nameOf(f.on[0]), "renamed");
   for (const f of moved) {
-    tally(byPage, f.on[0], "moved");
-    if (f.on[1] !== f.on[0]) tally(byPage, f.on[1], "movedOut");
+    tally(byPage, nameOf(f.on[0]), "moved");
+    if (f.on[1] !== f.on[0]) tally(byPage, nameOf(f.on[1]), "movedOut");
   }
 
-  const kept = (l: Found[]) => l.filter((f) => f.on.some((p) => covers(pages, p)));
+  const kept = (l: Found[]) => l.filter((f) => f.on.some(covered));
   const [add, rem, ren, mov, rts] = [added, removed, renamed, moved, roots].map(kept);
-  const pageKept = (p: { name: string; oldName?: string }) => covers(pages, p.name) || covers(pages, p.oldName);
-  const pageLists = [pagesAdded, pagesRemoved, pagesRenamed].map((l) => l.filter(pageKept));
+  const pageLists = [pagesAdded, pagesRemoved, pagesRenamed].map((l) => l.filter((p) => covered(p.id)));
   const cap = <T>(l: T[]) => l.slice(0, limit);
   const share = (l: Found[]) => sharedByPage(l, (f) => f.on[0], limit).map((f) => f.out);
   return {

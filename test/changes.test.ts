@@ -144,9 +144,20 @@ describe("diffDocuments", () => {
     // A layer that moved between an excluded page and a kept one is the kept page's news too.
     const kept = diffDocuments(before, after, 100, { exclude: new Set(["Screens v2"]) });
     assert.deepEqual([ids(kept.layers.added), ids(kept.layers.moved), kept.counts.removedRoots], [[], ["3:1", "6:1"], 0]);
-    // The page renamed is covered by either name.
-    assert.equal(diffDocuments(before, after, 100, { page: "Screens v2" }).counts.pagesRenamed, 1);
-    assert.equal(diffDocuments(before, after, 100, { page: "Screens v2" }).counts.removedNodes, 5);
+  });
+
+  it("takes a renamed page by either of its names, to ask for it and to leave it out", () => {
+    // Screens was renamed Screens v2. Filtered by the new name only, asking for "Screens" selected none of its changes
+    // and excluding it excluded none, in an answer that said nothing was cut.
+    const summary = (r: ReturnType<typeof diffDocuments>) => [ids(r.layers.added), ids(r.layers.removed), ids(r.layers.moved), ids(r.removedNodes), r.counts.pagesRenamed, r.counts.removedNodes];
+    const asked = summary(diffDocuments(before, after, 100, { page: "Screens v2" }));
+    assert.deepEqual(asked, [["9:2", "9:1"], ["2:1"], ["5:2", "3:1", "6:1", "4:1"], ["1:3", "2:1", "7:2"], 1, 5]);
+    assert.deepEqual(summary(diffDocuments(before, after, 100, { page: "Screens" })), asked, "by the name it had");
+    const left = [[], [], ["3:1", "6:1"], [], 0, 0];
+    assert.deepEqual(summary(diffDocuments(before, after, 100, { exclude: new Set(["Screens"]) })), left, "left out by the name it had");
+    assert.deepEqual(summary(diffDocuments(before, after, 100, { exclude: new Set(["Screens v2"]) })), left, "and by the name it has");
+    // byPage files it under the name it has, whichever name asked for it.
+    assert.deepEqual(Object.keys(diffDocuments(before, after, 100, { page: "Screens" }).byPage), ["Screens v2", "Archive"]);
   });
 
   it("stops every list at the limit, and says so while counts keeps the totals", () => {

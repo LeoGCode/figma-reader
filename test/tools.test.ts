@@ -853,6 +853,15 @@ describe("figma_diff", () => {
     await assert.rejects(body("figma_diff", { old: was, new: is, page: "Archiv" }), /no page named "Archiv"; pages: "Screens", "Archive"/);
     await assert.rejects(body("figma_diff", { old: was, new: is, exclude_pages: ["Old"] }), /no page named "Old" to exclude/);
     await assert.rejects(body("figma_diff", { old: was, new: is, page: "Archive", exclude_pages: ["Archive"] }), /page "Archive" is both asked for and in exclude_pages/);
+    // A page renamed between the two is asked for, and left out, by either name.
+    const draft = figFile("diff-renamed-before", [{ id: "0:1", type: "CANVAS", parent: "0:0", name: "Draft" }, { id: "1:1", type: "FRAME", parent: "0:1", name: "Gone" }]);
+    const released = figFile("diff-renamed-after", [{ id: "0:1", type: "CANVAS", parent: "0:0", name: "Released" }]);
+    for (const name of ["Draft", "Released"]) {
+      const asked = await call("figma_diff", { old: draft, new: released, page: name });
+      assert.deepEqual([ids(asked.removedNodes), asked.counts.pagesRenamed, asked.truncated], [["1:1"], 1, false], name);
+      const left = await call("figma_diff", { old: draft, new: released, exclude_pages: [name] });
+      assert.deepEqual([left.removedNodes, left.counts.pagesRenamed, left.excludedPages], [[], 0, [name]], name);
+    }
     // changes takes the same, over one file.
     const c = await call("figma_changes", { file: is, since: "2026-09-30" });
     assert.deepEqual([c.excludedPages, c.excludedPagesFrom, ids(c.layers), c.editedNodes], [["Archive"], projectFile, ["1:1"], 1]);

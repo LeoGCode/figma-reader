@@ -3,14 +3,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { release, servingMcp, tools } from "./tools.ts";
+import { datingRule, release, servingMcp, tools } from "./tools.ts";
 import { version } from "./version.ts";
 
 // The account was resolved when tools.ts loaded, for the life of this server, and no tool takes --account: a call
 // refused for want of one has to tell the client to fix the server's env or directory instead.
 servingMcp();
 
-const server = new McpServer({ name: "figma-reader", version });
+// The rule every dated tool's description points to, said once for the session rather than in each of them.
+const server = new McpServer({ name: "figma-reader", version }, { instructions: `How results are dated: ${datingRule()}` });
 
 for (const t of tools) {
   // readOnlyHint is what a client checks before running a tool without asking the user, and it was published as true

@@ -229,6 +229,11 @@ test("batch is bad usage only when the command itself is", async () => {
     assert.match(r.stdout, /^Usage: figma-reader batch < calls\.jsonl\n/, args.join(" "));
   }
   assert.match((await cli(["help"])).stdout, /^ {2}batch +Run tool calls given as JSON lines on stdin/m);
+  // The dating rule the dated commands' help points to, once, in the words of the command line.
+  const overview = (await cli(["help"])).stdout;
+  assert.match(overview, /^Dates: A result read from a file is dated by the copy it answers from\./m);
+  assert.match(overview.replace(/\s+/g, " "), /pass --refresh to export it again.*get-tree carries the same fields.*the note --out-file prints/);
+  assert.match((await cli(["help", "get-node"])).stdout.replace(/\s+/g, " "), /Dated by exportedAt and account, or fileModifiedAt for a local \.fig, as the server's instructions say \(figma-reader help on the command line\)/);
 });
 
 test("locate takes its ids from --node-ids, and cannot run without them", async () => {

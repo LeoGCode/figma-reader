@@ -172,6 +172,24 @@ test("a call refused for want of an account tells the client to fix the server, 
   assert.match(answers.get(3)!.result.content[0].text, /^# \{"fileModifiedAt":"[^"]+"\}\n- 0:1 PAGE "Page"/);
 });
 
+test("the dating rule is the server's instructions, said once, and each dated tool points to it", async () => {
+  // Written out in each of the ten dated tools' descriptions it was some 8.6 KB of every session's tool list.
+  const { answers } = await serve([{ id: 2, method: "tools/list" }]);
+  const instructions: string = answers.get(1)!.result.instructions;
+  for (const part of ["exportedAt is the ISO-8601 time this tool exported", "account, {name, source}", "fileModifiedAt, that copy's own file time", "pass refresh", "figma_get_tree carries the same fields", "figma_diff dates each of its two sides"]) {
+    assert.ok(instructions.includes(part), part);
+  }
+  const tools = answers.get(2)!.result.tools as { name: string; description: string }[];
+  // The rule is in no description; the dated tools say they are dated, in one sentence, and where the rule is.
+  assert.ok(tools.every((t) => !t.description.includes("copying, syncing or re-downloading")), "the rule itself is said once");
+  const pointing = tools.filter((t) => t.description.includes("Dated by exportedAt and account, or fileModifiedAt for a local .fig, as the server's instructions say")).map((t) => t.name).sort();
+  assert.deepEqual(pointing, [
+    "figma_changes", "figma_dev_status", "figma_get_components", "figma_get_node", "figma_get_text", "figma_get_tree",
+    "figma_load_file", "figma_locate", "figma_search", "figma_token_usage",
+  ]);
+  assert.match(tools.find((t) => t.name === "figma_diff")!.description, /old and new are each dated, as the server's instructions say/);
+});
+
 test("the published input schema says the unknown arguments are refused", async () => {
   const { answers } = await serve([{ id: 2, method: "tools/list" }]);
   const tree = answers.get(2)!.result.tools.find((t: { name: string }) => t.name === "figma_get_tree");

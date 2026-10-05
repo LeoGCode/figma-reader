@@ -9,7 +9,7 @@ import {
 } from "./account.ts";
 import { BATCH_SUMMARY, batchUsage, runBatch } from "./batch.ts";
 import { defaultExecutable, profileHasLoginCookie } from "./browser.ts";
-import { commandName, commandUsage, parseArgs, UsageError, wantsHelp } from "./cli-args.ts";
+import { commandName, commandUsage, parseArgs, UsageError, wantsHelp, wrap } from "./cli-args.ts";
 import { writePrivateTemp } from "./local-files.ts";
 import { version } from "./version.ts";
 
@@ -135,7 +135,7 @@ if (handled) await quit(0);
 
 // Loading the tools resolves the account. A command that reaches the browser registers this process with the shared
 // browser state when it does (a local read or help never does), so from here on always release before exiting.
-const { account, AccountNotChosen, release, tools } = await import("./tools.ts").catch((e) => fatal((e as Error).message, 1));
+const { account, AccountNotChosen, datingRule, release, tools } = await import("./tools.ts").catch((e) => fatal((e as Error).message, 1));
 const byCommand = new Map(tools.map((t) => [commandName(t.name), t]));
 
 function overview() {
@@ -158,6 +158,9 @@ function overview() {
     `Every command takes --account <name> to override the account; this directory uses "${account.name}".`,
     "<file> is a local .fig path, a Figma file key, or a figma.com/design/... URL (its node-id is used when --node-id is omitted).",
     "Output is JSON or text on stdout. Images are written to --save-path, or to a temp file, and the path is printed.",
+    "",
+    // Said here once, as the MCP server says it in its instructions: each dated command's help only points to it.
+    `Dates: ${wrap(datingRule(commandName, (a) => `--${a.replaceAll("_", "-")}`), 110, "")}`,
   ].join("\n");
 }
 

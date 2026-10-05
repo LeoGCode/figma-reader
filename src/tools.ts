@@ -224,19 +224,32 @@ const refreshArg = z
       "that file is read as it is on disk and the result carries refreshIgnored; pass the key or URL to export the live file instead.",
   );
 /**
- * Said in the description of every tool whose result is dated. A snapshot answers for the file as it was, and a
- * reader who is only told the answer is "fresh" cannot tell one taken before their last edit from an invention: the
- * time can be quoted, and is the one thing that makes the difference visible. The two names are not the same claim:
- * see open(), where a copied file's time is only when the copy was written.
+ * How a result is dated, said once: as the MCP server's instructions (mcp.ts) and in the CLI's help overview (cli.ts).
+ * A snapshot answers for the file as it was, and a reader who is only told the answer is "fresh" cannot tell one taken
+ * before their last edit from an invention: the time can be quoted, and is the one thing that makes the difference
+ * visible. The two names are not the same claim: see open(), where a copied file's time is only when the copy was
+ * written. It was written out in each dated tool's description, ten of them, which made it some 8.6 KB of every MCP
+ * session's tool list. `name` and `arg` spell a tool and an argument as the reader calls them: figma_get_tree and
+ * refresh over MCP, get-tree and --refresh on the command line.
  */
+export function datingRule(name = (tool: string) => tool, arg = (a: string) => a): string {
+  return [
+    "A result read from a file is dated by the copy it answers from. exportedAt is the ISO-8601 time this tool exported",
+    `that snapshot through the browser: report what the design said then rather than as current, and pass ${arg("refresh")}`,
+    "to export it again. Such a result also carries account, {name, source}: the Figma account it was read through and",
+    "what chose it (FIGMA_ACCOUNT, the path of the project's .figma-reader.json, or default). For a local .fig the field",
+    "is fileModifiedAt, that copy's own file time, which copying, syncing or re-downloading the file resets: the design",
+    "data can be older than it says, and nothing here can date it. No account reads a local .fig, so its result names",
+    `none. ${name("figma_get_tree")} carries the same fields in its first line, '# ' and JSON, and ${name("figma_diff")}`,
+    `dates each of its two sides, old and new. ${name("figma_get_variables")}, ${name("figma_get_styles")} and`,
+    `${name("figma_export_image_fills")} carry neither, their answer being the artifact itself, except in the note`,
+    `${arg("out_file")} prints after it.`,
+  ].join(" ");
+}
+/** Said in the description of every tool whose result is dated, in place of the rule itself (see datingRule). */
 const EXPORTED_AT_NOTE =
-  "The result is dated by the copy it answers from. exportedAt is the ISO-8601 time this tool exported that snapshot " +
-  "through the browser: report what the design said then rather than as current, and pass refresh to export it again. " +
-  "Such a result also carries account, {name, source}: the Figma account it was read through and what chose it " +
-  "(FIGMA_ACCOUNT, the path of the project's .figma-reader.json, or default). " +
-  "For a local .fig the field is fileModifiedAt, that copy's own file time, which copying, syncing or re-downloading " +
-  "the file resets: the design data can be older than it says, and nothing here can date it. No account reads a local " +
-  ".fig, so its result names none.";
+  "Dated by exportedAt and account, or fileModifiedAt for a local .fig, as the server's instructions say (figma-reader " +
+  "help on the command line).";
 /** Missing components listed by figma_get_text; the rest are counted, never dropped silently. */
 const MAX_UNRESOLVED_GROUPS = 20;
 
@@ -560,7 +573,7 @@ tool(
 tool(
   "figma_get_tree",
   "Compact outline of the layer tree (id, type, name, size, hints such as ready for dev). Omit node_id for all pages. " +
-    "The first line is a header, '# ' followed by a JSON object holding the fields described below; the outline starts " +
+    "The first line is a header, '# ' followed by a JSON object holding its date (see below); the outline starts " +
     "on the second line. max_nodes goes to one level before the next (pages, then top-level layers, then what is under " +
     "them), so a large first section cannot crowd out later pages. A branch cut short ends in a '- ... N more children' " +
     "line, a layer whose children were all left out says '(N children)', and the last line says it was truncated; when a " +
@@ -1169,12 +1182,12 @@ tool(
     "or exclude_pages (default: the project's excludePages, echoed as excludedPages) narrow the lists before the " +
     "limit. Every list stops at limit, shared between the pages it covers so a page with many changes cannot crowd out " +
     "the rest; counts has each total, and truncated says whether any list was cut. A node created and deleted between " +
-    "the two snapshots is in neither. old may be the word previous: the snapshot this account's cache held for new's key before its latest " +
-    "export (one per key, kept by every export that replaces a snapshot). new is then read from that cache, never from " +
+    "the two snapshots is in neither. old may be the word previous: the snapshot this account's cache held for new's " +
+    "key before its latest export (one per key, kept by every export that replaces a snapshot). new is then read from " +
+    "that cache, never from " +
     "a local copy, and refresh exports it again first, which keeps the snapshot it replaces as previous: so " +
-    "'previous <key>' with refresh compares the last export with the live file. old and new are each dated as the " +
-    "other tools date a result, exportedAt for a snapshot this tool exported and fileModifiedAt for a local .fig: " +
-    "report the changes as between those two times.",
+    "'previous <key>' with refresh compares the last export with the live file. old and new are each dated, as the " +
+    "server's instructions say: report the changes as between those two times.",
   {
     old: z.string().describe("The older file: a .fig path, file key or figma.com URL, or the word previous for the snapshot that new's latest export replaced"),
     new: z.string().describe("The newer file: a .fig path, file key or figma.com URL; a key or URL when old is previous. A node-id in a URL is ignored"),

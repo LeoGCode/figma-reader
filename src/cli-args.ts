@@ -155,7 +155,7 @@ export function checkArgs(shape: z.ZodRawShape, args: unknown): Record<string, u
   return parsed.data;
 }
 
-const wrap = (s: string, width: number, indent: string) => {
+export const wrap = (s: string, width: number, indent: string) => {
   const lines: string[] = [];
   let line = "";
   for (const word of s.split(/\s+/).filter(Boolean)) {

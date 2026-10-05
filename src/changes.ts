@@ -230,8 +230,7 @@ const recorded = (t: unknown): number | undefined => (typeof t === "number" && t
 
 /**
  * A node's newest recorded time in unix seconds, undefined for one that records none: no editInfo, or one with
- * neither time in it. Creation counts, since a node made and never touched since has only that time. In the real
- * export no node was created after its last edit.
+ * neither time in it. Creation counts, since a node made and never touched since has only that time.
  */
 function editedAt(n: FigNode): number | undefined {
   const created = recorded(n.editInfo?.createdAt), edited = recorded(n.editInfo?.lastEditedAt);

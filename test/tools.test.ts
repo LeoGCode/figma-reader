@@ -388,6 +388,29 @@ describe("dating a result", () => {
     await assert.rejects(byName.get("figma_load_file")!.run({ file: key, refresh: true }), /browser/i);
   });
 
+  it("names the snapshot a key was answered from, so a task can stay on that one export", async () => {
+    // A key re-exports once its snapshot is past the max age, so a task that keeps passing the key can read two
+    // exports and report them as one design. The path load-file names is the way to stay on the first: a path is
+    // never exported again, and it dates the answer by the same instant exportedAt did.
+    const key = "SNAPSHOT1234";
+    const snapshot = join(root, "cache", "accounts", "tools-test", `${key}.fig`);
+    mkdirSync(join(root, "cache", "accounts", "tools-test"), { recursive: true });
+    copyFileSync(figFile("snapshot", [page, { id: "1:1", type: "FRAME", parent: "0:1", name: "Card" }]), snapshot);
+    const taken = new Date(Date.now() - 60_000);
+    utimesSync(snapshot, taken, taken);
+    const loaded = await call("figma_load_file", { file: key });
+    assert.deepEqual([loaded.source, loaded.snapshotPath, loaded.path, loaded.exportedAt], ["web", snapshot, undefined, taken.toISOString()]);
+    assert.equal((await call("figma_get_node", { file: loaded.snapshotPath, node_id: "1:1" })).fileModifiedAt, loaded.exportedAt);
+
+    // Past the max age the key exports again (a browser that cannot start, here); the path still answers from disk.
+    const old = new Date(Date.now() - 2 * 3600_000);
+    utimesSync(snapshot, old, old);
+    await assert.rejects(byName.get("figma_get_node")!.run({ file: key, node_id: "1:1" }), /browser/i);
+    assert.equal((await call("figma_get_node", { file: snapshot, node_id: "1:1" })).name, "Card");
+    // A file the caller already holds is named by path; there is no snapshot of ours to name.
+    assert.equal((await call("figma_load_file", { file })).snapshotPath, undefined);
+  });
+
   it("says on the result that a refresh could not be honoured for a path", async () => {
     // refresh has nothing to export a path from, and it used to be dropped in silence: an agent that asked for live
     // data got a file of any age back with nothing on it to say the request was ignored.

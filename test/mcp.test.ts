@@ -6,6 +6,8 @@ import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { findProjectConfig } from "../src/account.ts";
+import { FigDocument } from "../src/fig-file.ts";
+import { Normalizer } from "../src/normalize.ts";
 import { figBytes, type TestNode } from "./fixtures.ts";
 
 const root = mkdtempSync(join(tmpdir(), "figma-reader-mcp-"));
@@ -188,6 +190,66 @@ test("the dating rule is the server's instructions, said once, and each dated to
     "figma_load_file", "figma_locate", "figma_search", "figma_token_usage",
   ]);
   assert.match(tools.find((t) => t.name === "figma_diff")!.description, /old and new are each dated, as the server's instructions say/);
+});
+
+test("what file and refresh take is the server's instructions, said once, and each tool's two point to it", async () => {
+  // Written out in every tool that reads a file, the two descriptions were 7.4 KB of the 35 KB tool list.
+  const { answers } = await serve([{ id: 2, method: "tools/list" }]);
+  const instructions: string = answers.get(1)!.result.instructions;
+  assert.ok(instructions.startsWith("How file and refresh work: file is a local .fig path, a Figma file key, or a figma.com/design/... URL."), instructions);
+  for (const part of ["A node-id in the URL is used by a tool that takes node_id", "from a local '<name> [<key>].fig' under FIGMA_FILES_DIRS", "refresh skips both", "the result carries refreshIgnored"]) {
+    assert.ok(instructions.includes(part), part);
+  }
+  assert.ok(instructions.includes("\n\nHow results are dated: "), "the dating rule follows");
+  const props = (answers.get(2)!.result.tools as { name: string; inputSchema: { properties: Record<string, { description?: string }> } }[])
+    .flatMap((t) => Object.entries(t.inputSchema.properties).map(([k, p]) => ({ tool: t.name, k, d: p.description ?? "" })));
+  const see = "(see the server's instructions, or figma-reader help)";
+  // Every file and refresh says what it takes in a line and points there, but screenshot's file and diff's refresh,
+  // which are not the shared ones; none repeats the rule.
+  const own = (tool: string, k: string) => (tool === "figma_screenshot" && k === "file") || (tool === "figma_diff" && k === "refresh");
+  const shared = props.filter((p) => ["file", "refresh"].includes(p.k) && !own(p.tool, p.k));
+  assert.ok(shared.length >= 25, `${shared.length}`);
+  for (const p of shared) {
+    assert.ok(p.d.endsWith(see) && p.d.length < 130, `${p.tool} ${p.k}: ${p.d}`);
+    assert.ok(!p.d.includes("FIGMA_FILES_DIRS") && !p.d.includes("refreshIgnored"), `${p.tool} ${p.k} repeats the rule`);
+  }
+  assert.equal(new Set(shared.filter((p) => p.k === "file").map((p) => p.d)).size, 1);
+});
+
+test("results are compact JSON, and text stays as the tool wrote it", async () => {
+  // The CLI's one-space indentation was 17-41% of the bytes of a real export's answers, and an MCP client cannot
+  // pipe them through jq: the model reads every byte of it.
+  const { answers } = await serve([
+    call(2, "figma_search", { file: fig, query: "frame 1", limit: 3 }),
+    call(3, "figma_get_node", { file: fig, node_id: "0:1", depth: 0 }),
+    call(4, "figma_load_file", { file: fig }),
+    call(5, "figma_get_tree", { file: fig, depth: 0 }),
+  ]);
+  for (const id of [2, 3, 4]) {
+    const text: string = answers.get(id)!.result.content[0].text;
+    assert.equal(text, JSON.stringify(JSON.parse(text)), `answer ${id} is indented`);
+  }
+  assert.equal(JSON.parse(answers.get(2)!.result.content[0].text).results.length, 3);
+  // get-tree's outline is text: its lines and their indentation are the answer.
+  assert.match(answers.get(5)!.result.content[0].text, /^# \{"fileModifiedAt":"[^"]+"\}\n- 0:1 PAGE "Page"/);
+});
+
+test("get-node refuses over MCP the node the CLI refuses, though its compact JSON would fit", async () => {
+  // The 200 KB limit is on the JSON as the CLI prints it, so one call answers or is refused alike on both surfaces.
+  const page: TestNode = { id: "0:1", type: "CANVAS", parent: "0:0", name: "Page" };
+  const frames = Array.from({ length: 3600 }, (_, i): TestNode => ({ id: `1:${i + 1}`, type: "FRAME", parent: "0:1", name: `f${i}`, position: String(i).padStart(5, "0") }));
+  const bytes = figBytes([page, ...frames]);
+  // What the tool answers with, as get-node builds it, to show the fixture is between the two sizes.
+  const doc = FigDocument.fromBytes("k", new Date(), bytes);
+  const body = { fileModifiedAt: new Date().toISOString(), page: "Page", path: "Page", ...new Normalizer(doc).node(doc.get("0:1")!, 1, doc.get(doc.rootId)) };
+  const [indented, compact] = [JSON.stringify(body, null, 1).length, JSON.stringify(body).length];
+  assert.ok(indented > 200_000 && compact < 200_000, `the fixture is between the two: ${indented} and ${compact}`);
+  const file = join(root, "between.fig");
+  writeFileSync(file, bytes);
+  const { answers } = await serve([call(2, "figma_get_node", { file, node_id: "0:1", depth: 1 })]);
+  const res = answers.get(2)!.result;
+  assert.equal(res.isError, true, "answered over MCP");
+  assert.match(res.content[0].text, /^result is \d+KB; use a smaller depth or a deeper node_id/);
 });
 
 test("the published input schema says the unknown arguments are refused", async () => {

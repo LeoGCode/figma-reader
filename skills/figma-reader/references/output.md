@@ -27,11 +27,11 @@ Read this before parsing a command the skill's Output list does not cover. Shape
 
 `get-variables`, `get-styles` and `export-image-fills` carry no `D`: date them by another call on the same file. With `--out-file`, `get-variables` and `get-styles` print `(written to <path>; exportedAt <time>, account "<name>" (source: …))` after the body (`fileModifiedAt <time>` for a local `.fig`); the file holds the body only.
 
-**batch** lines: blank ones are skipped and not counted in `i`; `login` is refused (run it alone first); an image is written to `save_path` or a private temp file and listed by path in `images`. Four decoded files are kept at once: group the calls by file. Exit 0 all ok, 1 any failed (stderr lists the `i`), 2 bad usage of batch or any line refused for want of an account.
+**batch** lines: a list is a JSON array even of one value (`figma-reader help batch` names every list argument); blank lines are skipped and not counted in `i`; `login` is refused (run it alone first); an image is written to `save_path` or a private temp file and listed by path in `images`. Four decoded files are kept at once: group the calls by file. Exit 0 all ok, 1 any failed (stderr lists the `i`), 2 bad usage of batch or any line refused for want of an account.
 
 ## Flags
 
-Lists take commas (`--types FRAME,TEXT`) or repeat (`--exclude-page A --exclude-page B`); booleans are bare. Every `<file>` command but `screenshot` takes `--refresh` (export again; ignored on a `.fig` path). `--json '<object>'` passes MCP argument names directly, e.g. `--json '{"exclude_pages":[]}'` to turn off the project's `excludePages` (which `search`, `diff` and `changes` apply when you give no `--page`). `figma-reader help <command>` has the rest.
+Lists take commas (`--types FRAME,TEXT`) or repeat (`--exclude-page A --exclude-page B`), and a list flag with `no-` in front gives it empty: `--no-exclude-page` turns off the project's `excludePages` (which `search`, `diff` and `changes` apply when you give no `--page`). Booleans are bare. Every `<file>` command but `screenshot` takes `--refresh` (export again; ignored on a `.fig` path). `--json '<object>'` passes MCP argument names directly. `figma-reader help <command>` has the rest.
 
 - `get-tree`: `--node-id`, `--depth` (2, pages being level 0), `--max-nodes` (400)
 - `get-node`: `--node-id`, `--depth` (3)

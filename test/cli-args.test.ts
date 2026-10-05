@@ -43,6 +43,29 @@ test("a list flag also answers to its singular, the way a repeated flag reads", 
   assert.throws(() => parseArgs({ ...shape, names: z.string().optional() }, ["a", "q", "--name", "x"]), /unknown option --name/);
 });
 
+test("--no-<list> gives a list as empty, the one way to write [] without --json", () => {
+  // search's exclude_pages: [] turns the project's excludePages off, which took --json '{"exclude_pages":[]}' since an
+  // empty --exclude-page= is bad usage like every list. It answers to the singular too, as the list does.
+  for (const argv of [["--no-types"], ["--no-type"], ["--json", '{"types":[]}', "--no-types"], ["--no-types", "--json", '{"types":[]}']]) {
+    assert.deepEqual(parseArgs(shape, ["a", "q", ...argv]).types, [], argv.join(" "));
+  }
+  assert.equal(parseArgs(shape, ["a", "q", "--no-refresh"]).refresh, false, "a switch is still turned off");
+  // It takes no value, so "--help" after it is a request for usage.
+  assert.equal(wantsHelp(shape, ["a.fig", "q", "--no-type", "--help"]), true);
+  const bad = (argv: string[], re: RegExp) => assert.throws(() => parseArgs(shape, ["a", "q", ...argv]), (e) => e instanceof UsageError && re.test(e.message), argv.join(" "));
+  bad(["--no-types=FRAME"], /--no-types takes no value/);
+  // Empty and given values at once contradict each other, in whichever order: lists add up rather than replace.
+  bad(["--no-types", "--types", "FRAME"], /--no-types gives types as an empty list, but it was also given \["FRAME"\]/);
+  bad(["--type", "FRAME", "--no-type"], /--no-type gives types as an empty list, but it was also given \["FRAME"\]/);
+  bad(["--json", '{"types":["TEXT"]}', "--no-types"], /--no-types gives types as an empty list, but it was also given \["TEXT"\]/);
+  bad(["--no-types", "--json", '{"types":"TEXT"}'], /--no-types gives types as an empty list, but it was also given "TEXT"/);
+  // An empty value is still bad usage, and says what gives an empty list on purpose.
+  bad(["--types="], /^--types needs at least one value; --no-types gives an empty list$/);
+  // Only switches and lists have a --no- form.
+  bad(["--no-depth"], /unknown option --no-depth/);
+  bad(["--no-node-id"], /unknown option --no-node-id/);
+});
+
 test("--json merges raw arguments and positionals fill only what is unset", () => {
   assert.deepEqual(parseArgs(shape, ["--json", '{"file":"x.fig","depth":1}', "q"]), { file: "x.fig", query: "q", depth: 1 });
 });
@@ -117,6 +140,9 @@ test("a required list is a flag the command cannot run without, and says so", ()
   assert.throws(() => parseArgs(locate, []), (e) => e instanceof UsageError && e.message === "missing <file> --node-ids");
   const usage = commandUsage("fr", { name: "figma_locate", description: "Locate.", shape: locate });
   assert.equal(usage.split("\n")[0], "Usage: fr locate <file> --node-ids <string,...> [options]");
+  // An empty list is no answer to a required one, so its help offers no --no- form; an optional list's does.
+  assert.doesNotMatch(usage, /--no-node-ids/);
+  assert.match(commandUsage("fr", { name: "figma_search", description: "Search.", shape }), /^ {2}--no-types +Give types as an empty list$/m);
 });
 
 test("a required list answers to its singular as a flag, and only to its own name in --json and a batch line", () => {

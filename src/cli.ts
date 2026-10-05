@@ -135,8 +135,10 @@ if (handled) await quit(0);
 
 // Loading the tools resolves the account. A command that reaches the browser registers this process with the shared
 // browser state when it does (a local read or help never does), so from here on always release before exiting.
-const { account, AccountNotChosen, datingRule, release, tools } = await import("./tools.ts").catch((e) => fatal((e as Error).message, 1));
+const { account, AccountNotChosen, datingRule, fileRule, release, tools } = await import("./tools.ts").catch((e) => fatal((e as Error).message, 1));
 const byCommand = new Map(tools.map((t) => [commandName(t.name), t]));
+/** An argument as a command line writes it: <file> in place, every other one a flag. */
+const spell = (a: string) => (a === "file" ? "<file>" : `--${a.replaceAll("_", "-")}`);
 
 function overview() {
   const width = Math.max(...[...byCommand.keys()].map((c) => c.length)) + 2;
@@ -156,11 +158,13 @@ function overview() {
     `  ${"batch".padEnd(width)}${BATCH_SUMMARY}`,
     "",
     `Every command takes --account <name> to override the account; this directory uses "${account.name}".`,
-    "<file> is a local .fig path, a Figma file key, or a figma.com/design/... URL (its node-id is used when --node-id is omitted).",
     "Output is JSON or text on stdout. Images are written to --save-path, or to a temp file, and the path is printed.",
     "",
-    // Said here once, as the MCP server says it in its instructions: each dated command's help only points to it.
-    `Dates: ${wrap(datingRule(commandName, (a) => `--${a.replaceAll("_", "-")}`), 110, "")}`,
+    // Said here once, as the MCP server says them in its instructions: each command's <file> and --refresh, and each
+    // dated command's help, only point to them.
+    `Files: ${wrap(fileRule(commandName, spell), 110, "")}`,
+    "",
+    `Dates: ${wrap(datingRule(commandName, spell), 110, "")}`,
   ].join("\n");
 }
 
@@ -177,13 +181,13 @@ if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
     console.error(`${BIN}: unknown command ${JSON.stringify(argv[0])}\n\n${overview()}`);
     await exit(2);
   }
-  console.log(t ? commandUsage(BIN, t) : argv[0] === "batch" ? batchUsage(BIN) : argv[0] ? accountUsage(argv[0]) : overview());
+  console.log(t ? commandUsage(BIN, t) : argv[0] === "batch" ? batchUsage(BIN, tools) : argv[0] ? accountUsage(argv[0]) : overview());
   await exit(0);
 }
 
 if (cmd === "batch") {
   if (wantsHelp({}, argv)) {
-    console.log(batchUsage(BIN));
+    console.log(batchUsage(BIN, tools));
     await exit(0);
   }
   if (argv.length) {

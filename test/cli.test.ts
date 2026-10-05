@@ -136,12 +136,13 @@ test("--page naming no page is an error that lists the pages", async () => {
   assert.equal(JSON.parse((await cli(["search", bigFig, "frame", "--page", "Home", "--limit", "1"])).stdout).total, FRAMES / 2);
 });
 
-test("search skips the project's excludePages, --exclude-page replaces them, and --json can turn them off", async () => {
+test("search skips the project's excludePages, --exclude-page replaces them, and --no-exclude-page turns them off", async () => {
   const proj = join(root, "excluding");
   mkdirSync(proj);
   writeFileSync(join(proj, ".figma-reader.json"), JSON.stringify({ excludePages: ["Home"] }));
+  const run = (args: string[]) => cli(args, { cwd: proj });
   const q = async (...args: string[]) => {
-    const r = await cli(["search", bigFig, "frame", "--limit", "1", ...args], { cwd: proj });
+    const r = await run(["search", bigFig, "frame", "--limit", "1", ...args]);
     assert.equal(r.code, 0, r.stderr);
     return JSON.parse(r.stdout);
   };
@@ -150,8 +151,25 @@ test("search skips the project's excludePages, --exclude-page replaces them, and
   assert.equal(byDefault.excludedPagesFrom, join(proj, ".figma-reader.json"));
   const own = await q("--exclude-page", "Settings");
   assert.deepEqual([own.total, own.results[0].page, own.excludedPages, own.excludedPagesFrom], [FRAMES / 2, "Home", ["Settings"], undefined]);
-  // An empty flag is bad usage, as it is for every list; an empty list is still an argument --json can give.
-  assert.equal((await q("--json", '{"exclude_pages":[]}')).total, FRAMES);
+  // Turning the default off took --json '{"exclude_pages":[]}': an empty flag is bad usage, as it is for every list,
+  // so that a value left empty by mistake cannot do it. --no-exclude-page (or -pages) says it on purpose.
+  for (const off of [["--no-exclude-page"], ["--no-exclude-pages"], ["--json", '{"exclude_pages":[]}']]) {
+    const all = await q(...off);
+    assert.deepEqual([all.total, all.excludedPages], [FRAMES, undefined], off.join(" "));
+  }
+  const empty = await run(["search", bigFig, "frame", "--exclude-page="]);
+  assert.equal(empty.code, 2);
+  assert.match(empty.stderr, /--exclude-page needs at least one value; --no-exclude-page gives an empty list/);
+  const both = await run(["search", bigFig, "frame", "--no-exclude-page", "--exclude-page", "Settings"]);
+  assert.equal(both.code, 2);
+  assert.match(both.stderr, /--no-exclude-page gives exclude_pages as an empty list, but it was also given \["Settings"\]/);
+  // diff and changes apply the same default, and the same flag turns it off.
+  for (const args of [["diff", bigFig, bigFig], ["changes", bigFig, "7d"]]) {
+    const r = await run(args);
+    assert.deepEqual([r.code, JSON.parse(r.stdout).excludedPages], [0, ["Home"]], r.stderr);
+    const off = await run([...args, "--no-exclude-page"]);
+    assert.deepEqual([off.code, JSON.parse(off.stdout).excludedPages], [0, undefined], off.stderr);
+  }
 });
 
 test("dev-status answers in the list envelope, and a status it does not know is bad usage", async () => {
@@ -234,6 +252,19 @@ test("batch is bad usage only when the command itself is", async () => {
   assert.match(overview, /^Dates: A result read from a file is dated by the copy it answers from\./m);
   assert.match(overview.replace(/\s+/g, " "), /pass --refresh to export it again.*get-tree carries the same fields.*the note --out-file prints/);
   assert.match((await cli(["help", "get-node"])).stdout.replace(/\s+/g, " "), /Dated by exportedAt and account, or fileModifiedAt for a file read from disk, as the server's instructions say \(figma-reader help on the command line\)/);
+});
+
+test("help says once what <file> and --refresh take, and names the arguments a batch line gives as lists", async () => {
+  // Written out in every command, the two were 7.4 KB of the MCP tool list; each command now says them in a line.
+  const overview = (await cli(["help"])).stdout;
+  assert.match(overview, /^Files: <file> is a local \.fig path, a Figma file key, or a figma\.com\/design\/\.\.\. URL\./m);
+  assert.match(overview.replace(/\s+/g, " "), /--refresh skips both and exports the live file through the browser\. It has no effect when <file> is a path to a \.fig/);
+  const search = (await cli(["help", "search"])).stdout;
+  assert.match(search.replace(/\s+/g, " "), /<file> A local \.fig path, a Figma file key or a figma\.com\/design\/\.\.\. URL \(see the server's instructions, or figma-reader help\)/);
+  assert.match(search, /^ {2}--no-exclude-pages +Give exclude_pages as an empty list$/m);
+  // Read off the tools: an agent passed node_ids as "1:2,3:4", the way the flag takes them, and lost the call.
+  const batch = (await cli(["help", "batch"])).stdout.replace(/\s+/g, " ");
+  assert.match(batch, /a list as a JSON array, even of one value, never as a comma-separated string\. The lists are node_ids \(locate\), types \(search\), exclude_pages \(search, diff, changes\):/);
 });
 
 test("locate takes its ids from --node-ids, and cannot run without them", async () => {

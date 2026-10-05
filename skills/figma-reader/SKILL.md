@@ -35,14 +35,14 @@ JSON on stdout unless marked text; exit 0 ok, 1 failed (message on stderr), 2 ba
 
 - `get-tree` (**text**: `grep`, not `jq`): line 1 `# {D}`, then `- <id> <TYPE> "<name>" <w>x<h> (<hints>)`, two spaces per level. Hints: `hidden`, `of "<component>"`, a text preview, `ready for dev`, `<n> children` (not opened), `<n> vectors`. A cut branch ends `- ... N more children`; a last line `level N not shown` names the `--max-nodes` that shows it.
 - `get-node`: one flat object, no wrapper: `{D, page, path, id, name, type, width, height, fills, layout, component, devStatus?, children[] or childCount}`. On TEXT, `characters` is the string and `text` the **style**.
-- `search`: `{D, total, truncated, excludedPages?, results[{id, type, name, page, characters?}]}`; a TEXT hit's string is `characters`, `name` the layer name.
+- `search`: `{D, total, truncated, excludedPages?, results[{id, type, name, page, characters?}]}`; a TEXT hit's string is `characters`, `name` the layer name. `excludedPages` names the pages left out, by default the project's; `--no-exclude-page` searches every page.
 - `get-text`: `{D, total, truncated, unresolvedInstances, text[{id, text, frame?}]}`: `jq -r '.text[] | "\(.id) \(.text)"'`.
 - `locate`: `{D, found, missing, invalid, results[{id, found, type?, name?, page?, path?}]}`.
 - `dev-status`: `{D, total, neverMarked?, nodes[{id, name, page, status, raw, previous, changedAt}]}`; `neverMarked`: records left out, which `--status any` lists.
 - `diff`: `{old{D}, new{D}, counts, byPage, layers{added, removed, renamed, moved}, removedNodes[{id, page, path, removedCount}], truncated}`; `changes`: `{D, total, byPage, layers[{id, name, page, lastEditedAt, created, editedNodes}]}`.
 - Any other command, every key and every flag: read `references/output.md` (beside this file) before you parse it.
 
-**batch**: one JSON call per stdin line, `{"tool": "locate", "args": {"file": "<file>", "node_ids": ["1:2", "3:4"]}}`: MCP argument names and types (`node_ids` and `exclude_pages` are arrays, `include_text` a boolean). One decode for all; one line back per call, `{"i": 0, "ok": true, "result": <its JSON, or text as a string>}` or `{"i": 1, "ok": false, "error": "…"}`; exit 1 if any failed, 2 if any was refused for want of an account. Pipe it through `jq` for the fields you need, or into a file you then query: a long answer is cut before you see it.
+**batch**: one JSON call per stdin line, `{"tool": "locate", "args": {"file": "<file>", "node_ids": ["1:2", "3:4"]}}`: MCP argument names and types (`node_ids` and `exclude_pages` are arrays, `include_text` a boolean; `figma-reader help batch` lists every array). One decode for all; one line back per call, `{"i": 0, "ok": true, "result": <its JSON, or text as a string>}` or `{"i": 1, "ok": false, "error": "…"}`; exit 1 if any failed, 2 if any was refused for want of an account. Pipe it through `jq` for the fields you need, or into a file you then query: a long answer is cut before you see it.
 
 ## Rules
 

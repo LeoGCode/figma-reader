@@ -8,8 +8,8 @@ It ships in two forms that share the same tools and code. Use whichever fits:
 
 | | Command | Best for |
 | --- | --- | --- |
-| **MCP server** | `figma-reader-mcp` | MCP clients (Claude Code, Claude Desktop, Cursor, ...). One long-lived process keeps the browser and editor tab warm, so repeated web calls are fast |
-| **CLI** | `figma-reader` | Shells, scripts, CI, and agents that prefer running commands over loading MCP tools. Nothing to register; output is JSON/text on stdout |
+| **MCP server** | `figma-reader-mcp` | MCP clients (Claude Code, Claude Desktop, Cursor, ...). One long-lived process keeps decoded files in memory and the browser and editor tab warm, so repeated calls are fast |
+| **CLI** | `figma-reader` | Shells, scripts, CI, and agents that prefer running commands over loading MCP tools. Nothing to register; output is JSON/text on stdout. Each call decodes the file again, seconds on a large one |
 
 Two ways to feed it:
 
@@ -111,7 +111,7 @@ Arguments are the MCP tool arguments in kebab-case. Required strings are positio
 
 Installed from a clone without `npm link`, run `node /path/to/figma-reader/dist/cli.js`. The CLI reads the same environment variables as the server (see below).
 
-Each CLI call is its own process. Local `.fig` files and cached snapshots answer in well under a second, but a call that needs figma.com starts the headless browser and loads the editor, so it takes tens of seconds. The browser closes when the call ends, unless an MCP server on the same profile is still using it. For many web calls in a row, the MCP server is faster.
+Each CLI call is its own process, and decodes the `.fig` (a local file or a cached snapshot) again. That cost grows with the file: a small one answers in a fraction of a second, but every call on a 67 MB export takes 3.4 to 4.7 s, almost all of it decoding, whatever the command asks. A call that needs figma.com also starts the headless browser and loads the editor, so it takes tens of seconds. The browser closes when the call ends, unless an MCP server on the same profile is still using it. The MCP server decodes a file once and keeps it in memory while the file is unchanged, and keeps the browser warm, so for many calls on a large file, or many web calls in a row, use the server rather than the CLI.
 
 #### For agents
 

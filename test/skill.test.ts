@@ -83,6 +83,14 @@ describe("the agent skill", () => {
     assert.deepEqual(new Set(pins), new Set([version]), "update the npx pin in SKILL.md to the package version");
   });
 
+  it("keeps the exception to \"never your working tree\": a FIGMA_USER_DATA_DIR profile writes where it is", () => {
+    // A trim for the byte budget dropped it, and the rule then promised that a browser call never writes in the
+    // working tree, which a profile set inside the project does (the browser makes and fills it).
+    const rule = skill.split("\n").find((l) => l.startsWith("- **What writes.**")) ?? "";
+    assert.match(rule, /`FIGMA_USER_DATA_DIR` profile/);
+    assert.match(rule, /never your working tree unless that profile is in it/);
+  });
+
   it(`stays within ${SKILL_BUDGET} bytes, and names the reference it leaves the rest to, which the package ships`, () => {
     const size = Buffer.byteLength(skill);
     assert.ok(size <= SKILL_BUDGET, `SKILL.md is ${size} bytes: move shapes and flags to ${REFERENCE}`);

@@ -25,17 +25,17 @@ JSON on stdout unless marked text. Shapes name the keys you need, not every key;
 
 | Command | Shape |
 | --- | --- |
-| `load-file` | `{name, key?, source: "local"\|"web", path? or snapshotPath?, D, pages[{id, name, topLevelNodes}], nodeCounts, variableCollections, styles, components}` |
-| `get-tree` | **Text**: `- <id> <TYPE> "<name>" <w>x<h> (<hints>)`, two spaces of indent per level; hints include `<n> children` where depth stopped. Past `--max-nodes` the last line is `... truncated at <n> nodes`. Use `grep`, not `jq`. |
-| `get-node` | One flat object, no wrapper: `{D, page, path: "Page / Frame / Layer", id, name, type, x, y, width, height, fills[{type, color, variable?}], layout{mode, gap, padding[t,r,b,l]}, component{mainComponent, mainComponentId, properties}, boundVariables, children[…] or childCount}`. On TEXT, `characters` is the string and `text` the **style** (`fontFamily`, `fontSize`, …). |
-| `search` | `{D, queryAs, returned, total, truncated, unresolvedInstances?, results[{id, type, name, page, characters?, charactersTruncated?, via?, component?, frame?}]}`. The string is `characters` (cut at 120 chars when `charactersTruncated`); `name` is the layer name. |
-| `get-text` | `{D, returned, total, truncated, unresolvedInstances, unresolved?, text[{id, name, text, via, component?, frame?}]}`: `jq -r '.text[].text'` |
-| `get-variables` | json: `[{name, modes, defaultMode, variables[{name, type, values{<mode>: {value} or {alias, resolved}}}]}]`; css: a `:root` stylesheet; dtcg: `{<collection>: {<mode>: {…: {$type, $value}}}}` |
-| `get-styles` | json: `[{name, type, value}]`; css: a stylesheet |
-| `get-components` | `{D, componentSets[{id, name, variants[{id, name, instances, swapInstances}]}], components[{id, name, instances, swapInstances}], libraryComponentsUsed[{name, instances, swapInstances}]}` |
-| `token-usage` | `{D, colors, typography, cornerRadii, gaps, paddings, strokeWidths, effects}`, lists of `{value (typography: font fields), count, variables?, styles?}` |
-| `screenshot` | Text: `image written to <path>`, then `node <id>: <w>x<h>`; with `--save-path`, one line ending `saved to <path>` |
-| `export-image-fills` | `[{hash, path, bytes, usedBy}]`; `{hash, missing: true, usedBy}` where the export lacks the image |
+| `load-file` | `{name, key?, source: "local"\|"web", path? or snapshotPath?, D, pages[{id, name, topLevelNodes}], nodeCounts{<TYPE>: n}, variableCollections[{name, modes[<name>], variables: n}], styles{<TYPE>: n}, components: n, imageFills: n}` |
+| `get-tree` | **Text**: `- <id> <TYPE> "<name>"`, then `<w>x<h>` and `(<hints>)` if any, indented two spaces per level. Hints: `hidden`, `of "<component>"`, a text preview, `auto-layout <mode>`, `<n> children` where depth stopped. Past `--max-nodes` it ends `... truncated at <n> nodes`. Use `grep`, not `jq`. |
+| `get-node` | One flat object, no wrapper: `{D, page, path: "Page / Frame / Layer", id, name, type, x, y, width, height, fills[{type, color?, variable?}], layout{mode, gap, padding[t,r,b,l]}, component, boundVariables{<field>: <variable>}, children[…] or childCount}`, children without `D`/`page`/`path`. An INSTANCE's `component` is `{mainComponent, mainComponentId?, properties?}`. On TEXT, `characters` is the string and `text` the **style** (`fontFamily`, `fontSize`, …). |
+| `search` | `{D, queryAs, returned, total, truncated, unresolvedInstances?, results[{id, type, name, page, size?, characters?, charactersTruncated?, via?, component?, frame?}]}`. A TEXT hit's string is `characters`, its first 120 chars and `...` when `charactersTruncated`; `name` is the layer name. |
+| `get-text` | `{D, returned, total, truncated, unresolvedInstances, unresolved?[{name, reason, count, ids}], text[{id, name, text, via, component?, frame?}]}`: `jq -r '.text[].text'` |
+| `get-variables` | json: `[{name, modes[{id, name}], defaultMode, variables[{name, type, values{<mode name>: {value} or {alias, resolved?}}}]}]`; css: custom properties in `:root`, other modes in blocks of their own; dtcg: `{<collection>: {<mode>: {…: {$type, $value}}}}` |
+| `get-styles` | json: `[{name, type, value}]`, `value` by type `{paints}`, font fields, `{effects}` or `{grids}`; css: `:root` properties and a class per text style |
+| `get-components` | `{D, componentSets[{id, name, page, variants[{id, name, instances, swapInstances}]}], components[{id, name, page, size, instances, swapInstances}], libraryComponentsUsed[{name, variantsUsed?, instances, swapInstances}]}` |
+| `token-usage` | `{D, colors, typography, cornerRadii, gaps, paddings, strokeWidths, effects, textWithoutTypography?}`: colors `[{value, roles{fill\|text\|stroke: n}, count, variables?, styles?}]`, typography `[{<font fields>, count, styles?}]`, effects `[{type, color?, offset?, radius?, spread?, count}]`, the other four `[{value, count}]` |
+| `screenshot` | Text: `image written to <path>`, then `node <id>: <w>x<h>` (`page (all top-level layers) <id>: …` for a page); with `--save-path`, only that line, ending `saved to <path>` |
+| `export-image-fills` | `[{hash, path, bytes, usedBy, usedByTotal?}]`, one per image; `{hash, missing: true, usedBy}` where the export lacks it |
 
 With `--out-file`, `get-variables` and `get-styles` print `(written to <path>)` after the body: read the file.
 
@@ -51,7 +51,7 @@ Lists take commas (`--types FRAME,TEXT`), booleans are bare; `figma-reader help 
 
 ## Rules
 
-- **Verify every node id you cite**, each one: `get-node <file> --node-id <id> --depth 0` gives its `page` and `path`. Exit 1 with `node <id> not found` on stderr means absent; any other failure means the check failed, so report the id as unverified, not gone. An id with a `/` (`get-text`, `search` text hits) is text inside an instance: verify the part before the first `/`.
+- **Verify every node id you cite**, each one: `get-node <file> --node-id <id> --depth 0` gives its `page` and `path`. Exit 1 with `node <id> not found` on stderr means absent; any other failure means the check failed, so report the id as unverified, not gone. An id with a `/` (`get-text`, `search` text hits) is text inside an instance, not a node: `get-node` says `not found` to every one. Look for it in `.text[].id` of `get-text <file> --node-id <the part before the first />` (with `--include-hidden` if it came with it); missing there is gone only if `truncated` is false (else raise `--limit`) and `unresolvedInstances` is 0, unverified otherwise.
 - **Few calls, tight filters.** Each CLI call decodes the file again, 3-5 s on a 67 MB file. Scope with `--node-id`, `--page`, `--types`; find several names at once with `--regex 'Login|Sign up'`. For many reads prefer the `figma_*` MCP tools if loaded: the server decodes once. In a long conversation, delegate the Figma reading to a subagent with a checklist of what to return (ids, values, date): each call there re-reads the whole context.
 - **One snapshot per task.** A key or URL reads a snapshot cached for 30 minutes; the first call after that exports again, and you can end up quoting two versions as one. After `load-file`, pass its `snapshotPath` (`path` for a local copy) instead of the key: a path is never exported again, and is dated `fileModifiedAt`, the time `exportedAt` gave. Another export of the key (after 30 minutes, or `--refresh`) replaces the file; a changed `fileModifiedAt` shows it.
 - An export starts a headless browser on figma.com and takes tens of seconds. `--refresh` forces one begun after you ask; on a `.fig` path it is ignored (dated results say `refreshIgnored: true`).

@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { commandName } from "../src/cli-args.ts";
+import { commandName, parseArgs, positionals, UsageError } from "../src/cli-args.ts";
 
 const root = mkdtempSync(join(tmpdir(), "figma-reader-skill-"));
 mkdirSync(join(root, "home"));
@@ -35,15 +35,30 @@ const byCommand = new Map(tools.map((t) => [commandName(t.name), t]));
 const section = (title: string) => skill.split(/^## /m).find((s) => s.startsWith(`${title}\n`)) ?? "";
 
 describe("the agent skill", () => {
-  it("has the frontmatter a skill installer reads", () => {
+  it("keeps its frontmatter to one-line `key: plain value` pairs of the keys a skill declares", () => {
+    // Not a YAML parser: the frontmatter is held to the small subset of YAML it uses, which every parser reads alike.
+    // Anything outside it - a flow sequence, a quoted or block scalar, a comment, a second line - fails here, where it
+    // would otherwise first fail in someone's installer.
     const front = skill.match(/^---\n([\s\S]*?)\n---\n/)?.[1];
     assert.ok(front, "SKILL.md starts with a --- block");
-    const fields = new Map(front.split("\n").map((l) => [l.slice(0, l.indexOf(":")), l.slice(l.indexOf(":") + 1).trim()]));
-    assert.equal(fields.get("name"), "figma-reader");
-    assert.ok(fields.get("allowed-tools"));
-    // A plain YAML scalar ends at ": ", so one inside the description would cut it short or fail to parse.
+    const fields = new Map<string, string>();
+    for (const line of front.split("\n")) {
+      const m = line.match(/^([a-z-]+): (\S(?:.*\S)?)$/);
+      assert.ok(m, `not a one-line key: value pair: ${JSON.stringify(line)}`);
+      const [, key, value] = m;
+      assert.ok(["name", "description", "allowed-tools"].includes(key) && !fields.has(key), `unexpected or repeated key ${key}`);
+      // A plain scalar: opened by no indicator, holding nothing that would end it (": ") or comment it out (" #").
+      assert.ok(!/^[-?:,[\]{}#&*!|>'"%@`]/.test(value) && !/: | #|:$|\t/.test(value), `${key} is not a plain scalar: ${value}`);
+      fields.set(key, value);
+    }
+    assert.equal(fields.get("name"), "figma-reader", "the name is the skill's directory name");
+    // 1024 characters is the Agent Skills limit on a description.
     const description = fields.get("description") ?? "";
-    assert.ok(description.length > 50 && !description.includes(": "), description);
+    assert.ok(description.length > 50 && description.length <= 1024, `description of ${description.length} characters`);
+    // Claude Code's tool rules, space separated: Bash(<command>:*).
+    const rules = fields.get("allowed-tools")?.split(" ") ?? [];
+    assert.ok(rules.length);
+    for (const rule of rules) assert.match(rule, /^Bash\([a-z][a-z-]*:\*\)$/);
   });
 
   it("pins the version it describes", () => {
@@ -65,33 +80,85 @@ describe("the agent skill", () => {
     for (const c of named) assert.ok(byCommand.has(c) || others.has(c), `SKILL.md names "${c}", which is no command`);
   });
 
-  it("gives each command only flags it takes", () => {
+  // Every check below asks the CLI's own parser, so what passes here is what `figma-reader` accepts: a reading of the
+  // schemas written for this test once let `--no-depth` through, which the parser refuses since depth is no switch.
+  it("gives each command in its flags list only flags it takes, with values it takes", () => {
+    // "- `get-tree`: `--node-id`, `--depth` (default 2); `get-node`: `--node-id`", one command per segment.
     let checked = 0;
-    const takes = (command: string, flags: Iterable<RegExpMatchArray>) => {
-      const tool = byCommand.get(command);
-      assert.ok(tool, `SKILL.md gives flags to "${command}", which is no command`);
-      for (const [flag] of flags) {
-        const key = flag.slice(2).replaceAll("-", "_");
-        const negated = key.startsWith("no_") && !(key in tool.shape) ? key.slice(3) : undefined;
-        assert.ok(key in tool.shape || (negated && negated in tool.shape), `${command} takes no ${flag}`);
-        checked++;
-      }
-    };
-    // The Flags section: "- `get-tree`: `--node-id`, `--depth` (default 2); `get-node`: `--node-id`", one command per
-    // segment.
     for (const line of section("Flags").split("\n").filter((l) => l.startsWith("- "))) {
       for (const segment of line.slice(2).split("; ")) {
         const m = segment.match(/^`([a-z-]+)[^`]*`: (.*)$/);
         assert.ok(m, `unreadable flags entry: ${segment}`);
-        takes(m[1], m[2].matchAll(/--[a-z-]+/g));
+        for (const [, flag, values] of m[2].matchAll(/`(--[a-z-]+)(?: ([^`]+))?`/g)) {
+          assert.equal(flagError(m[1], flag, values), undefined, `${m[1]} ${flag}${values ? ` ${values}` : ""}`);
+          checked++;
+        }
       }
     }
     assert.ok(checked > 20, `only ${checked} flags found: did the Flags section change shape?`);
-    // And every example call, such as `get-node <file> --node-id <id> --depth 0` in the workflow and the rules.
-    for (const m of skill.matchAll(/`(?:figma-reader )?([a-z][a-z-]*) <(?:file|key-or-url)>([^`]*)`/g)) takes(m[1], m[2].matchAll(/--[a-z-]+/g));
     // "Every <file> command but screenshot takes --refresh."
     for (const [name, t] of byCommand) {
-      if ("file" in t.shape) assert.equal("refresh" in t.shape, name !== "screenshot", name);
+      if ("file" in t.shape) assert.equal(flagError(name, "--refresh") === undefined, name !== "screenshot", name);
+    }
+  });
+
+  it("writes every example call so that the CLI parses it", () => {
+    // `get-node <file> --node-id <id> --depth 0` in a rule, and `search --include-text`, which leaves its positionals
+    // out: a command word followed by a <file> or a flag. Placeholders become "1", which every argument takes.
+    let checked = 0;
+    for (const [, span] of skill.matchAll(/`([^`\n]+)`/g)) {
+      const words = (span.match(/<[^>]*>|"[^"]*"|'[^']*'|\S+/g) ?? []).filter((w, i) => i || w !== "figma-reader");
+      const [command, next] = words;
+      if (!/^[a-z][a-z-]*$/.test(command) || !next || !(next.startsWith("--") || ["<file>", "<key-or-url>"].includes(next))) continue;
+      const args = words.slice(1).map((w) => w.replace(/^(["'])(.*)\1$/, "$2")).map((w) => (/^<.*>$/.test(w) ? "1" : w));
+      const argv = next.startsWith("--") && byCommand.has(command) ? [...stand(command), ...args] : args;
+      assert.equal(usageError(command, argv), undefined, `\`${span}\``);
+      checked++;
+    }
+    assert.ok(checked >= 10, `only ${checked} example calls found`);
+  });
+
+  it("names in prose only flags some command takes", () => {
+    // "Scope with `--node-id`, `--page`, `--types`": not tied to one command, but each must be an option of one. The
+    // value it would want does not matter here, only that the parser does not call it an unknown option.
+    // --account is taken by every command before its own options are parsed (cli.ts), so no tool's schema has it.
+    for (const [, flag] of skill.matchAll(/`(--[a-z-]+)/g)) {
+      if (flag === "--account") continue;
+      const known = (c: string) => !usageError(c, [...stand(c), flag])?.startsWith(`unknown option ${flag}`);
+      assert.ok([...byCommand.keys()].some(known), `no command takes ${flag}`);
     }
   });
 });
+
+/** What the CLI's parser says to `figma-reader <command> <argv>`: undefined when it parses, else its complaint. */
+function usageError(command: string, argv: string[]): string | undefined {
+  const tool = byCommand.get(command);
+  if (!tool) return `"${command}" is no command`;
+  try {
+    parseArgs(tool.shape, argv);
+    return undefined;
+  } catch (e) {
+    if (e instanceof UsageError) return e.message;
+    throw e;
+  }
+}
+
+/** Stand-ins for the positionals a command requires (<file>, then <query> or <out_dir>), so a flag can be tried alone. */
+const stand = (command: string) => positionals(byCommand.get(command)!.shape).map(() => "1");
+
+/**
+ * Whether `command` takes `flag`, as the parser says: each value the skill writes for it ("json|css|dtcg"), or else
+ * as a switch or with "1", which every string, number and list option takes.
+ */
+function flagError(command: string, flag: string, values?: string): string | undefined {
+  if (!byCommand.has(command)) return `"${command}" is no command`;
+  if (values && !values.startsWith("<")) {
+    for (const v of values.split("|")) {
+      const error = usageError(command, [...stand(command), flag, v]);
+      if (error) return error;
+    }
+    return undefined;
+  }
+  const alone = usageError(command, [...stand(command), flag]);
+  return alone && usageError(command, [...stand(command), flag, "1"]) && alone;
+}

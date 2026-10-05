@@ -166,7 +166,8 @@ test("a layer drawn only with vector shapes is one line counting them", () => {
     { id: "2:4", type: "VECTOR", parent: "2:2", name: "b" },
     { id: "3:1", type: "FRAME", parent: "1:1", name: "icon" },
     { id: "3:2", type: "VECTOR", parent: "3:1", name: "path" },
-    // Not drawings: text next to the shapes, a rectangle (a background as often as a shape), a picture in a circle.
+    // Not drawings: text next to the shapes, a rectangle (a background as often as a shape), a picture in a circle,
+    // and a photo used as a circle's border, which is as much an image as a fill.
     { id: "4:1", type: "GROUP", parent: "1:1", name: "Badge" },
     { id: "4:2", type: "VECTOR", parent: "4:1", name: "star" },
     { id: "4:3", type: "TEXT", parent: "4:1", name: "label" },
@@ -174,6 +175,8 @@ test("a layer drawn only with vector shapes is one line counting them", () => {
     { id: "5:2", type: "RECTANGLE", parent: "5:1", name: "bar" },
     { id: "6:1", type: "FRAME", parent: "1:1", name: "Avatar" },
     { id: "6:2", type: "ELLIPSE", parent: "6:1", name: "photo", fillPaints: [{ type: "IMAGE" }] },
+    { id: "7:1", type: "FRAME", parent: "1:1", name: "Framed" },
+    { id: "7:2", type: "ELLIPSE", parent: "7:1", name: "border", strokePaints: [{ type: "IMAGE" }] },
   ]);
   assert.equal(outline(drawn, drawn.require("1:1"), 6, 400), [
     '- 1:1 FRAME "Header"',
@@ -186,14 +189,16 @@ test("a layer drawn only with vector shapes is one line counting them", () => {
     '    - 5:2 RECTANGLE "bar"',
     '  - 6:1 FRAME "Avatar"',
     '    - 6:2 ELLIPSE "photo"',
+    '  - 7:1 FRAME "Framed"',
+    '    - 7:2 ELLIPSE "border"',
   ].join("\n"));
   // Past the depth the count names what it counts.
-  assert.match(outline(drawn, drawn.require("1:1"), 0, 400), /^- 1:1 FRAME "Header" \(5 children\)$/);
+  assert.match(outline(drawn, drawn.require("1:1"), 0, 400), /^- 1:1 FRAME "Header" \(6 children\)$/);
   assert.match(outline(drawn, drawn.get(drawn.rootId)!, 2, 400), /- 2:1 GROUP "Logo" 120x32 \(26 vectors\)/);
   // Asking for the drawing itself is how its shapes are seen: the node asked for is always listed.
   const logo = outline(drawn, drawn.require("2:1"), 1, 400).split("\n");
   assert.equal(logo.length, 27);
   assert.deepEqual([logo[0], logo[26]], ['- 2:1 GROUP "Logo" 120x32', '  - 2:2 BOOLEAN_OPERATION "Union" (2 vectors)']);
-  // Shapes counted on their parent's line are not lines, so they spend none of max_nodes: the ten lines above fit ten.
-  assert.doesNotMatch(outline(drawn, drawn.require("1:1"), 6, 10), /truncated/);
+  // Shapes counted on their parent's line are not lines, so they spend none of max_nodes: the twelve above fit twelve.
+  assert.doesNotMatch(outline(drawn, drawn.require("1:1"), 6, 12), /truncated/);
 });

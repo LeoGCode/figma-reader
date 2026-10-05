@@ -10,9 +10,15 @@ import { displayType } from "./normalize.ts";
  */
 const SHAPES = new Set(["VECTOR", "BOOLEAN_OPERATION", "STAR", "LINE", "ELLIPSE", "REGULAR_POLYGON"]);
 
-/** A shape with an image fill is a picture (an avatar, a photo in a circle), which is not something to count away. */
+/**
+ * A shape painted with an image is a picture (an avatar, a photo in a circle, a photo used as a border), which is not
+ * something to count away. Strokes as well as fills, as figma_export_image_fills reads both: an image stroke on an
+ * ellipse used to hide the layer holding the image inside its frame's "(1 vector)".
+ */
 const isDrawing = (n: FigNode) =>
-  SHAPES.has(n.type) && (n.type === "BOOLEAN_OPERATION" || !n.childIds.length) && !n.fillPaints?.some((p: { type?: string }) => p.type === "IMAGE");
+  SHAPES.has(n.type) &&
+  (n.type === "BOOLEAN_OPERATION" || !n.childIds.length) &&
+  ![...(n.fillPaints ?? []), ...(n.strokePaints ?? [])].some((p: { type?: string }) => p.type === "IMAGE");
 
 /** Lines a parent's children take when it shows some of them: one each, and one for the "... N more children". */
 const linesFor = (count: number, shown: number) => shown + (shown > 0 && shown < count ? 1 : 0);

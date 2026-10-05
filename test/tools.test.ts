@@ -4,7 +4,7 @@
 // hardcoded false, with the whole suite green. These call the handlers directly, on .fig files written here.
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync, zipSync } from "fflate";
@@ -12,7 +12,9 @@ import { compileSchema, encodeBinarySchema, parseSchema } from "kiwi-schema";
 import { z } from "zod";
 import { guid, nodeChanges, type TestNode } from "./fixtures.ts";
 
-const root = mkdtempSync(join(tmpdir(), "figma-reader-tools-"));
+// Resolved, as in test/cli.test.ts: the project file is found from the working directory, which the kernel reports
+// resolved, so on macOS (/var -> /private/var) its path came back under a spelling this test did not build it with.
+const root = realpathSync(mkdtempSync(join(tmpdir(), "figma-reader-tools-")));
 const figs = join(root, "figs");
 const listed = join(root, "listed");
 for (const d of [join(root, "home"), figs, listed]) mkdirSync(d, { recursive: true });
@@ -280,11 +282,41 @@ describe("figma_search page exclusion", () => {
     assert.deepEqual([all.total, all.excludedPages], [8, undefined]);
   });
 
+  it("leaves excluded pages out of the text pass too", async () => {
+    // Only the text matches here. A page skipped by the name walk alone was still searched by the text scan, and
+    // answered first under a limit of one, next to an excludedPages saying it had not been searched.
+    const texts = figFile("archived-text", [
+      { id: "0:1", type: "CANVAS", parent: "0:0", name: "Archive" },
+      { id: "1:1", type: "TEXT", parent: "0:1", name: "old copy", textData: { characters: "needle in the archive" } },
+      { id: "0:2", type: "CANVAS", parent: "0:0", name: "Screens" },
+      { id: "2:1", type: "TEXT", parent: "0:2", name: "new copy", textData: { characters: "needle on a screen" } },
+    ]);
+    for (const args of [{}, { exclude_pages: ["Archive"] }]) {
+      const r = await call("figma_search", { file: texts, query: "needle", include_text: true, limit: 1, ...args });
+      assert.deepEqual([r.returned, r.total, r.truncated, r.results[0].id, r.excludedPages], [1, 1, false, "2:1", ["Archive"]], JSON.stringify(args));
+    }
+  });
+
   it("leaves the default out when page or node_id already says where to look", async () => {
     const page = await call("figma_search", { file: archived, query: "request", page: "Archive" });
     assert.deepEqual([page.total, page.excludedPages], [5, undefined]);
     const node = await call("figma_search", { file: archived, query: "request", node_id: "1:1" });
     assert.deepEqual([node.total, node.searchedNode, node.excludedPages], [1, "1:1", undefined]);
+  });
+
+  it("takes a node-id in the file URL as saying where to look, as node_id does", async () => {
+    // A pasted frame URL is how a node is usually named. Read as no scope, it brought the project's default in, and
+    // a frame on an excluded page was refused as if the call had excluded that page itself.
+    const key = "ARCHIVEDKEY1";
+    // FIGMA_FILES_DIRS is shared with the list-files tests, which count what is in it, so this leaves nothing behind.
+    const local = join(listed, `Archived [${key}].fig`);
+    copyFileSync(archived, local);
+    try {
+      const r = await call("figma_search", { file: `https://www.figma.com/design/${key}/Archived?node-id=1-1`, query: "request" });
+      assert.deepEqual([r.total, r.searchedNode, r.results[0].page, r.excludedPages], [1, "1:1", "Archive", undefined]);
+    } finally {
+      rmSync(local, { force: true });
+    }
   });
 
   it("refuses an exclusion that names no page, or the very page it is asked to search", async () => {

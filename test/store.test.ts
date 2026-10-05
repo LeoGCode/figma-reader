@@ -868,9 +868,12 @@ describe("SnapshotStore between processes", () => {
     const current = await store.get("K", true);
     const decode = mock.method(FigDocument, "fromFile");
     try {
-      assert.equal(await store.getLocal(store.figPath("K")), current, "the key and its path are one document");
+      const byPath = await store.getLocal(store.figPath("K"));
+      assert.equal(byPath.nodes, current.nodes, "the key and its path are one decode");
+      assert.deepEqual([byPath.fileKey, current.fileKey], [store.figPath("K"), "K"], "each answered under its own name");
+      assert.equal(await store.getLocal(store.figPath("K")), byPath, "and the same copy each time it is named so");
       const prev = await store.previousOf("K", current);
-      assert.notEqual(prev, current);
+      assert.notEqual(prev!.nodes, current.nodes);
       assert.deepEqual([label(prev!), label(current)], ["export 1", "export 2"]);
       // Read by its own path afterwards, the previous snapshot is that same decode, and still not the current one.
       assert.equal(await store.getLocal(store.previousPath("K")), prev);

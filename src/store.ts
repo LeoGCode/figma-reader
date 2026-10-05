@@ -176,6 +176,8 @@ export class SnapshotStore {
   private docs = new Map<string, FigDocument>();
   /** The file each document was decoded from, as seen then: another process can replace it in a shared cache dir. */
   private stamps = new WeakMap<FigDocument, string>();
+  /** Each document under the other names it was asked for by, one per name (see named). */
+  private aliases = new WeakMap<FigDocument, Map<string, FigDocument>>();
   /** Loads in progress, at most one per key: a new one is only ever queued behind the one already there. */
   private inflight = new Map<string, Inflight>();
 
@@ -236,19 +238,42 @@ export class SnapshotStore {
    *
    * A snapshot of ours goes by two names: its key, and its path, which getLocal keeps under the real path. Reading by
    * key and then by that path is how a task pins itself to one snapshot, and it decoded the same file twice and kept
-   * both. Under either name, a document kept under the other is that same file when its stamp agrees. Which name the
-   * caller used still decides how the answer is dated (open in tools.ts), and both read the one file time.
+   * both. Under either name, a document kept under the other is that same file when its stamp agrees, and it is
+   * answered under the name asked for (see named). Which name the caller used still decides how the answer is dated
+   * (open in tools.ts), and both read the one file time.
    */
   private fromDisk(fileKey: string, path: string): FigDocument {
     const st = statSync(path);
     const stamp = `${st.mtimeMs}:${st.size}`;
     for (const name of [fileKey, this.otherName(fileKey, path)]) {
       const cached = name === undefined ? undefined : this.docs.get(name);
-      if (cached && this.stamps.get(cached) === stamp) return this.remember(cached);
+      if (cached && this.stamps.get(cached) === stamp) return this.named(this.remember(cached), fileKey);
     }
     const doc = FigDocument.fromFile(fileKey, path, st.mtime);
     this.stamps.set(doc, stamp);
     return this.remember(doc);
+  }
+
+  /**
+   * `doc` under the name `fileKey`, which is how the caller named the file: a document carries the name it was decoded
+   * under, and its errors name the file by it. Sharing one decode between a key and its snapshot's path made a node
+   * missing from that path, read after the key, "not found in file <key>", a name the caller had not used. The copy
+   * shares everything decoded, the very maps and nodes, and differs only in its name, so nothing is decoded or kept
+   * twice; FigDocument keeps all of it in plain fields, which is what lets a copy of them be the same document. One per
+   * name, kept with the document, so that what the other modules work out once per document and keep by it (the
+   * instance-text indexes) is worked out once per name rather than on every call.
+   */
+  private named(doc: FigDocument, fileKey: string): FigDocument {
+    if (doc.fileKey === fileKey) return doc;
+    let byName = this.aliases.get(doc);
+    if (!byName) this.aliases.set(doc, (byName = new Map()));
+    let alias = byName.get(fileKey);
+    if (!alias) {
+      alias = Object.assign(Object.create(FigDocument.prototype) as FigDocument, doc, { fileKey });
+      this.stamps.set(alias, this.stamps.get(doc)!);
+      byName.set(fileKey, alias);
+    }
+    return alias;
   }
 
   /**

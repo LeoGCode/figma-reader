@@ -161,6 +161,32 @@ describe("batch", () => {
     }
   });
 
+  it("names the file in an error as the call named it, though its key and its path share one decode", async () => {
+    // Shared, the document carried the name it was first decoded under: a node missing from the snapshot read by its
+    // path after its key was "not found in file <key>", a name that call never gave.
+    const cache = join(root, "cache", "accounts", "batch-test");
+    mkdirSync(cache, { recursive: true });
+    const snapshot = join(cache, "NAMEDKEY1234.fig");
+    writeFileSync(snapshot, figBytes(nodes));
+    const decode = mock.method(FigDocument, "fromFile");
+    try {
+      const { out } = await batch([
+        line("get-node", { file: "NAMEDKEY1234", node_id: "9:9" }),
+        line("get-node", { file: snapshot, node_id: "9:9" }),
+        line("get-node", { file: "NAMEDKEY1234", node_id: "9:9" }),
+        line("locate", { file: snapshot, node_ids: ["1:1"] }),
+      ]);
+      assert.equal(decode.mock.callCount(), 1);
+      const errors = out.map((o) => o.error);
+      assert.ok(errors[0].startsWith("node 9:9 not found in file NAMEDKEY1234 ["), errors[0]);
+      assert.equal(errors[1], `node 9:9 not found in file ${realpathSync(snapshot)}`);
+      assert.equal(errors[2], errors[0], "and the key's own name is as it was");
+      assert.equal(out[3].result.found, 1, "the path's answer reads the same nodes");
+    } finally {
+      decode.mock.restore();
+    }
+  });
+
   it("keeps four files decoded, so a batch over more decodes again the one it used longest ago", async () => {
     // The bound the help and the README state: within four files each is decoded once, and a fifth evicts the file
     // used longest ago, which is decoded again when it comes back. A smaller bound would decode the second round

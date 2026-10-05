@@ -39,8 +39,9 @@ Lists take commas (`--types FRAME,TEXT`) or repeat (`--exclude-page A --exclude-
 - `get-text`: `--node-id`, `--include-hidden`, `--limit` (500)
 - `locate`: `--node-ids` (required)
 - `dev-status`: `--page`, `--status ready_for_dev|completed|none|any` (default: marked now or before), `--limit` (100)
-- `diff <old> <new>`: `--page` and `--exclude-page` (a renamed page answers to either name), `--limit` (100 per list), and old may be `previous`
+- `diff <old> <new>`: `--page` and `--exclude-page` (a renamed page answers to either name), `--limit` (100 per list), `--refresh` (exports new again), and old may be `previous`
 - `changes <file> <since>`: `--page`, `--exclude-page`, `--limit` (50), since being an ISO date or 30m, 12h, 7d, 2w, given as a positional or after --since
 - `token-usage`: `--node-id`, `--include-hidden`, `--min-count`
-- `get-variables`: `--format json|css|dtcg`, `--collection`, `--no-include-remote`, `--out-file`; `get-styles`: `--type FILL|STROKE|TEXT|EFFECT|GRID`, `--format json|css`, `--out-file`; `get-components`: `--query`
+- `get-variables`: `--format json|css|dtcg`, `--collection`, `--no-include-remote`, `--css-prefix`, `--out-file`; `get-styles`: `--type FILL|STROKE|TEXT|EFFECT|GRID`, `--format json|css`, `--css-prefix`, `--out-file`; `get-components`: `--query`
 - `screenshot`: `--node-id`, `--save-path`, `--max-dimension` (1568); `export-image-fills <file> <out_dir>`: `--node-id`
+- `list-files`: `--source local|web`, `--query`, `--limit` (30); `login`: `--wait-seconds` (up to 1800)

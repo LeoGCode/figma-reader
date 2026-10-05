@@ -132,6 +132,32 @@ describe("the agent skill", () => {
     }
   });
 
+  it("lists in the reference every option of every command", () => {
+    // The check above holds what is listed to the parser; this holds the parser to what is listed. --css-prefix and
+    // login's --wait-seconds were missing, and list-files had no entry, while the skill promised every flag there.
+    const listed = new Map<string, Set<string>>();
+    for (const line of section(reference, "Flags").split("\n").filter((l) => l.startsWith("- "))) {
+      for (const segment of line.slice(2).split("; ")) {
+        const m = segment.match(/^`([a-z-]+)[^`]*`: (.*)$/);
+        if (m) listed.set(m[1], new Set([...(listed.get(m[1]) ?? []), ...[...m[2].matchAll(/`(--[a-z-]+)/g)].map((f) => f[1])]));
+      }
+    }
+    // Said once for them all, rather than in every entry.
+    assert.ok(section(reference, "Flags").includes("Every `<file>` command but `screenshot` takes `--refresh`"));
+    const missing: string[] = [];
+    for (const [name, t] of byCommand) {
+      const { properties = {} } = z.toJSONSchema(z.object(t.shape)) as { properties?: Record<string, { type?: string }> };
+      for (const [k, p] of Object.entries(properties)) {
+        if (positionals(t.shape).includes(k) || (k === "refresh" && "file" in t.shape)) continue;
+        const flag = `--${k.replaceAll("_", "-")}`;
+        // A switch may be listed by its negation, and a list by its singular, as the parser takes both.
+        const forms = [flag, ...(p.type === "boolean" ? [`--no-${flag.slice(2)}`] : []), ...(p.type === "array" ? [flag.replace(/s$/, "")] : [])];
+        if (!forms.some((f) => listed.get(name)?.has(f))) missing.push(`${name} ${flag}`);
+      }
+    }
+    assert.deepEqual(missing, [], `${REFERENCE} leaves these out`);
+  });
+
   it("writes every example call so that the CLI parses it", () => {
     // `get-node <file> --node-id <id> --depth 0` in a rule, and `search --include-text`, which leaves its positionals
     // out: a command word followed by a <file> or a flag. Placeholders become "1", which every argument takes.

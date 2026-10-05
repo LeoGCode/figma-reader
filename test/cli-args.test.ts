@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { z } from "zod";
-import { commandName, commandUsage, parseArgs, positionals, UsageError, wantsHelp } from "../src/cli-args.ts";
+import { checkArgs, commandName, commandUsage, parseArgs, positionals, UsageError, wantsHelp } from "../src/cli-args.ts";
 
 const shape = {
   file: z.string(),
@@ -117,4 +117,18 @@ test("a required list is a flag the command cannot run without, and says so", ()
   assert.throws(() => parseArgs(locate, []), (e) => e instanceof UsageError && e.message === "missing <file> --node-ids");
   const usage = commandUsage("fr", { name: "figma_locate", description: "Locate.", shape: locate });
   assert.equal(usage.split("\n")[0], "Usage: fr locate <file> --node-ids <string,...> [options]");
+});
+
+test("a required list answers to its singular as a flag, and only to its own name in --json and a batch line", () => {
+  // The singular is the CLI's way of writing a repeated flag (--node-id 1:2 --node-id 3:4, as --exclude-page reads),
+  // so it counts as the required list it stands for. --json and a batch line take MCP argument names, where node_id
+  // is no argument of locate's: that is the error to name, not that --node-ids is missing.
+  const locate = { file: z.string(), node_ids: z.array(z.string()).min(1), refresh: z.boolean().optional() };
+  assert.deepEqual(parseArgs(locate, ["a.fig", "--node-id", "1:2", "--node-id=3-4"]), { file: "a.fig", node_ids: ["1:2", "3-4"] });
+  assert.equal(wantsHelp(locate, ["a.fig", "--node-id", "--help"]), false, "--help is the value it takes");
+  assert.throws(() => parseArgs(locate, ["a.fig", "--node-id="]), /--node-id needs at least one value/);
+  assert.throws(() => parseArgs(locate, ["a.fig", "--json", '{"node_id":["1:2"]}']), (e) => e instanceof UsageError && /Unrecognized key: "node_id"/.test(e.message));
+  assert.throws(() => checkArgs(locate, { file: "a.fig", node_id: ["1:2"] }), (e) => e instanceof UsageError && /Unrecognized key: "node_id"/.test(e.message));
+  // A missing positional is still said first, whatever --json carried.
+  assert.throws(() => parseArgs(locate, ["--json", '{"node_id":["1:2"]}']), (e) => e instanceof UsageError && e.message === "missing <file> --node-ids");
 });

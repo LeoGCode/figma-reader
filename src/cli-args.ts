@@ -138,7 +138,10 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
   });
   // A required argument that is not a string (locate's --node-ids) is a flag that must be given, not a positional.
   const missing = required.filter((k) => out[k] === undefined).map((k) => (pos.includes(k) ? `<${k}>` : flagName(k)));
-  if (missing.length) throw new UsageError(`missing ${missing.join(" ")}`);
+  // Unless --json set a key no argument has, which is the likelier mistake and the one to name: a flag's singular
+  // (--node-id for --node-ids) is the CLI's alone, so {"node_id": [...]} in --json said only "missing --node-ids".
+  const unknown = Object.keys(out).some((k) => !props[k]);
+  if (missing.length && !(unknown && missing.every((m) => m.startsWith("--")))) throw new UsageError(`missing ${missing.join(" ")}`);
   return checkArgs(shape, out);
 }
 

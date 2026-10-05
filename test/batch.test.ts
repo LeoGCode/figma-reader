@@ -1,6 +1,6 @@
 // figma-reader batch, run in this process against the real tools so that decodes can be counted: a batch exists to
-// decode each file once (while at most four are in play), and one that decoded per line would answer exactly the
-// same, only as slowly as separate processes. test/cli-batch.test.ts runs the command itself, over stdin.
+// decode each file once (while at most four are in play, and fewer large ones), and one that decoded per line would
+// answer exactly the same, only as slowly as separate processes. test/cli-batch.test.ts runs the command itself.
 import { after, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
@@ -27,6 +27,9 @@ process.env.FIGMA_ACCOUNT = "batch-test";
 process.env.FIGMA_READER_CACHE = join(root, "cache");
 process.env.FIGMA_FILES_DIRS = listed;
 process.env.FIGMA_BROWSER_PATH = join(root, "no-such-browser");
+// What the decoded files kept between calls may weigh, read as the tools load: room for any number of the small files
+// below (a few KB each), and not for one of the large one (1.3 MB) beside anything else.
+process.env.FIGMA_DECODED_MAX_MB = "1";
 for (const k of ["FIGMA_CDP_URL", "FIGMA_USER_DATA_DIR", "FIGMA_SNAPSHOT_MAX_AGE_MIN"]) delete process.env[k];
 const { release, tools } = await import("../src/tools.ts");
 const { batchUsage, runBatch } = await import("../src/batch.ts");
@@ -187,9 +190,24 @@ describe("batch", () => {
     }
   });
 
-  it("keeps four files decoded, so a batch over more decodes again the one it used longest ago", async () => {
-    // The bound the help and the README state: within four files each is decoded once, and a fifth evicts the file
-    // used longest ago, which is decoded again when it comes back. A smaller bound would decode the second round
+  it("keeps fewer files decoded when they are large, but always the one in use", async () => {
+    // FIGMA_DECODED_MAX_MB (1 here) bounds what the files kept weigh: the large one does not fit beside a small one,
+    // so each pushes the other out, and a run of calls on either still decodes it once.
+    const large = fig("large", [...nodes, ...Array.from({ length: 2000 }, (_, i): TestNode => ({ id: `3:${i + 1}`, type: "FRAME", parent: "0:1", name: `f${i}` }))]);
+    const small = fig("small");
+    const decode = mock.method(FigDocument, "fromFile");
+    try {
+      const { failed } = await batch([small, large, large, large, small, large].map((file) => line("locate", { file, node_ids: ["1:1"] })));
+      assert.deepEqual(failed, []);
+      assert.deepEqual(decode.mock.calls.map((c) => basename(c.arguments[1], ".fig")), ["small", "large", "small", "large"]);
+    } finally {
+      decode.mock.restore();
+    }
+  });
+
+  it("keeps four small files decoded, so a batch over more decodes again the one it used longest ago", async () => {
+    // The bound the help and the README state: within four small files each is decoded once, and a fifth evicts the
+    // file used longest ago, which is decoded again when it comes back. A smaller bound would decode the second round
     // again; a larger one would not decode the first file a second time at the end.
     const [f1, f2, f3, f4, f5] = ["held-1", "held-2", "held-3", "held-4", "held-5"].map((name) => fig(name));
     const decode = mock.method(FigDocument, "fromFile");

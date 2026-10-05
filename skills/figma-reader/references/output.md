@@ -27,7 +27,7 @@ Read this before parsing a command the skill's Output list does not cover. Shape
 
 `get-variables`, `get-styles` and `export-image-fills` carry no `D`: date them by another call on the same file. With `--out-file`, `get-variables` and `get-styles` print `(written to <path>; exportedAt <time>, account "<name>" (source: …))` after the body (`fileModifiedAt <time>` for a local `.fig`); the file holds the body only.
 
-**batch** lines: a list is a JSON array even of one value (`figma-reader help batch` names every list argument); blank lines are skipped and not counted in `i`; `login` is refused (run it alone first); an image is written to `save_path` or a private temp file and listed by path in `images`. Four decoded files are kept at once: group the calls by file. Exit 0 all ok, 1 any failed (stderr lists the `i`), 2 bad usage of batch or any line refused for want of an account.
+**batch** lines: a list is a JSON array even of one value (`figma-reader help batch` names every list argument); blank lines are skipped and not counted in `i`; `login` is refused (run it alone first); an image is written to `save_path` or a private temp file and listed by path in `images`. Up to four decoded files are kept at once, fewer when they are large (`FIGMA_DECODED_MAX_MB`, half of Node's heap limit by default: about two 67 MB exports with 16 GB of RAM), and always the one in use: group the calls by file. Exit 0 all ok, 1 any failed (stderr lists the `i`), 2 bad usage of batch or any line refused for want of an account.
 
 ## Flags
 

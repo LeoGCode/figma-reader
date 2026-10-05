@@ -1,8 +1,8 @@
 // figma-reader batch: many tool calls in one process. Every CLI call is a process of its own that decodes its file
 // again, which takes seconds on a large export: an agent reviewing a design ran some 130 of them, mostly in loops over
 // node ids, and spent 805 s of an 18 minute run inside figma-reader. A batch runs its calls in one process, where the
-// store keeps the four decoded files used last for the next call, and every web call shares one browser launch. Kept
-// free of side effects, like cli-args.ts, so it can be tested on its own: the tools are passed in.
+// store keeps the decoded files used last for the next call (four, fewer large ones), and every web call shares one
+// browser launch. Kept free of side effects, like cli-args.ts, so it can be tested on its own: the tools are passed in.
 import { AccountNotChosen } from "./account.ts";
 import { checkArgs, commandName, listArguments, wrap } from "./cli-args.ts";
 import { outPath, writePrivateTemp } from "./local-files.ts";
@@ -132,8 +132,9 @@ export function batchUsage(bin: string, tools: Tool[]): string {
     `Usage: ${bin} batch < calls.jsonl`,
     "",
     "Run many tool calls in one process, so a file is not decoded again for every call (seconds for a large file),",
-    "and web calls share one browser. The process keeps the four files used last decoded, so each file is decoded",
-    "once while at most four are in play: group calls by file. Each line of stdin is one call, run in order:",
+    "and web calls share one browser. The process keeps the four files used last decoded, fewer when they are large",
+    "(FIGMA_DECODED_MAX_MB, half of Node's heap limit by default: about two 67 MB exports with 16 GB of RAM), and",
+    "always the one in use, so group calls by file. Each line of stdin is one call, run in order:",
     "",
     '  {"tool": "get-text", "args": {"file": "app.fig", "node_id": "1:2"}}',
     "",

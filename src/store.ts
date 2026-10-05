@@ -1,6 +1,7 @@
 // Snapshot cache: the latest exported .fig per file key on disk, and the one it replaced; decoded documents in memory.
 import { existsSync, linkSync, mkdirSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { getHeapStatistics } from "node:v8";
 import { cannotWrite, mayNotWrite } from "./account.ts";
 import { dropLease, liveLeases, processStamp, takeLease } from "./browser.ts";
 import { FigDocument } from "./fig-file.ts";
@@ -100,6 +101,64 @@ export function cleanStaleLocks(dir: string) {
 }
 
 /**
+ * What one decoded value takes in memory, about: an object, an array element, a key, a number or a string, counted as
+ * weigh counts them. Retained heap over that count ran from 17 to 31 bytes on twelve real exports of 3 to 754 MB of
+ * heap (37 on the smallest); this is the middle of it, within 30% of either end.
+ */
+const BYTES_PER_VALUE = 24;
+/** weigh counts one node in this many: within 12% of counting them all on those exports, 60-130 ms on the largest. */
+const SAMPLE_EVERY = 16;
+
+/** Values in `v`, itself included. A byte array is one: its bytes are not on the heap, and images are weighed apart. */
+function values(v: unknown): number {
+  if (v === null || typeof v !== "object" || ArrayBuffer.isView(v)) return 1;
+  let n = 1;
+  if (Array.isArray(v)) for (const x of v) n += values(x);
+  else for (const k in v) n += 1 + values((v as Record<string, unknown>)[k]);
+  return n;
+}
+
+/**
+ * About how many bytes the decoded `doc` keeps in memory, which is what the store's budget is spent on (see remember):
+ * its values, counted on every SAMPLE_EVERY-th node and scaled, and the bytes of its images.
+ *
+ * Neither the file's size nor the heap says it. A .fig is a zip of the canvas and its images, and on those exports the
+ * heap a document kept ran from 0.2 to 62 times its file's size: a 171 MB file kept 28 MB, a 21 MB one 621 MB. The
+ * heap's growth across a decode came within 7-17% of what the document kept in a fresh process, and wrong in a process
+ * that had been working, the one this is for: the documents it had dropped were collected during the next decode, and
+ * one keeping 471 MB grew the heap by -940 MB.
+ */
+export function weigh(doc: FigDocument): number {
+  let counted = 0;
+  let i = 0;
+  for (const node of doc.nodes.values()) if (i++ % SAMPLE_EVERY === 0) counted += values(node);
+  let images = 0;
+  for (const bytes of doc.images.values()) images += bytes.byteLength;
+  return counted * SAMPLE_EVERY * BYTES_PER_VALUE + images;
+}
+
+/**
+ * How many bytes of decoded documents a store keeps between calls (see remember): FIGMA_DECODED_MAX_MB, else half of
+ * this process's heap limit, which Node sets from the machine's memory (4 GB with 16 GB or more, 2 GB with 8). Four
+ * files were kept whatever they weighed, and a decoded 67 MB export keeps about 750 MB of heap: with a 2 GB limit, a
+ * batch over four large real exports by path ran out of heap at the fourth, and with 4 GB, one over five peaked at
+ * 3.8 GB of RSS (3.0 GB under this budget). Half leaves the other half to the decode under way, which is not counted
+ * until it is done, and to the call's own work; weigh's estimate is within a third of what a document keeps. A value
+ * that is not a number of MB is said on stderr and replaced by the default, as FIGMA_SNAPSHOT_MAX_AGE_MIN's is.
+ */
+export function decodedBudget(env: NodeJS.ProcessEnv = process.env): number {
+  const fallback = getHeapStatistics().heap_size_limit / 2;
+  const raw = env.FIGMA_DECODED_MAX_MB;
+  if (raw === undefined) return fallback;
+  const mb = Number(raw);
+  if (raw.trim() === "" || !Number.isFinite(mb) || mb < 0) {
+    process.stderr.write(`figma-reader: FIGMA_DECODED_MAX_MB=${JSON.stringify(raw)} is not a number of MB; using ${Math.round(fallback / 2 ** 20)}\n`);
+    return fallback;
+  }
+  return mb * 2 ** 20;
+}
+
+/**
  * An export whose lease name says it began at or before `since`, so it may be exporting the file as it was before
  * then. The time in the name is the holder's own Date.now(): one in the future means the clock stepped back between
  * that export and this read (chrony's makestep, a resumed VM, date -s), so it dates nothing and counts as older, as
@@ -176,6 +235,8 @@ export class SnapshotStore {
   private docs = new Map<string, FigDocument>();
   /** The file each document was decoded from, as seen then: another process can replace it in a shared cache dir. */
   private stamps = new WeakMap<FigDocument, string>();
+  /** What each decoded document keeps in memory (see weigh). */
+  private weights = new WeakMap<FigDocument, number>();
   /** Each document under the other names it was asked for by, one per name (see named). */
   private aliases = new WeakMap<FigDocument, Map<string, FigDocument>>();
   /** Loads in progress, at most one per key: a new one is only ever queued behind the one already there. */
@@ -186,17 +247,20 @@ export class SnapshotStore {
   private maxAgeMs: number;
   private maxDocs: number;
   private otherExportWaitMs: number;
+  private maxBytes: number;
 
   /**
    * `otherExportWaitMs` is a parameter only so that a test can reach the ceiling: what it leaves behind is an
    * export still running that this one has to answer around, and no test can wait out the ten real minutes.
+   * `maxDocs` and `maxBytes` bound the documents kept decoded, by number and by what they weigh (see remember).
    */
-  constructor(web: Exporter, dir: string, maxAgeMs: number, maxDocs = 4, otherExportWaitMs = OTHER_EXPORT_WAIT_MS) {
+  constructor(web: Exporter, dir: string, maxAgeMs: number, maxDocs = 4, otherExportWaitMs = OTHER_EXPORT_WAIT_MS, maxBytes = decodedBudget()) {
     this.web = web;
     this.dir = dir;
     this.maxAgeMs = maxAgeMs;
     this.maxDocs = maxDocs;
     this.otherExportWaitMs = otherExportWaitMs;
+    this.maxBytes = maxBytes;
   }
 
   figPath(fileKey: string) {
@@ -652,11 +716,28 @@ export class SnapshotStore {
     }
   }
 
-  /** Keep a document, as the most recently used: when over maxDocs, the least recently used is dropped. */
+  /**
+   * Keep a document, as the most recently used: while more than maxDocs are kept, or more than maxBytes of them by
+   * weight (see weigh), the least recently used is dropped. Never the one just used, however much it weighs alone: a
+   * file larger than the whole budget is then decoded once for a run of calls on it, rather than once for every call.
+   * Small files are kept four at a time, as before; a 67 MB export weighs about 1 GB, so under a 4 GB heap limit the
+   * default budget keeps two.
+   */
   private remember(doc: FigDocument) {
     this.docs.delete(doc.fileKey);
     this.docs.set(doc.fileKey, doc);
-    while (this.docs.size > this.maxDocs) this.docs.delete(this.docs.keys().next().value!);
+    const weight = () => [...this.docs.values()].reduce((sum, d) => sum + this.weightOf(d), 0);
+    while (this.docs.size > 1 && (this.docs.size > this.maxDocs || weight() > this.maxBytes)) this.docs.delete(this.docs.keys().next().value!);
     return doc;
+  }
+
+  /**
+   * What `doc` weighs, worked out the first time it is asked, which is when a second document is kept beside it: a
+   * process that reads one file, as every single CLI call does, never pays for it (60-130 ms on a 67 MB export).
+   */
+  private weightOf(doc: FigDocument): number {
+    let weight = this.weights.get(doc);
+    if (weight === undefined) this.weights.set(doc, (weight = weigh(doc)));
+    return weight;
   }
 }

@@ -9,11 +9,12 @@ import {
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { getHeapStatistics } from "node:v8";
 import { LEASE_BEAT_MS, pidNamespace, processStamp, takeLease } from "../src/browser.ts";
 import { FigDocument } from "../src/fig-file.ts";
 import { cleanStaleDownloads, type FigmaWeb } from "../src/figma-web.ts";
-import { LEASE_POLL_MS, SnapshotStore } from "../src/store.ts";
-import { figBytes } from "./fixtures.ts";
+import { decodedBudget, LEASE_POLL_MS, SnapshotStore, weigh } from "../src/store.ts";
+import { figBytes, figDoc, nodeChanges, type TestNode } from "./fixtures.ts";
 
 const dirs: string[] = [];
 after(() => {
@@ -250,6 +251,67 @@ describe("SnapshotStore.get", () => {
     assert.notEqual(b, first, "B was dropped from memory");
     assert.equal(label(b), "export 2", "and decoded again from its own file");
     assert.deepEqual(x.calls, ["A", "B", "C"]);
+  });
+});
+
+// Four documents were kept whatever they weighed, and a decoded 67 MB export holds some 750 MB of heap: a batch or a
+// server over a few large files neared Node's heap limit. What is kept is bounded by what it weighs too.
+describe("SnapshotStore's budget for decoded documents", () => {
+  /** A .fig of one page holding `frames` frames. */
+  const local = (name: string, frames: number) => {
+    const path = join(tempDir(), `${name}.fig`);
+    const page = { id: "0:1", type: "CANVAS", parent: "0:0", name };
+    writeFileSync(path, figBytes([page, ...Array.from({ length: frames }, (_, i) => ({ id: `1:${i + 1}`, type: "FRAME", parent: "0:1", name: `frame ${i}` }))]));
+    return path;
+  };
+  const weightOf = (path: string) => weigh(FigDocument.fromFile(path, path, new Date()));
+
+  it("drops what it used longest ago once what it keeps outweighs the budget, and never the one just used", async () => {
+    const [s1, s2, big] = [local("small 1", 1), local("small 2", 1), local("big", 2000)];
+    // Room for the large one beside one small one, and not beside both.
+    const budget = weightOf(big) + weightOf(s1) + weightOf(s2) / 2;
+    const store = new SnapshotStore(exporter().web, tempDir(), HOUR, 4, undefined, budget);
+    const decode = mock.method(FigDocument, "fromFile");
+    try {
+      for (const path of [s1, s2, big, s2, s1, big]) await store.getLocal(path);
+      // The large one pushes out the small one used longest ago; the other small one, used since, stays; the first
+      // coming back pushes out the large one, then unused longest, which comes back decoded again.
+      assert.deepEqual(decode.mock.calls.map((c) => basename(c.arguments[1], ".fig")), ["small 1", "small 2", "big", "small 1", "big"]);
+    } finally {
+      decode.mock.restore();
+    }
+    // With no room at all, the file in use is still kept for the next call on it.
+    const none = new SnapshotStore(exporter().web, tempDir(), HOUR, 4, undefined, 0);
+    const kept = await none.getLocal(s1);
+    assert.equal(await none.getLocal(s1), kept, "the one just used stays, however little room there is");
+    await none.getLocal(s2);
+    assert.notEqual(await none.getLocal(s1), kept, "and goes once another is used");
+  });
+
+  it("weighs a document by what it decoded and the bytes of its images, not by its file's size", () => {
+    const page: TestNode = { id: "0:1", type: "CANVAS", parent: "0:0", name: "Page" };
+    const frames = (n: number): TestNode[] => [page, ...Array.from({ length: n }, (_, i): TestNode => ({ id: `1:${i + 1}`, type: "FRAME", parent: "0:1", name: `f${i}` }))];
+    const [one, two] = [figDoc(frames(1600)), figDoc(frames(3200))];
+    // Counted on one node in sixteen, and scaled: twice the nodes, twice the weight, near enough.
+    assert.ok(Math.abs(weigh(two) / weigh(one) - 2) < 0.1, `${weigh(two)} / ${weigh(one)}`);
+    // An image is kept as its bytes, so it weighs those, however well the .fig compressed them.
+    const image = new FigDocument("k", new Date(0), { nodeChanges: nodeChanges([page]), images: new Map([["ab", new Uint8Array(1_000_000)]]) });
+    assert.equal(weigh(image) - weigh(figDoc([page])), 1_000_000);
+  });
+
+  it("takes its budget from FIGMA_DECODED_MAX_MB, else half the heap limit, and says so of a value that is no number", () => {
+    const half = getHeapStatistics().heap_size_limit / 2;
+    assert.equal(decodedBudget({}), half);
+    assert.equal(decodedBudget({ FIGMA_DECODED_MAX_MB: "512" }), 512 * 2 ** 20);
+    assert.equal(decodedBudget({ FIGMA_DECODED_MAX_MB: "0" }), 0, "keep only the file in use");
+    const said = mock.method(process.stderr, "write", () => true);
+    try {
+      for (const raw of ["", "1.5GB", "-1"]) assert.equal(decodedBudget({ FIGMA_DECODED_MAX_MB: raw }), half, raw);
+      assert.equal(said.mock.callCount(), 3);
+      assert.match(String(said.mock.calls[1].arguments[0]), /^figma-reader: FIGMA_DECODED_MAX_MB="1\.5GB" is not a number of MB; using \d+\n$/);
+    } finally {
+      said.mock.restore();
+    }
   });
 });
 

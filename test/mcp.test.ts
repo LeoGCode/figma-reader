@@ -182,7 +182,7 @@ test("the dating rule is the server's instructions, said once, and each dated to
   const tools = answers.get(2)!.result.tools as { name: string; description: string }[];
   // The rule is in no description; the dated tools say they are dated, in one sentence, and where the rule is.
   assert.ok(tools.every((t) => !t.description.includes("copying, syncing or re-downloading")), "the rule itself is said once");
-  const pointing = tools.filter((t) => t.description.includes("Dated by exportedAt and account, or fileModifiedAt for a local .fig, as the server's instructions say")).map((t) => t.name).sort();
+  const pointing = tools.filter((t) => t.description.includes("Dated by exportedAt and account, or fileModifiedAt for a file read from disk, as the server's instructions say")).map((t) => t.name).sort();
   assert.deepEqual(pointing, [
     "figma_changes", "figma_dev_status", "figma_get_components", "figma_get_node", "figma_get_text", "figma_get_tree",
     "figma_load_file", "figma_locate", "figma_search", "figma_token_usage",

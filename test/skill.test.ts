@@ -5,7 +5,7 @@
 // shapes and flags it leaves out.
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -146,6 +146,21 @@ describe("the agent skill", () => {
       checked++;
     }
     assert.ok(checked >= 10, `only ${checked} example calls found`);
+  });
+
+  it("dates an answer by where it was read from, a key answered by a local copy included", async () => {
+    // A key or URL is read from disk when a local '<name> [<key>].fig' under FIGMA_FILES_DIRS has it, and is then
+    // dated fileModifiedAt with no account like any path. Both files said every key or URL read named its account.
+    const key = "SKILLKEY12345";
+    copyFileSync(join(repo, "test", "files", "real-export.fig"), join(root, `Saved [${key}].fig`));
+    const c = (await byCommand.get("load-file")!.run({ file: key })).content[0];
+    const loaded = JSON.parse(c.type === "text" ? c.text : "{}");
+    assert.deepEqual([loaded.source, typeof loaded.fileModifiedAt, loaded.exportedAt, loaded.account], ["local", "string", undefined, undefined]);
+    for (const [file, text] of docs) {
+      const dating = text.split("\n").filter((l) => l.includes("`fileModifiedAt`"));
+      assert.ok(dating.some((l) => l.includes("`<name> [<key>].fig`") && /no account/.test(l)), `${file} dates a key a local copy answers as that copy`);
+      assert.ok(!/for a key or URL, or `fileModifiedAt`/.test(text) && !text.includes("A key or URL read also names its `account`"), file);
+    }
   });
 
   it("names in prose only flags some command takes", () => {

@@ -1,6 +1,6 @@
 # figma-reader: output shapes and flags
 
-Read this before parsing a command the skill's Output list does not cover. Shapes name the keys you need; a key that does not apply is absent. `D` is `exportedAt` and `account` (`{name, source}`) for a key or URL, or `fileModifiedAt` for a local `.fig`; `load-file`, `get-tree`, `get-node`, `locate`, `search`, `get-components`, `dev-status`, `token-usage`, `get-text` and `changes` carry it, `diff` on each side. `path` joins layer names with ` / `, and a name may itself contain ` / ` (component naming): tell structure by ids and `page`, never by splitting `path`.
+Read this before parsing a command the skill's Output list does not cover. Shapes name the keys you need; a key that does not apply is absent. `D` is `exportedAt` and `account` (`{name, source}`) for a snapshot this tool exported, or `fileModifiedAt` and no account for a file read from disk: a `.fig` path, or a key or URL that a local `<name> [<key>].fig` under `FIGMA_FILES_DIRS` answers (`--refresh` exports instead); `load-file`, `get-tree`, `get-node`, `locate`, `search`, `get-components`, `dev-status`, `token-usage`, `get-text` and `changes` carry it, `diff` on each side. `path` joins layer names with ` / `, and a name may itself contain ` / ` (component naming): tell structure by ids and `page`, never by splitting `path`.
 
 ## Shapes
 

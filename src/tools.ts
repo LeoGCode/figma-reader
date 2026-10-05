@@ -237,10 +237,11 @@ export function datingRule(name = (tool: string) => tool, arg = (a: string) => a
     "A result read from a file is dated by the copy it answers from. exportedAt is the ISO-8601 time this tool exported",
     `that snapshot through the browser: report what the design said then rather than as current, and pass ${arg("refresh")}`,
     "to export it again. Such a result also carries account, {name, source}: the Figma account it was read through and",
-    "what chose it (FIGMA_ACCOUNT, the path of the project's .figma-reader.json, or default). For a local .fig the field",
-    "is fileModifiedAt, that copy's own file time, which copying, syncing or re-downloading the file resets: the design",
-    "data can be older than it says, and nothing here can date it. No account reads a local .fig, so its result names",
-    `none. ${name("figma_get_tree")} carries the same fields in its first line, '# ' and JSON, and ${name("figma_diff")}`,
+    "what chose it (FIGMA_ACCOUNT, the path of the project's .figma-reader.json, or default). For a .fig read from disk,",
+    "by its path or by a key or URL that a local '<name> [<key>].fig' answers, the field is fileModifiedAt, that copy's",
+    "own file time, which copying, syncing or re-downloading the file resets: the design data can be older than it says,",
+    "and nothing here can date it. No account reads such a file, so its result names none.",
+    `${name("figma_get_tree")} carries the same fields in its first line, '# ' and JSON, and ${name("figma_diff")}`,
     `dates each of its two sides, old and new. ${name("figma_get_variables")}, ${name("figma_get_styles")} and`,
     `${name("figma_export_image_fills")} carry neither, their answer being the artifact itself, except in the note`,
     `${arg("out_file")} prints after it.`,
@@ -248,8 +249,8 @@ export function datingRule(name = (tool: string) => tool, arg = (a: string) => a
 }
 /** Said in the description of every tool whose result is dated, in place of the rule itself (see datingRule). */
 const EXPORTED_AT_NOTE =
-  "Dated by exportedAt and account, or fileModifiedAt for a local .fig, as the server's instructions say (figma-reader " +
-  "help on the command line).";
+  "Dated by exportedAt and account, or fileModifiedAt for a file read from disk, as the server's instructions say " +
+  "(figma-reader help on the command line).";
 /** Missing components listed by figma_get_text; the rest are counted, never dropped silently. */
 const MAX_UNRESOLVED_GROUPS = 20;
 

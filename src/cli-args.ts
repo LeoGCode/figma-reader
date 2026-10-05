@@ -23,6 +23,12 @@ function schemaOf(shape: z.ZodRawShape) {
   return { props: js.properties ?? {}, required: js.required ?? [] };
 }
 
+/**
+ * The argument a flag names. A list also answers to its singular, since a repeated flag reads that way:
+ * --exclude-page Archive --exclude-page Old for exclude_pages. Only where no argument has the singular name itself.
+ */
+const argName = (props: Record<string, Prop>, key: string) => (!props[key] && props[`${key}s`]?.type === "array" ? `${key}s` : key);
+
 /** Required string arguments are positional, in declaration order: <file>, then <query> or <out_dir>. */
 export function positionals(shape: z.ZodRawShape): string[] {
   const { props, required } = schemaOf(shape);
@@ -41,7 +47,7 @@ export function wantsHelp(shape: z.ZodRawShape, argv: string[]): boolean {
     if (a === "--") return false;
     if (a === "--help" || a === "-h") return true;
     if (!a.startsWith("--") || a.includes("=")) continue;
-    const p = props[a.slice(2).replaceAll("-", "_")];
+    const p = props[argName(props, a.slice(2).replaceAll("-", "_"))];
     if (p && p.type !== "boolean") i++;
   }
   return false;
@@ -72,7 +78,7 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
     const eq = a.indexOf("=");
     const flag = eq < 0 ? a : a.slice(0, eq);
     const inline = eq < 0 ? undefined : a.slice(eq + 1);
-    let key = flag.slice(2).replaceAll("-", "_");
+    let key = argName(props, flag.slice(2).replaceAll("-", "_"));
     const value = () => {
       const v = inline ?? argv[++i];
       if (v === undefined) throw new UsageError(`${flag} needs a value`);

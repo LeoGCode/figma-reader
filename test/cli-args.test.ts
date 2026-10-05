@@ -32,6 +32,17 @@ test("flags map to snake_case arguments with typed values", () => {
   for (const v of ["true", "yes", "1", "on", "True"]) assert.equal(parseArgs(shape, ["a", "q", `--refresh=${v}`]).refresh, true, v);
 });
 
+test("a list flag also answers to its singular, the way a repeated flag reads", () => {
+  // search --exclude-page Archive --exclude-page Old fills exclude_pages, as --type does types here.
+  assert.deepEqual(parseArgs(shape, ["a", "q", "--type", "FRAME", "--types", "TEXT", "--type=INSTANCE,GROUP"]).types, ["FRAME", "TEXT", "INSTANCE", "GROUP"]);
+  // It takes a value like the list it stands for, so "--help" after it is that value.
+  assert.equal(wantsHelp(shape, ["a.fig", "q", "--type", "--help"]), false);
+  // Never in place of an argument that has the singular name itself, and only for a list.
+  const both = { ...shape, page: z.string().optional(), pages: z.array(z.string()).optional() };
+  assert.deepEqual(parseArgs(both, ["a", "q", "--page", "P"]), { file: "a", query: "q", page: "P" });
+  assert.throws(() => parseArgs({ ...shape, names: z.string().optional() }, ["a", "q", "--name", "x"]), /unknown option --name/);
+});
+
 test("--json merges raw arguments and positionals fill only what is unset", () => {
   assert.deepEqual(parseArgs(shape, ["--json", '{"file":"x.fig","depth":1}', "q"]), { file: "x.fig", query: "q", depth: 1 });
 });

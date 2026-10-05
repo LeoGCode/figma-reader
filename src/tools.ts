@@ -534,6 +534,10 @@ tool(
   "figma_get_tree",
   "Compact outline of the layer tree (id, type, name, size, hints). Omit node_id for all pages. The first line is a " +
     "header, '# ' followed by a JSON object holding the fields described below; the outline starts on the second line. " +
+    "max_nodes goes to one level before the next (pages, then top-level layers, then what is under them), so a large " +
+    "first section cannot crowd out later pages. A branch cut short ends in a '- ... N more children' line, a layer whose " +
+    "children were all left out says '(N children)', and the last line says it was truncated. A layer drawn only with " +
+    "vector shapes is one line counting them, '(27 vectors)': pass its node_id to list them. " +
     EXPORTED_AT_NOTE,
   {
     file: fileArg,
@@ -542,7 +546,10 @@ tool(
       "Levels of children below the start node (default 2). With no node_id the start is the document, whose pages are " +
         "level 0, so the default shows three: pages, their top-level layers, and one level under those",
     ),
-    max_nodes: z.number().int().positive().optional().describe("Default 400"),
+    max_nodes: z.number().int().positive().optional().describe(
+      "Lines to spend (default 400), a level at a time: a level that does not fit is shared evenly between its parents, " +
+        "and the levels under it are not shown",
+    ),
     refresh: refreshArg,
   },
   async ({ file, node_id, depth, max_nodes, refresh }) => {
@@ -593,6 +600,8 @@ tool(
     "charactersTruncated (truncated, next to it, is about the number of results); figma_get_text returns the strings whole. " +
     "When the text pass runs, unresolvedInstances counts the instances whose text could not be resolved and so was not " +
     "searched (figma_get_text names the components); it is absent when the pass did not run. " +
+    "Pages in exclude_pages, or by default in the project's excludePages, are skipped before the limit is counted; " +
+    "excludedPages names the ones this search left out. " +
     EXPORTED_AT_NOTE,
   {
     file: fileArg,
@@ -606,11 +615,16 @@ tool(
     include_text: z.boolean().optional().describe("Also match text content, including text rendered inside instances"),
     node_id: z.string().optional().describe("Search only this node and everything under it, like 12:34 (or 12-34); a node-id in the file URL is used when it is omitted"),
     page: z.string().optional().describe("Restrict to page name"),
+    exclude_pages: z.array(z.string()).optional().describe(
+      "Pages to skip, by name as page takes it. They are left out while walking, so their hits neither fill the limit nor " +
+        "count in total. Default: excludePages in the project's .figma-reader.json, unless page or node_id is given; an " +
+        "empty list searches every page",
+    ),
     include_hidden: z.boolean().optional().describe("Include text on layers hidden in the design (default false)"),
     limit: z.number().int().positive().optional().describe("Default 50"),
     refresh: refreshArg,
   },
-  async ({ file, query, regex, case_sensitive, types, include_text, node_id, page, include_hidden, limit, refresh }) => {
+  async ({ file, query, regex, case_sensitive, types, include_text, node_id, page, exclude_pages, include_hidden, limit, refresh }) => {
     const { doc, dated, urlNodeId } = await open(file, refresh);
     // fileArg promises a node-id in the URL is used when node_id is omitted; search used to ignore it, so pasting a
     // frame's URL searched the whole file and said nothing about it.
@@ -620,9 +634,23 @@ tool(
     const { re, as } = searchPattern(query, { regex, caseSensitive: case_sensitive });
     // An empty list means no filter: as a filter it would match nothing.
     const typeSet = types?.length ? new Set(types.map((t) => t.toUpperCase())) : undefined;
-    if (page && !doc.pages().some((p) => p.name === page)) {
-      throw new Error(`no page named ${JSON.stringify(page)}; pages: ${doc.pages().map((p) => JSON.stringify(p.name)).join(", ")}`);
+    const noPage = (name: string, what = "") =>
+      new Error(`no page named ${JSON.stringify(name)}${what}; pages: ${doc.pages().map((p) => JSON.stringify(p.name)).join(", ")}`);
+    if (page && !doc.pages().some((p) => p.name === page)) throw noPage(page);
+    // Agents left archive and template pages out with jq after the limit, by which time the walk had stopped
+    // collecting: a query with 1,737 matches and limit 300 showed the first 300 in page order, and hits on later pages
+    // were never seen. So pages are skipped here, before a hit is counted. A name this call gives that the file does not
+    // have is a typo, refused as page refuses one; the project's list is for all of its files, and a file without one of
+    // those pages has nothing to skip.
+    const fromProject = exclude_pages === undefined && !page && !scope ? account.config?.excludePages : undefined;
+    for (const name of exclude_pages ?? []) if (!doc.pages().some((p) => p.name === name)) throw noPage(name, " to exclude");
+    const excluded = new Set(exclude_pages ?? fromProject ?? []);
+    // Excluding the one page searched would answer "no hits" about a page nobody looked at.
+    if (page && excluded.has(page)) throw new Error(`page ${JSON.stringify(page)} is both searched and in exclude_pages`);
+    if (scope && scopePage && excluded.has(scopePage.name)) {
+      throw new Error(`node ${scope.id} is on page ${JSON.stringify(scopePage.name)}, which exclude_pages leaves out`);
     }
+    const excludedPages = new Set<string>();
     const max = limit ?? 50;
     const results: Raw[] = [];
     const seen = new Map<string, Raw>();
@@ -647,6 +675,10 @@ tool(
     for (const p of doc.pages()) {
       if (page && p.name !== page) continue;
       if (scope && p !== scopePage) continue;
+      if (excluded.has(p.name)) {
+        excludedPages.add(p.name);
+        continue;
+      }
       for (const n of doc.walk(scope ?? p)) {
         if (n === p) continue;
         if (typeSet && !typeSet.has(displayType(n))) continue;
@@ -676,6 +708,9 @@ tool(
       ...dated,
       queryAs: as,
       ...(scope ? { searchedNode: scope.id } : {}),
+      // Leaving pages out is never silent, least of all when this call did not ask for it: the result names them, and
+      // where the default came from.
+      ...(excludedPages.size ? { excludedPages: [...excludedPages], ...(fromProject ? { excludedPagesFrom: account.config!.path } : {}) } : {}),
       returned: results.length,
       total,
       truncated: total > results.length,

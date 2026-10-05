@@ -375,7 +375,11 @@ tool(
 
 tool(
   "figma_get_tree",
-  "Compact outline of the layer tree (id, type, name, size, hints). Omit node_id for all pages.",
+  "Compact outline of the layer tree (id, type, name, size, hints). Omit node_id for all pages. max_nodes goes to one " +
+    "level before the next (pages, then top-level layers, then what is under them), so a large first section cannot " +
+    "crowd out later pages. A branch cut short ends in a '- ... N more children' line, a layer whose children were all " +
+    "left out says '(N children)', and the last line says it was truncated. A layer drawn only with vector shapes is one " +
+    "line counting them, '(27 vectors)': pass its node_id to list them.",
   {
     file: fileArg,
     node_id: z.string().optional().describe("Start node id like 12:34 (or 12-34)"),
@@ -383,7 +387,10 @@ tool(
       "Levels of children below the start node (default 2). With no node_id the start is the document, whose pages are " +
         "level 0, so the default shows three: pages, their top-level layers, and one level under those",
     ),
-    max_nodes: z.number().int().positive().optional().describe("Default 400"),
+    max_nodes: z.number().int().positive().optional().describe(
+      "Lines to spend (default 400), a level at a time: a level that does not fit is shared evenly between its parents, " +
+        "and the levels under it are not shown",
+    ),
     refresh: refreshArg,
   },
   async ({ file, node_id, depth, max_nodes, refresh }) => {

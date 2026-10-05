@@ -157,6 +157,18 @@ test("search reads a query as a pattern only when asked", async () => {
   assert.deepEqual([(await q("/frame/")).total, (await q("/frame/")).queryAs], [0, "substring"]);
 });
 
+test("locate takes its ids from --node-ids, and cannot run without them", async () => {
+  const r = await cli(["locate", bigFig, "--node-ids", "1-1,99:99", "--node-ids", "nope"]);
+  // Ids the file does not have are an answer, not a failed call.
+  assert.equal(r.code, 0, r.stderr);
+  const res = JSON.parse(r.stdout);
+  assert.deepEqual([res.found, res.missing, res.invalid], [1, 1, 1]);
+  assert.deepEqual(res.results[0], { id: "1:1", found: true, type: "FRAME", name: "frame 0", page: "Home", path: "Home / frame 0" });
+  const without = await cli(["locate", bigFig]);
+  assert.equal(without.code, 2);
+  assert.match(without.stderr, /^figma-reader locate: missing --node-ids\n/);
+});
+
 test("account commands have help and exit 2 on bad usage", async () => {
   for (const args of [["help", "use"], ["help", "accounts"], ["use", "--help"], ["accounts", "-h"]]) {
     const r = await cli(args);

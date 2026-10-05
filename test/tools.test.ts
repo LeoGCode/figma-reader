@@ -318,6 +318,53 @@ describe("figma_get_text", () => {
   });
 });
 
+// A handoff called 12 node ids "gone" after looking up 5 of them, one process per id: 5 of the other 7 were there.
+describe("figma_locate", () => {
+  const file = figFile("locate", [
+    page,
+    { id: "1:1", type: "FRAME", parent: "0:1", name: "Card" },
+    { id: "1:2", type: "TEXT", parent: "1:1", name: "Label", textData: { characters: "hi" } },
+    { id: "0:2", type: "CANVAS", parent: "0:0", name: "Archive" },
+    { id: "2:1", type: "SYMBOL", parent: "0:2", name: "Button" },
+  ]);
+
+  it("answers every id, in the order given, with where it is or that it is not there", async () => {
+    const r = await call("figma_locate", { file, node_ids: ["1:2", "9:9", "2:1", "0:1"] });
+    assert.deepEqual([r.found, r.missing, r.invalid], [3, 1, 0]);
+    assert.deepEqual(r.results, [
+      { id: "1:2", found: true, type: "TEXT", name: "Label", page: "Page", path: "Page / Card / Label" },
+      { id: "9:9", found: false },
+      // The type as every other tool reports it, and the page the node is on, not the first one.
+      { id: "2:1", found: true, type: "COMPONENT", name: "Button", page: "Archive", path: "Archive / Button" },
+      { id: "0:1", found: true, type: "PAGE", name: "Page", page: "Page", path: "Page" },
+    ]);
+  });
+
+  it("takes the 12-34 spelling of a URL and answers in the 12:34 one", async () => {
+    const r = await call("figma_locate", { file, node_ids: ["1-1", "9-9"] });
+    assert.deepEqual(r.results.map((e: { id: string; found: boolean }) => [e.id, e.found]), [["1:1", true], ["9:9", false]]);
+  });
+
+  it("tells a string that is not a node id from a node the file does not have", async () => {
+    // A missing node and a malformed id are different mistakes: counting "x" as missing says the file was searched
+    // for something it could never have held.
+    const r = await call("figma_locate", { file, node_ids: ["1:1/1:2", "x", "1:1:1", "", "9:9"] });
+    assert.deepEqual([r.found, r.missing, r.invalid], [0, 1, 4]);
+    // The id get-text and search give text rendered inside an instance is the likeliest one to be handed back, and the
+    // error says which part of it is a node.
+    assert.equal(r.results[0].id, "1:1/1:2");
+    assert.match(r.results[0].error, /not a node id: .*only the instance, 1:1, is a node of the file/);
+    for (const e of r.results.slice(1, 4)) assert.match(e.error, /^not a node id: node ids look like 12:34 \(or 12-34\)$/, e.id);
+    assert.equal(r.results[4].found, false);
+  });
+
+  it("needs at least one id", () => {
+    const shape = z.object(byName.get("figma_locate")!.shape).strict();
+    assert.equal(shape.safeParse({ file, node_ids: [] }).success, false);
+    assert.equal(shape.safeParse({ file, node_ids: ["1:1"] }).success, true);
+  });
+});
+
 describe("figma_list_files", () => {
   it("returns 30 by default, and is truncated only past that", async () => {
     for (let i = 0; i < 30; i++) writeFileSync(join(listed, `File ${i}.fig`), "x");
@@ -359,6 +406,7 @@ describe("dating a result", () => {
       ["figma_get_text", {}],
       ["figma_token_usage", {}],
       ["figma_get_components", {}],
+      ["figma_locate", { node_ids: ["1:1"] }],
     ] as [string, Record<string, unknown>][]) {
       const r = await call(name, { file, ...args });
       assert.equal(r.fileModifiedAt, taken.toISOString(), name);

@@ -55,7 +55,7 @@ export function wantsHelp(shape: z.ZodRawShape, argv: string[]): boolean {
  * The result is validated against the tool's schema.
  */
 export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, unknown> {
-  const { props } = schemaOf(shape);
+  const { props, required } = schemaOf(shape);
   const pos = positionals(shape);
   const out: Record<string, unknown> = {};
   const rest: string[] = [];
@@ -130,8 +130,9 @@ export function parseArgs(shape: z.ZodRawShape, argv: string[]): Record<string, 
   rest.forEach((v, i) => {
     out[open[i]] = v;
   });
-  const missing = pos.filter((k) => out[k] === undefined);
-  if (missing.length) throw new UsageError(`missing ${missing.map((k) => `<${k}>`).join(" ")}`);
+  // A required argument that is not a string (locate's --node-ids) is a flag that must be given, not a positional.
+  const missing = required.filter((k) => out[k] === undefined).map((k) => (pos.includes(k) ? `<${k}>` : flagName(k)));
+  if (missing.length) throw new UsageError(`missing ${missing.join(" ")}`);
   const parsed = z.object(shape).strict().safeParse(out);
   if (!parsed.success) throw new UsageError(z.prettifyError(parsed.error));
   return parsed.data;
@@ -150,20 +151,22 @@ const wrap = (s: string, width: number, indent: string) => {
   return lines.join(`\n${indent}`);
 };
 
+const kindOf = (p: Prop) =>
+  p.type === "boolean" ? "" : p.enum ? ` <${p.enum.join("|")}>` : p.type === "array" ? ` <${p.items?.type ?? "value"},...>` : ` <${p.type === "integer" ? "n" : p.type}>`;
+
 export function commandUsage(bin: string, tool: { name: string; description: string; shape: z.ZodRawShape }): string {
-  const { props } = schemaOf(tool.shape);
+  const { props, required } = schemaOf(tool.shape);
   const pos = positionals(tool.shape);
   const opts = Object.entries(props)
     .filter(([k]) => !pos.includes(k))
-    .map(([k, p]) => {
-      const kind = p.type === "boolean" ? "" : p.enum ? ` <${p.enum.join("|")}>` : p.type === "array" ? ` <${p.items?.type ?? "value"},...>` : ` <${p.type === "integer" ? "n" : p.type}>`;
-      return [`${flagName(k)}${kind}`, p.description ?? ""];
-    });
+    .map(([k, p]) => [`${flagName(k)}${kindOf(p)}`, p.description ?? ""]);
+  // Shown on the usage line too, since under [options] alone a flag the command cannot run without reads as optional.
+  const flags = required.filter((k) => !pos.includes(k)).map((k) => ` ${flagName(k)}${kindOf(props[k])}`);
   // --json is always there, so a command without options of its own still gets a header and an aligned column.
   opts.push(["--json <object>", "Raw arguments as JSON (names as in the MCP tool)"]);
   const col = Math.min(32, Math.max(...opts.map(([f]) => f.length)) + 2);
   const lines = [
-    `Usage: ${bin} ${commandName(tool.name)}${pos.map((k) => ` <${k}>`).join("")} [options]`,
+    `Usage: ${bin} ${commandName(tool.name)}${pos.map((k) => ` <${k}>`).join("")}${flags.join("")} [options]`,
     "",
     wrap(tool.description, 100, ""),
   ];

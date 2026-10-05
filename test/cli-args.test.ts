@@ -93,3 +93,17 @@ test("usage lists --json under Options, aligned, also for a command without opti
   };
   assert.deepEqual(["--depth", "--refresh", "--json"].map(column), [20, 20, 20]);
 });
+
+test("a required list is a flag the command cannot run without, and says so", () => {
+  // locate is the first tool to require something that is not a string, which positionals() never takes: it was
+  // listed under [options] like any other flag, and leaving it out failed with zod's "expected array, received
+  // undefined".
+  const locate = { file: z.string(), node_ids: z.array(z.string()).min(1), refresh: z.boolean().optional() };
+  assert.deepEqual(positionals(locate), ["file"]);
+  assert.deepEqual(parseArgs(locate, ["a.fig", "--node-ids", "1:2,3-4"]), { file: "a.fig", node_ids: ["1:2", "3-4"] });
+  assert.deepEqual(parseArgs(locate, ["a.fig", "--json", '{"node_ids":["1:2"]}']).node_ids, ["1:2"]);
+  assert.throws(() => parseArgs(locate, ["a.fig"]), (e) => e instanceof UsageError && e.message === "missing --node-ids");
+  assert.throws(() => parseArgs(locate, []), (e) => e instanceof UsageError && e.message === "missing <file> --node-ids");
+  const usage = commandUsage("fr", { name: "figma_locate", description: "Locate.", shape: locate });
+  assert.equal(usage.split("\n")[0], "Usage: fr locate <file> --node-ids <string,...> [options]");
+});

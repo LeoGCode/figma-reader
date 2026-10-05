@@ -2,7 +2,7 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { figBytes, type TestNode } from "./fixtures.ts";
@@ -54,6 +54,23 @@ test("a client that closes stdin right after a request still gets the whole resp
   assert.equal(code, 0);
   const res = JSON.parse(answers.get(2)!.result.content[0].text);
   assert.equal(res.results.length, FRAMES);
+});
+
+test("a server that only reads local files writes nothing, from start to shutdown", async () => {
+  // It used to register with the shared browser as it started (a lease under the state directory) and make the
+  // account's cache directory, so a read-only sandbox refused the server before a single local read. HOME is not
+  // what Windows builds those roots from, so APPDATA and LOCALAPPDATA move with it.
+  const home = join(root, "untouched");
+  mkdirSync(home);
+  const env = { HOME: home, USERPROFILE: home, APPDATA: join(home, "AppData", "Roaming"), LOCALAPPDATA: join(home, "AppData", "Local") };
+  const { code, answers } = await serve([
+    call(2, "figma_load_file", { file: fig }),
+    call(3, "figma_search", { file: fig, query: "frame 1", limit: 1 }),
+    call(4, "figma_list_files", {}),
+  ], env);
+  assert.equal(code, 0);
+  for (const id of [2, 3, 4]) assert.notEqual(answers.get(id)!.result.isError, true, answers.get(id)!.result.content[0].text);
+  assert.deepEqual(readdirSync(home, { recursive: true }), []);
 });
 
 test("an argument the tool does not have is refused, not dropped", async () => {

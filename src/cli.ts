@@ -131,8 +131,8 @@ try {
 }
 if (handled) await quit(0);
 
-// Loading the tools resolves the account and registers this process with the shared browser state, so from here on
-// always release before exiting.
+// Loading the tools resolves the account. A command that reaches the browser registers this process with the shared
+// browser state when it does (a local read or help never does), so from here on always release before exiting.
 const { account, release, tools } = await import("./tools.ts").catch((e) => fatal((e as Error).message, 1));
 const byCommand = new Map(tools.map((t) => [commandName(t.name), t]));
 

@@ -16,8 +16,9 @@ const root = mkdtempSync(join(tmpdir(), "figma-reader-tools-"));
 const figs = join(root, "figs");
 const listed = join(root, "listed");
 for (const d of [join(root, "home"), figs, listed]) mkdirSync(d, { recursive: true });
-// tools.ts resolves the account, the cache and the local file directories when it is imported, and registers this
-// process with the shared browser state: everything has to point into the temp dir, and the registration be given back.
+// tools.ts resolves the account, the cache and the local file directories when it is imported, and the first call that
+// reaches the browser registers this process with the shared browser state: everything has to point into the temp dir,
+// and the registration be given back.
 // HOME is not what Windows reads: os.homedir() takes USERPROFILE there, and the roots are built from APPDATA and
 // LOCALAPPDATA, so redirecting HOME alone left these tests writing into the runner's real profile.
 process.env.HOME = join(root, "home");

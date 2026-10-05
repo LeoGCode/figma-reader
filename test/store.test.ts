@@ -288,15 +288,58 @@ describe("SnapshotStore's budget for decoded documents", () => {
     assert.notEqual(await none.getLocal(s1), kept, "and goes once another is used");
   });
 
-  it("weighs a document by what it decoded and the bytes of its images, not by its file's size", () => {
+  it("weighs every node by what it decoded, its arrays, strings and byte arrays included, and images by their bytes", () => {
+    // A document, a page and fourteen text nodes: one node in sixteen, the document, was all a sample of them saw, so
+    // their payloads could grow by millions of values and the weight stayed that of an empty file.
     const page: TestNode = { id: "0:1", type: "CANVAS", parent: "0:0", name: "Page" };
-    const frames = (n: number): TestNode[] => [page, ...Array.from({ length: n }, (_, i): TestNode => ({ id: `1:${i + 1}`, type: "FRAME", parent: "0:1", name: `f${i}` }))];
-    const [one, two] = [figDoc(frames(1600)), figDoc(frames(3200))];
-    // Counted on one node in sixteen, and scaled: twice the nodes, twice the weight, near enough.
-    assert.ok(Math.abs(weigh(two) / weigh(one) - 2) < 0.1, `${weigh(two)} / ${weigh(one)}`);
+    const texts = (payload: () => object): TestNode[] => [
+      page,
+      ...Array.from({ length: 14 }, (_, i): TestNode => ({ id: `1:${i + 1}`, type: "TEXT", parent: "0:1", name: `t${i}`, ...payload() })),
+    ];
+    const n = 50_000;
+    const light = weigh(figDoc(texts(() => ({ textData: { characters: "a", characterStyleIDs: [0] } }))));
+    const grown = (payload: () => object) => weigh(figDoc(texts(payload))) - light;
+    // An array element takes 8 bytes at the least, a character and a byte one each: the weight grows by that much.
+    assert.ok(grown(() => ({ textData: { characters: "a", characterStyleIDs: Array(n).fill(1) } })) >= 14 * (n - 1) * 8);
+    assert.ok(grown(() => ({ textData: { characters: "a".repeat(n), characterStyleIDs: [0] } })) >= 14 * (n - 1));
+    assert.ok(grown(() => ({ textData: { characters: "a", characterStyleIDs: [0] }, vectorData: { blob: new Uint8Array(n) } })) >= 14 * n);
+    // And it is the nodes it counts, not the file: twice the frames, twice the weight (their ids are a digit longer).
+    const frames = (count: number): TestNode[] => [page, ...Array.from({ length: count }, (_, i): TestNode => ({ id: `2:${i + 1}`, type: "FRAME", parent: "0:1", name: "f" }))];
+    const [none, one, two] = [0, 1600, 3200].map((count) => weigh(figDoc(frames(count))));
+    assert.ok(Math.abs((two - none) / (one - none) - 2) < 0.01, `${two - none} / ${one - none}`);
     // An image is kept as its bytes, so it weighs those, however well the .fig compressed them.
     const image = new FigDocument("k", new Date(0), { nodeChanges: nodeChanges([page]), images: new Map([["ab", new Uint8Array(1_000_000)]]) });
     assert.equal(weigh(image) - weigh(figDoc([page])), 1_000_000);
+  });
+
+  it("lets a file of few nodes and a large payload push the others out, as its weight says", async () => {
+    // The same sixteen nodes, encoded and decoded as an export is, with 20,000 style ids on each text node in the large
+    // one: it does not fit a budget of 1 MB beside anything, so it is kept alone, and goes when another is read.
+    const schema = `
+      struct GUID { uint sessionID; uint localID; }
+      message ParentIndex { GUID guid = 1; string position = 2; }
+      message TextData { string characters = 1; uint[] characterStyleIDs = 2; }
+      message NodeChange { GUID guid = 1; ParentIndex parentIndex = 2; string type = 3; string name = 4; TextData textData = 5; }
+      message Message { NodeChange[] nodeChanges = 1; }
+    `;
+    const textFile = (name: string, ids: number) => {
+      const path = join(tempDir(), `${name}.fig`);
+      const texts = Array.from({ length: 14 }, (_, i): TestNode => ({
+        id: `1:${i + 1}`, type: "TEXT", parent: "0:1", name: `t${i}`, textData: { characters: "a", characterStyleIDs: Array(ids).fill(1) },
+      }));
+      writeFileSync(path, figBytes([{ id: "0:1", type: "CANVAS", parent: "0:0", name }, ...texts], { schema }));
+      return path;
+    };
+    const [light1, light2, heavy] = [textFile("light 1", 1), textFile("light 2", 1), textFile("heavy", 20_000)];
+    assert.equal(FigDocument.fromFile(heavy, heavy, new Date()).get("1:1")!.textData.characterStyleIDs.length, 20_000, "decoded as written");
+    const store = new SnapshotStore(exporter().web, tempDir(), HOUR, 4, undefined, 2 ** 20);
+    const decode = mock.method(FigDocument, "fromFile");
+    try {
+      for (const path of [light1, light2, heavy, light1, light2]) await store.getLocal(path);
+      assert.deepEqual(decode.mock.calls.map((c) => basename(c.arguments[1], ".fig")), ["light 1", "light 2", "heavy", "light 1", "light 2"]);
+    } finally {
+      decode.mock.restore();
+    }
   });
 
   it("takes its budget from FIGMA_DECODED_MAX_MB, else half the heap limit, and says so of a value that is no number", () => {

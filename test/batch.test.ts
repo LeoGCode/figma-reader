@@ -28,7 +28,7 @@ process.env.FIGMA_READER_CACHE = join(root, "cache");
 process.env.FIGMA_FILES_DIRS = listed;
 process.env.FIGMA_BROWSER_PATH = join(root, "no-such-browser");
 // What the decoded files kept between calls may weigh, read as the tools load: room for any number of the small files
-// below (a few KB each), and not for one of the large one (1.3 MB) beside anything else.
+// below (a few KB each), and not for the large one (1.4 MB) beside anything else.
 process.env.FIGMA_DECODED_MAX_MB = "1";
 for (const k of ["FIGMA_CDP_URL", "FIGMA_USER_DATA_DIR", "FIGMA_SNAPSHOT_MAX_AGE_MIN"]) delete process.env[k];
 const { release, tools } = await import("../src/tools.ts");

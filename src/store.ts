@@ -103,40 +103,44 @@ export function cleanStaleLocks(dir: string) {
 }
 
 /**
- * What one decoded value takes in memory, about: an object, an array element, a key, a number or a string, counted as
- * weigh counts them. Retained heap over that count ran from 17 to 31 bytes on twelve real exports of 3 to 754 MB of
- * heap (37 on the smallest); this is the middle of it, within 30% of either end.
+ * What one decoded value takes in memory, about: an object, a key, an array element, a number or a boolean, counted
+ * as bytesOf counts them, with a string's and a byte array's length on top (see weigh for how near that comes).
  */
 const BYTES_PER_VALUE = 24;
-/** weigh counts one node in this many: within 12% of counting them all on those exports, 60-130 ms on the largest. */
-const SAMPLE_EVERY = 16;
 
-/** Values in `v`, itself included. A byte array is one: its bytes are not on the heap, and images are weighed apart. */
-function values(v: unknown): number {
-  if (v === null || typeof v !== "object" || ArrayBuffer.isView(v)) return 1;
-  let n = 1;
-  if (Array.isArray(v)) for (const x of v) n += values(x);
-  else for (const k in v) n += 1 + values((v as Record<string, unknown>)[k]);
+/** About how many bytes `v` takes: BYTES_PER_VALUE for each value in it, itself included, and its strings' and byte arrays' lengths. */
+function bytesOf(v: unknown): number {
+  if (typeof v === "string") return BYTES_PER_VALUE + v.length;
+  if (v === null || typeof v !== "object") return BYTES_PER_VALUE;
+  if (ArrayBuffer.isView(v)) return BYTES_PER_VALUE + v.byteLength;
+  let n = BYTES_PER_VALUE;
+  if (Array.isArray(v)) for (let i = 0; i < v.length; i++) n += bytesOf(v[i]);
+  else for (const k in v) n += BYTES_PER_VALUE + bytesOf((v as Record<string, unknown>)[k]);
   return n;
 }
 
 /**
  * About how many bytes the decoded `doc` keeps in memory, which is what the store's budget is spent on (see remember):
- * its values, counted on every SAMPLE_EVERY-th node and scaled, and the bytes of its images.
+ * every value of every node (see bytesOf), and the bytes of its images.
  *
- * Neither the file's size nor the heap says it. A .fig is a zip of the canvas and its images, and on those exports the
- * heap a document kept ran from 0.2 to 62 times its file's size: a 171 MB file kept 28 MB, a 21 MB one 621 MB. The
- * heap's growth across a decode came within 7-17% of what the document kept in a fresh process, and wrong in a process
- * that had been working, the one this is for: the documents it had dropped were collected during the next decode, and
- * one keeping 471 MB grew the heap by -940 MB.
+ * Neither the file's size nor the heap says it. A .fig is a zip of the canvas and its images, and on twelve real
+ * exports the heap a document kept ran from 0.2 to 62 times its file's size: a 171 MB file kept 28 MB, a 21 MB one 621
+ * MB. The heap's growth across a decode came within 7-17% of what the document kept in a fresh process, and wrong in a
+ * process that had been working, the one this is for: the documents it had dropped were collected during the next
+ * decode, and one keeping 471 MB grew the heap by -940 MB. This came to 0.82-1.31 times what each of those exports
+ * kept (heap and image bytes) among the seven keeping over 100 MB, and 0.75-1.23 for the rest.
+ *
+ * Every node is walked. Counting one in sixteen and scaling was a tenth of the cost and blind to what the other
+ * fifteen hold: a page of fourteen text nodes holding 3.5 million style ids between them weighed what an empty one
+ * does, and four of them, 150 MB, sat in a budget of 1 MB. Walking took 200-420 ms on the large exports, a tenth to a
+ * fifth of their decode, and it cannot cost more than the decode that made what it walks. Weighing the elements of a
+ * long array by a few of them was slower there, not faster: the time goes on the many small objects of every node.
  */
 export function weigh(doc: FigDocument): number {
-  let counted = 0;
-  let i = 0;
-  for (const node of doc.nodes.values()) if (i++ % SAMPLE_EVERY === 0) counted += values(node);
-  let images = 0;
-  for (const bytes of doc.images.values()) images += bytes.byteLength;
-  return counted * SAMPLE_EVERY * BYTES_PER_VALUE + images;
+  let n = 0;
+  for (const node of doc.nodes.values()) n += bytesOf(node);
+  for (const bytes of doc.images.values()) n += bytes.byteLength;
+  return n;
 }
 
 /**
@@ -752,7 +756,7 @@ export class SnapshotStore {
 
   /**
    * What `doc` weighs, worked out the first time it is asked, which is when a second document is kept beside it: a
-   * process that reads one file, as every single CLI call does, never pays for it (60-130 ms on a 67 MB export).
+   * process that reads one file, as every single CLI call does, never pays for it (200-420 ms on a large export).
    */
   private weightOf(doc: FigDocument): number {
     let weight = this.weights.get(doc);

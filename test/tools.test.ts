@@ -75,11 +75,15 @@ const SCHEMA = parseSchema(`
   message VariableSetMode { GUID id = 1; string name = 2; string sortPosition = 3; }
   message ImageRef { byte[] hash = 1; }
   message Paint { string type = 1; ImageRef image = 2; }
+  enum SectionStatus { NONE = 0; BUILD = 1; COMPLETED = 2; }
+  message SectionStatusInfo {
+    SectionStatus status = 1; uint lastUpdateUnixTimestamp = 2; string description = 3; string userId = 4; SectionStatus prevStatus = 5;
+  }
   message NodeChange {
     GUID guid = 1; ParentIndex parentIndex = 2; string type = 3; string name = 4; string key = 5;
     TextData textData = 6; SymbolData symbolData = 7; string sourceLibraryKey = 8; string componentKey = 9;
     VariableSetMode[] variableSetModes = 10; string styleType = 11;
-    Paint[] fillPaints = 12; Paint[] strokePaints = 13;
+    Paint[] fillPaints = 12; Paint[] strokePaints = 13; SectionStatusInfo sectionStatusInfo = 14;
   }
   message Message { NodeChange[] nodeChanges = 1; }
 `);
@@ -463,6 +467,7 @@ describe("dating a result", () => {
       ["figma_get_text", {}],
       ["figma_token_usage", {}],
       ["figma_get_components", {}],
+      ["figma_dev_status", {}],
     ] as [string, Record<string, unknown>][]) {
       const r = await call(name, { file, ...args });
       assert.equal(r.fileModifiedAt, taken.toISOString(), name);
@@ -634,6 +639,41 @@ describe("figma_get_components", () => {
     // A library component is reported by how much the file leans on it, so the order is the point.
     assert.deepEqual(r.libraryComponentsUsed.map((c: { name: string; instances: number }) => [c.name, c.instances]), [["Common", 3], ["Middle", 2], ["Rare", 1]]);
     assert.deepEqual(r.components.map((c: { name: string }) => c.name).sort(), ["Common", "Middle", "Rare"]);
+  });
+});
+
+describe("figma_dev_status", () => {
+  // The schema above declares SectionStatus an enum, as Figma's does, so the handler reads what decoding a real export
+  // gives it: the value's name, not its number. 101 frames marked a second apart, and one whose Completed mark came
+  // off a second before the first of them.
+  const at = 1790848800;
+  const file = figFile("dev-status", [
+    page,
+    ...many(101, (i) => ({
+      id: `1:${i + 1}`, type: "FRAME", parent: "0:1", name: `frame ${i}`,
+      sectionStatusInfo: { status: "BUILD", prevStatus: "NONE", lastUpdateUnixTimestamp: at + i, userId: "1234567" },
+    })),
+    { id: "2:1", type: "FRAME", parent: "0:1", name: "unmarked", sectionStatusInfo: { status: "NONE", prevStatus: "COMPLETED", lastUpdateUnixTimestamp: at - 1 } },
+  ]);
+
+  it("returns 100 by default, newest change first, and says what it left out", async () => {
+    const r = await call("figma_dev_status", { file });
+    assert.deepEqual([r.returned, r.total, r.truncated, r.nodes.length], [100, 102, true, 100]);
+    assert.deepEqual(r.nodes[0], {
+      id: "1:101", type: "FRAME", name: "frame 100", page: "Page", path: "Page / frame 100",
+      status: "ready_for_dev", raw: "BUILD", previous: "none", previousRaw: "NONE", changedAt: "2026-10-01T10:01:40.000Z", by: "1234567",
+    });
+    const all = await call("figma_dev_status", { file, limit: 102 });
+    assert.deepEqual([all.returned, all.total, all.truncated], [102, 102, false]);
+    assert.deepEqual([all.nodes[101].id, all.nodes[101].status, all.nodes[101].previous, all.nodes[101].previousRaw], ["2:1", "none", "completed", "COMPLETED"]);
+  });
+
+  it("filters by status and page, and refuses a page or status that does not exist", async () => {
+    const off = await call("figma_dev_status", { file, status: "none", page: "Page" });
+    assert.deepEqual([off.total, off.truncated, off.nodes.map((n: { id: string }) => n.id)], [1, false, ["2:1"]]);
+    await assert.rejects(body("figma_dev_status", { file, page: "Pag" }), /no page named "Pag"; pages: "Page"/);
+    // The CLI and the MCP server both validate against this shape, so a status nobody spells this way is refused there.
+    assert.equal(z.object(byName.get("figma_dev_status")!.shape).strict().safeParse({ file, status: "ready" }).success, false);
   });
 });
 

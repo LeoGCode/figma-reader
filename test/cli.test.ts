@@ -153,6 +153,21 @@ test("search skips the project's excludePages, --exclude-page replaces them, and
   assert.equal((await q("--json", '{"exclude_pages":[]}')).total, FRAMES);
 });
 
+test("dev-status answers in the list envelope, and a status it does not know is bad usage", async () => {
+  // An agent that could not find the status told the user it was unreadable; the command it looks for is this one.
+  // Outside the work directory, whose files the list-files test counts.
+  const small = join(root, "dev-status.fig");
+  writeFileSync(small, figBytes([{ id: "0:1", type: "CANVAS", parent: "0:0", name: "Home" }]));
+  const r = await cli(["dev-status", small, "--status", "completed", "--page", "Home"]);
+  assert.equal(r.code, 0, r.stderr);
+  const res = JSON.parse(r.stdout);
+  assert.deepEqual([res.returned, res.total, res.truncated, res.nodes], [0, 0, false, []]);
+  assert.ok(res.fileModifiedAt, "dated like the other answers read off a file");
+  const bad = await cli(["dev-status", small, "--status", "ready"]);
+  assert.equal(bad.code, 2);
+  assert.match(bad.stderr, /status/);
+});
+
 test("an empty --types is bad usage, not a filter that matches nothing", async () => {
   const r = await cli(["search", bigFig, "frame", "--types="]);
   assert.equal(r.code, 2);

@@ -38,6 +38,32 @@ test("the document root lists visible pages, and nodes below the depth are count
   ].join("\n"));
 });
 
+test("a frame's Dev Mode status is a hint, and so is the status a frame had before its mark came off", () => {
+  const info = (status: string, prevStatus: string) => ({ sectionStatusInfo: { status, prevStatus, lastUpdateUnixTimestamp: 1790848800 } });
+  const marked = figDoc([
+    { id: "0:1", type: "CANVAS", parent: "0:0", name: "Handoff" },
+    { id: "1:1", type: "FRAME", parent: "0:1", name: "Ready", visible: false, ...info("BUILD", "NONE") },
+    { id: "1:2", type: "FRAME", parent: "0:1", name: "Done", ...info("COMPLETED", "BUILD") },
+    { id: "1:3", type: "FRAME", parent: "0:1", name: "Unmarked", ...info("NONE", "BUILD") },
+    { id: "1:4", type: "SECTION", parent: "0:1", name: "Reopened", ...info("NONE", "COMPLETED") },
+    // The records Figma keeps on components nobody marked say nothing, so they add no hint.
+    { id: "1:5", type: "SYMBOL", parent: "0:1", name: "Never", ...info("NONE", "NONE") },
+    { id: "1:6", type: "FRAME", parent: "0:1", name: "Later", ...info("IN_REVIEW", "NONE") },
+    // A person left this one, which get-node shows, but none and none names no status for a hint to give.
+    { id: "1:7", type: "FRAME", parent: "0:1", name: "Touched", sectionStatusInfo: { status: "NONE", prevStatus: "NONE", userId: "1234567" } },
+  ]);
+  assert.equal(outline(marked, marked.require("0:1"), 1, 100), [
+    '- 0:1 PAGE "Handoff"',
+    '  - 1:1 FRAME "Ready" (hidden, ready for dev)',
+    '  - 1:2 FRAME "Done" (completed)',
+    '  - 1:3 FRAME "Unmarked" (was ready for dev)',
+    '  - 1:4 SECTION "Reopened" (was completed)',
+    '  - 1:5 COMPONENT "Never"',
+    '  - 1:6 FRAME "Later" (dev status IN_REVIEW)',
+    '  - 1:7 FRAME "Touched"',
+  ].join("\n"));
+});
+
 test("output stops at max_nodes and says so, but only when something was left out", () => {
   // The marker for what a branch left out is a line too, so max_nodes still bounds the output.
   assert.deepEqual(outline(doc, doc.require("1:1"), 1, 3).split("\n"), [

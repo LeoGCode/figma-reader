@@ -219,6 +219,68 @@ export class Normalizer {
     return out;
   }
 
+  private categories?: Map<string, string>;
+
+  /**
+   * Dev Mode annotations: the note a designer pins on a layer, and the properties it asks Dev Mode to show beside it.
+   * An annotation with an empty label is a properties-only one, which is the common kind.
+   */
+  annotations(n: FigNode): Raw[] | undefined {
+    const list: Raw[] = n.annotations ?? [];
+    if (!list.length) return undefined;
+    // Category names live once on the document, keyed by the id each annotation names.
+    if (!this.categories) {
+      this.categories = new Map();
+      for (const c of this.doc.get(this.doc.rootId)?.annotationCategories?.items ?? []) {
+        const name = c.preset && c.preset !== "NONE" ? `${c.preset[0]}${c.preset.slice(1).toLowerCase()}` : c.custom?.label;
+        if (guidId(c.id) && name) this.categories.set(guidId(c.id)!, name);
+      }
+    }
+    return list.map((a) => {
+      const category = guidId(a.categoryId);
+      return prune({
+        // labelV2 has been set in no export seen. It is the later field, so when it is there it is the label, even
+        // empty: falling back to label then would bring back text someone cleared.
+        label: typeof (a.labelV2 ?? a.label) === "string" ? labelMarkdown(a.labelV2 ?? a.label).markdown || undefined : undefined,
+        // A category the document does not name is kept as its id rather than dropped, so the grouping still shows.
+        category: category ? this.categories!.get(category) : undefined,
+        categoryId: category && !this.categories!.has(category) ? category : undefined,
+        properties: (a.properties ?? []).map((p: Raw) => p.type).filter(Boolean),
+      });
+    });
+  }
+
+  /**
+   * Dev Mode measurements: a distance the designer pinned from one side of this layer to a side of another, or of
+   * itself. What Figma stores is the two nodes and the sides, not the distance, so that is what is reported.
+   */
+  measurements(n: FigNode): Raw[] | undefined {
+    const list: Raw[] = n.measurements ?? [];
+    if (!list.length) return undefined;
+    // 0xFFFFFFFF in both halves is Figma's "no node", and toNode holds it in every measurement seen so far: the
+    // target is in toNodeStablePath instead, and fromNode is left out because the measurement is on its from node.
+    const real = (g: { sessionID: number; localID: number } | undefined) => (g && g.sessionID !== 0xffffffff ? guidId(g) : undefined);
+    return list.map((m) => {
+      // A stable path is the target node, then, when the target is a layer inside that instance, the layer's override
+      // key at each instance level: the same addressing symbolOverrides use, so only its first id is a node here.
+      const path: string[] = (m.toNodeStablePath?.guids ?? []).map(real).filter(Boolean);
+      const to = path[0] ?? real(m.toNode);
+      const side: string | undefined = m.fromNodeSide;
+      return prune({
+        from: real(m.fromNode) ?? n.id,
+        fromSide: side,
+        to,
+        // What toSameSide means was read off real files: every measurement from a layer to itself has it false, so it
+        // crosses to the opposite side (a width or a height), and every one to an enclosing frame has it true (a
+        // padding). The side it names says that outright, where the bare flag left the caller to work it out.
+        toSide: side && (m.toSameSide ? side : OPPOSITE_SIDE[side]),
+        toPath: path.length > 1 ? path : undefined,
+        toMissing: to && !this.doc.get(to) ? true : undefined,
+        freeText: m.freeText || undefined,
+      });
+    });
+  }
+
   node(n: FigNode, depth: number, parent?: FigNode): Raw {
     const out: Raw = { id: n.id, name: n.name, type: displayType(n) };
     if (n.visible === false) out.visible = false;
@@ -285,6 +347,10 @@ export class Normalizer {
     if (n.exportSettings?.length) {
       out.exports = n.exportSettings.map((e: Raw) => prune({ format: e.imageType, suffix: e.suffix || undefined, constraint: e.constraint }));
     }
+    const dev = devStatus(n);
+    if (dev && devStatusShown(dev)) out.devStatus = dev;
+    out.annotations = this.annotations(n);
+    out.measurements = this.measurements(n);
 
     const kids = this.doc.children(n);
     if (kids.length) {
@@ -303,6 +369,161 @@ export function displayType(n: FigNode): string {
   if (n.type === "ROUNDED_RECTANGLE") return "RECTANGLE";
   return n.type;
 }
+
+/**
+ * Dev Mode's names for the SectionStatus values a .fig stores. BUILD is taken to be what the editor calls "Ready for
+ * dev" and COMPLETED its "Completed": the names line up, but nobody has yet marked a frame and exported the file again
+ * to confirm it, so every answer keeps the stored value beside the name.
+ */
+const DEV_STATUS: Record<string, string> = { NONE: "none", BUILD: "ready_for_dev", COMPLETED: "completed" };
+
+export interface DevStatus {
+  /** ready_for_dev, completed or none; unknown for a value this decoder has no name for, which raw then holds. */
+  status: string;
+  raw: string;
+  previous: string;
+  previousRaw: string;
+  /** ISO-8601: when the status last changed; for status none with a previous status other than none, when the mark came off. */
+  changedAt?: string;
+  /** The Figma user id that changed it. The export holds no names to go with it. */
+  by?: string;
+  note?: string;
+}
+
+/**
+ * The Dev Mode status a node carries in its own sectionStatusInfo. Each page also keeps a handoffStatusMap of the
+ * statuses on it, but that index goes stale: its entries outlive the nodes they name and can disagree with the node
+ * about the previous status, so the node's own record is what is read. An absent status is NONE, the enum's first
+ * value, and the timestamp is in seconds.
+ */
+export function devStatus(n: FigNode): DevStatus | undefined {
+  const s: Raw | undefined = n.sectionStatusInfo;
+  if (!s) return undefined;
+  const raw: string = s.status ?? "NONE";
+  const previousRaw: string = s.prevStatus ?? "NONE";
+  return prune({
+    status: DEV_STATUS[raw] ?? "unknown",
+    raw,
+    previous: DEV_STATUS[previousRaw] ?? "unknown",
+    previousRaw,
+    changedAt: s.lastUpdateUnixTimestamp ? new Date(s.lastUpdateUnixTimestamp * 1000).toISOString() : undefined,
+    by: s.userId || undefined,
+    note: s.description || undefined,
+  });
+}
+
+/**
+ * Whether a status record says anything: marked now, marked before and since unmarked ("was ready for dev"), or
+ * carrying the user or note a person leaves. Figma also writes records that are none and were none, with neither, on
+ * components nobody marked - by the thousand in a component library - and reporting those would put a dated "none" on
+ * every variant of it. A user id is what tells the two apart: every record a person made in the files checked names
+ * one, and no none-and-none record does, so one that did would be a person's doing and is shown.
+ */
+export const devStatusShown = (d: DevStatus) => d.status !== "none" || d.previous !== "none" || !!d.by || !!d.note;
+
+/** A tag, with attribute values quoted either way or not at all; any other "<" is text. */
+const LABEL_TOKEN = /<(\/?)([a-z][a-z0-9]*)((?:[^>"']|"[^"]*"|'[^']*')*)>|[^<]+|</gi;
+
+function decodeEntities(s: string): string {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (entity, e: string) => {
+    const k = e.toLowerCase();
+    if (k[0] !== "#") return { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " }[k]!;
+    const cp = k[1] === "x" ? parseInt(k.slice(2), 16) : Number(k.slice(1));
+    // fromCodePoint throws past U+10FFFF; such an entity is left as it was written.
+    return cp <= 0x10ffff ? String.fromCodePoint(cp) : entity;
+  });
+}
+
+/** A code span that holds its text whatever backticks are in it: the fence is one longer than any run inside. */
+function codeSpan(s: string): string {
+  if (!s) return "";
+  const fence = "`".repeat(Math.max(0, ...[...s.matchAll(/`+/g)].map((m) => m[0].length)) + 1);
+  const pad = s.startsWith("`") || s.endsWith("`") ? " " : "";
+  return `${fence}${pad}${s}${pad}${fence}`;
+}
+
+/**
+ * An annotation label as markdown, and the markup the conversion met and could not turn into any (tag names, or
+ * "malformed" for a "<" that starts a tag it cannot read). label holds HTML in every export seen: a <p> per line, an
+ * empty one for a blank line, <br>, <strong>, <code> and <a href>. Markdown keeps the links and code spans that
+ * stripping tags would lose, and the Plugin API hands the same text out as markdown too. A tag it does not know is
+ * dropped and its text kept; text with no markup passes through as it is.
+ *
+ * Text is read token by token rather than by rewriting the string, so an entity is decoded once, where it stands: a
+ * "&lt;button&gt;" inside <code> is the literal text "<button>", not a tag, and a "[" in a link's text or a ")" in its
+ * address is escaped against the link it would otherwise end.
+ */
+export function labelMarkdown(html: string): { markdown: string; unconverted: string[] } {
+  const unconverted = new Set<string>();
+  const frames: { kind: "root" | "a" | "code"; text: string; href?: string }[] = [{ kind: "root", text: "" }];
+  const lists: { ordered: boolean; n: number }[] = [];
+  const top = () => frames[frames.length - 1];
+  const put = (s: string) => {
+    top().text += s;
+  };
+  // A paragraph or list item starts on a line of its own, unless its line has nothing on it yet: a <br> just before
+  // it already gave it one - the empty paragraph Figma writes for a blank line is then one blank line, not two - and a
+  // paragraph inside a list item belongs on its bullet's line.
+  const newLine = () => {
+    const t = top().text;
+    if (t && !t.endsWith("\n") && !/^ *(-|\d+\.) $/.test(t.slice(t.lastIndexOf("\n") + 1))) put("\n");
+  };
+  const render = (f: (typeof frames)[number]) => {
+    if (f.kind === "code") return codeSpan(f.text);
+    if (f.href === undefined) return f.text;
+    const url = f.href.replace(/[\s()<>]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+    return `[${f.text || f.href.replace(/[\\[\]]/g, "\\$&")}](${url})`;
+  };
+  /** Ends the innermost open element of this kind, and any opened inside it and left open. A stray end tag is ignored. */
+  const close = (kind: "a" | "code") => {
+    if (!frames.some((f) => f.kind === kind)) return;
+    for (let f = frames.pop()!; ; f = frames.pop()!) {
+      put(render(f));
+      if (f.kind === kind) return;
+    }
+  };
+  for (const m of html.matchAll(LABEL_TOKEN)) {
+    const [token, slash, name, attrs] = m;
+    if (!name) {
+      if (token === "<" && /^<\/?[a-z]/i.test(html.slice(m.index, m.index + 3))) unconverted.add("malformed");
+      const text = decodeEntities(token);
+      // Inside a code span nothing is markdown; inside a link's text a bracket would end the text early.
+      put(top().kind === "code" || !frames.some((f) => f.kind === "a") ? text : text.replace(/[\\[\]]/g, "\\$&"));
+      continue;
+    }
+    const tag = name.toLowerCase();
+    const closing = slash === "/";
+    if (top().kind === "code" && tag !== "code") continue;
+    if (tag === "p") newLine();
+    else if (tag === "br") put("\n");
+    else if (tag === "strong" || tag === "b") put("**");
+    else if (tag === "em" || tag === "i") put("*");
+    else if (tag === "code") closing ? close("code") : frames.push({ kind: "code", text: "" });
+    else if (tag === "a") {
+      if (closing) close("a");
+      else {
+        const href = /(?:^|\s)href\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(attrs);
+        frames.push({ kind: "a", text: "", href: href ? decodeEntities(href[1] ?? href[2] ?? href[3]) : undefined });
+      }
+    } else if (tag === "ul" || tag === "ol") {
+      if (closing) lists.pop();
+      else lists.push({ ordered: tag === "ol", n: 0 });
+      newLine();
+    } else if (tag === "li") {
+      newLine();
+      const list = lists[lists.length - 1];
+      if (!closing) put(`${"  ".repeat(Math.max(0, lists.length - 1))}${list?.ordered ? `${++list.n}.` : "-"} `);
+    } else unconverted.add(tag);
+  }
+  // An element left open at the end still renders as what it is.
+  while (frames.length > 1) {
+    const f = frames.pop()!;
+    put(render(f));
+  }
+  return { markdown: frames[0].text.replace(/\n{3,}/g, "\n\n").trim(), unconverted: [...unconverted] };
+}
+
+const OPPOSITE_SIDE: Record<string, string> = { TOP: "BOTTOM", BOTTOM: "TOP", LEFT: "RIGHT", RIGHT: "LEFT" };
 
 function sizing(s: string | undefined) {
   if (!s) return undefined;

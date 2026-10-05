@@ -12,6 +12,7 @@ import {
 } from "./account.ts";
 import { BrowserManager, defaultExecutable, defaultStateDir } from "./browser.ts";
 import { componentUsage, componentUses } from "./component-usage.ts";
+import { DEV_STATUS_FILTERS, devStatusList } from "./dev-status.ts";
 import type { Raw } from "./fig-file.ts";
 import { cleanStaleDownloads, FigmaWeb, parseFileRef } from "./figma-web.ts";
 import { groupUnresolved, scanText } from "./instance-text.ts";
@@ -532,12 +533,12 @@ tool(
 
 tool(
   "figma_get_tree",
-  "Compact outline of the layer tree (id, type, name, size, hints). Omit node_id for all pages. The first line is a " +
-    "header, '# ' followed by a JSON object holding the fields described below; the outline starts on the second line. " +
-    "max_nodes goes to one level before the next (pages, then top-level layers, then what is under them), so a large " +
-    "first section cannot crowd out later pages. A branch cut short ends in a '- ... N more children' line, a layer whose " +
-    "children were all left out says '(N children)', and the last line says it was truncated. A layer drawn only with " +
-    "vector shapes is one line counting them, '(27 vectors)': pass its node_id to list them. " +
+  "Compact outline of the layer tree (id, type, name, size, hints such as ready for dev). Omit node_id for all pages. " +
+    "The first line is a header, '# ' followed by a JSON object holding the fields described below; the outline starts " +
+    "on the second line. max_nodes goes to one level before the next (pages, then top-level layers, then what is under " +
+    "them), so a large first section cannot crowd out later pages. A branch cut short ends in a '- ... N more children' " +
+    "line, a layer whose children were all left out says '(N children)', and the last line says it was truncated. A " +
+    "layer drawn only with vector shapes is one line counting them, '(27 vectors)': pass its node_id to list them. " +
     EXPORTED_AT_NOTE,
   {
     file: fileArg,
@@ -567,6 +568,10 @@ tool(
   "figma_get_node",
   "Detailed design data for a node and its subtree: geometry, fills/strokes/effects (hex), auto-layout, text styling and runs, " +
     "component/instance info, bound variables and style names. Instances are not expanded (see mainComponentId). " +
+    "Dev Mode's handoff data where a node has it: devStatus as figma_dev_status describes it, annotations (label as " +
+    "markdown, category, the properties pinned) and measurements (from/to node ids and sides; the distance itself is not " +
+    "stored). devStatus is absent on a node never marked: a record that is none and was none, with no user or note on " +
+    "it, is one Figma keeps on components nobody marked, and only figma_dev_status with status none or any lists it. " +
     EXPORTED_AT_NOTE,
   {
     file: fileArg,
@@ -845,6 +850,40 @@ tool(
       .map((e): Raw => ({ ...e, variantsUsed: e.variantsUsed.size ? [...e.variantsUsed] : undefined }))
       .sort((a, b) => b.instances + b.swapInstances - (a.instances + a.swapInstances));
     return json({ ...dated, componentSets: sets, components: singles, libraryComponentsUsed });
+  },
+);
+
+tool(
+  "figma_dev_status",
+  "Dev Mode status: the nodes marked Ready for dev or Completed, and those unmarked since, newest change first. " +
+    "Read off each frame's, section's or component's own status record; each entry has id, type, name, page, path and " +
+    "the fields figma_get_node reports as devStatus: status (ready_for_dev, completed, none, or unknown for a value this " +
+    "decoder has no name for), raw (the value Figma stores: BUILD is read as Ready for dev, which has not been confirmed " +
+    "against a re-export, so quote it beside status), previous and previousRaw, changedAt (ISO-8601), and by (a Figma " +
+    "user id) and note when the record has them. status none with a previous status other than none is a mark that came " +
+    "off at changedAt; none with previous none is a record Figma keeps on a node never marked, listed only with status " +
+    "none or any unless a user or note on it says a person left it. " +
+    "Internal-only pages, soft-deleted nodes and superseded library copies are left out. " +
+    EXPORTED_AT_NOTE,
+  {
+    file: fileArg,
+    page: z.string().optional().describe("Only nodes on this page; a name no page has is an error listing the pages"),
+    status: z.enum(DEV_STATUS_FILTERS).optional().describe(
+      "Only this status: none covers marks that came off as well as records that never said anything else, and any is " +
+        "every record. Default: every node marked now or before (status or previous other than none), and any record " +
+        "with a user or note on it",
+    ),
+    limit: z.number().int().positive().optional().describe("Default 100"),
+    refresh: refreshArg,
+  },
+  async ({ file, page, status, limit, refresh }) => {
+    const { doc, dated } = await open(file, refresh);
+    if (page !== undefined && !doc.pages().some((p) => p.name === page)) {
+      throw new Error(`no page named ${JSON.stringify(page)}; pages: ${doc.pages().map((p) => JSON.stringify(p.name)).join(", ")}`);
+    }
+    const nodes = devStatusList(doc, { page, status });
+    const max = limit ?? 100;
+    return json({ ...dated, returned: Math.min(nodes.length, max), total: nodes.length, truncated: nodes.length > max, nodes: nodes.slice(0, max) });
   },
 );
 

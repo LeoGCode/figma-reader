@@ -504,6 +504,9 @@ tool(
   "figma_load_file",
   "Export (Save local copy) and decode a Figma file, returning a summary: pages, node counts, variable collections, styles, components. " +
     "Snapshots are cached; other tools reuse them. Export of large files can take a minute. " +
+    "For a snapshot exported through the browser, snapshotPath is its .fig in the cache: pass that path instead of the key " +
+    "and later calls answer from this one export however old it gets, since a path is never exported again, until an " +
+    "export of the same key replaces the file. " +
     EXPORTED_AT_NOTE,
   { file: fileArg, refresh: refreshArg },
   async ({ file, refresh }) => {
@@ -519,6 +522,12 @@ tool(
       key,
       source,
       path,
+      // A key is answered by whichever snapshot is current when the call runs, and once it is older than the max age
+      // the next call exports again: a task that outlives its snapshot reads two exports and can report them as one
+      // design. Nothing said where the snapshot was, so passing the file an answer came from was not an option. A path
+      // is read as it is on disk and never exported again, so it holds a task to one export - but only until an export
+      // of this key replaces the file, and read back by path it is dated fileModifiedAt, the instant exportedAt is.
+      ...(source === "web" ? { snapshotPath: resolve(store.figPath(key!)) } : {}),
       ...dated,
       // Only for a snapshot we took: for a file the user supplied, the age of the copy is not the age of the design.
       ...(source === "web" ? { snapshotAgeMinutes: Math.round((Date.now() - doc.exportedAt.getTime()) / 60_000) } : {}),

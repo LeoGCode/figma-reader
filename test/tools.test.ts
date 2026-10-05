@@ -897,6 +897,54 @@ describe("figma_export_image_fills", () => {
 
 // What an agent gets when it passes nothing but the file. Every one of these is a cut-off: too small and the answer
 // silently misses what was asked about, too large and it floods the caller's context.
+describe("figma_get_tree, with every lane's part of it at once", () => {
+  // Four lanes write into one outline: a header line (dated, with the account when one read it), the Dev Mode hint,
+  // the budget spent a level at a time with a marker on the branch it cut, and a drawing counted in one line. Each was
+  // tested on its own; here they have to compose on one file without one of them pushing another out.
+  it("dates it, hints the dev status, cuts the widest branch with a marker and counts a drawing", async () => {
+    const at = Date.parse("2026-10-01T10:00:00Z") / 1000;
+    const file = figFile("tree-all", [
+      { id: "0:1", type: "CANVAS", parent: "0:0", name: "Screens" },
+      { id: "1:1", type: "FRAME", parent: "0:1", name: "Checkout", sectionStatusInfo: { status: "BUILD", prevStatus: "NONE", lastUpdateUnixTimestamp: at } },
+      ...many(3, (i) => ({ id: `1:${10 + i}`, type: "FRAME", parent: "1:1", name: `step ${i + 1}` })),
+      { id: "1:2", type: "FRAME", parent: "0:1", name: "Logo" },
+      ...many(3, (i) => ({ id: `1:${20 + i}`, type: "VECTOR", parent: "1:2", name: `path ${i + 1}` })),
+      { id: "1:3", type: "FRAME", parent: "0:1", name: "Icons" },
+      ...many(30, (i) => ({ id: `1:${100 + i}`, type: "INSTANCE", parent: "1:3", name: `icon ${i + 1}` })),
+      { id: "1:4", type: "FRAME", parent: "0:1", name: "Old checkout", sectionStatusInfo: { status: "NONE", prevStatus: "BUILD", lastUpdateUnixTimestamp: at } },
+      { id: "0:2", type: "CANVAS", parent: "0:0", name: "Archive" },
+      { id: "2:1", type: "FRAME", parent: "0:2", name: "v1" },
+    ]);
+    const taken = new Date("2026-10-05T14:15:09.000Z");
+    utimesSync(file, taken, taken);
+    const tree = await body("figma_get_tree", { file, max_nodes: 13 });
+    assert.equal(
+      tree,
+      [
+        `# {"fileModifiedAt":"${taken.toISOString()}"}`,
+        '- 0:1 PAGE "Screens"',
+        '  - 1:1 FRAME "Checkout" (ready for dev)',
+        '    - 1:10 FRAME "step 1"',
+        '    - 1:11 FRAME "step 2"',
+        '    - 1:12 FRAME "step 3"',
+        '  - 1:2 FRAME "Logo" (3 vectors)',
+        '  - 1:3 FRAME "Icons"',
+        '    - 1:100 INSTANCE "icon 1"',
+        '    - 1:101 INSTANCE "icon 2"',
+        "    - ... 28 more children",
+        '  - 1:4 FRAME "Old checkout" (was ready for dev)',
+        '- 0:2 PAGE "Archive"',
+        '  - 2:1 FRAME "v1"',
+        "... truncated at 13 nodes; use a node_id or smaller depth",
+      ].join("\n"),
+    );
+    // The drawing's id lists what it counted, and the header stays on top of a tree asked for by node.
+    const logo = (await body("figma_get_tree", { file, node_id: "1:2" })).split("\n");
+    assert.deepEqual(logo.slice(1), ['- 1:2 FRAME "Logo"', '  - 1:20 VECTOR "path 1"', '  - 1:21 VECTOR "path 2"', '  - 1:22 VECTOR "path 3"']);
+    assert.match(logo[0], /^# \{"fileModifiedAt":/);
+  });
+});
+
 describe("the defaults", () => {
   const chain = (n: number, from: string) =>
     many(n, (i) => ({ id: `1:${i + 1}`, type: "FRAME", parent: i ? `1:${i}` : from, name: `level ${i + 1}` }));

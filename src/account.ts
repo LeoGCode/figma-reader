@@ -2,7 +2,7 @@
 // (the login) and its own snapshot cache, so one project never reuses another account's session or exported files.
 // A project picks its account in .figma-reader.json; FIGMA_ACCOUNT (or the CLI's --account) overrides it.
 // The per-platform roots everything we write hangs off live here too (appRoot), since accounts are most of it.
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -110,9 +110,29 @@ export function resolveAccount(env: NodeJS.ProcessEnv = process.env, cwd = proce
  * the project (an agent's scratch directory) read client files through it with nothing in the answer to say so.
  * Empty when an account was chosen, "default" included (FIGMA_ACCOUNT, --account, a project file), or when "default"
  * is the only account there is, which is the setup every single-login machine has and keeps working as it did.
+ * `accounts` is only called for the fallback, so a chosen account never depends on the data root being readable;
+ * whatever it throws (see existingAccounts) is the caller's to refuse on.
  */
-export function otherAccounts(resolved: ResolvedAccount, accounts = listAccounts()): string[] {
-  return resolved.source === "default" ? accounts.filter((n) => n !== DEFAULT_ACCOUNT) : [];
+export function otherAccounts(resolved: ResolvedAccount, accounts: () => string[] = existingAccounts): string[] {
+  return resolved.source === "default" ? accounts().filter((n) => n !== DEFAULT_ACCOUNT) : [];
+}
+
+/**
+ * The accounts set up on this machine, for otherAccounts. listAccounts reads every failure as "no accounts", which for
+ * the accounts command only shortens a list; here it let the fallback through on a machine whose other logins merely
+ * could not be listed (EACCES, EIO, a home on a network share gone stale). So only a directory that is not there yet,
+ * which is every machine that never logged in, means none, and any other failure is thrown. A symbolic link counts as
+ * an account too, whatever it points at: it is not up to this check to prove that one is not a login.
+ */
+export function existingAccounts(dir = join(dataRoot(), "accounts")): string[] {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException | null)?.code === "ENOENT") return [];
+    throw e;
+  }
+  return entries.filter((e) => e.isDirectory() || e.isSymbolicLink()).map((e) => e.name).sort();
 }
 
 /**

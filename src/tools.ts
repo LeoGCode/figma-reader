@@ -1,6 +1,7 @@
 // The read-only Figma tools shared by the MCP server (mcp.ts) and the CLI (cli.ts). No Figma plugin and no API token:
 // data comes from local .fig files or the logged-in figma.com web app over CDP, via "Save local copy" (.fig, decoded
 // locally) and "Copy as PNG" (captured in-page).
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -256,11 +257,21 @@ export function servingMcp() {
  * stderr away. Read at each call rather than once, so an account logged in after an MCP server started counts too.
  * A profile or browser named directly (FIGMA_USER_DATA_DIR, FIGMA_CDP_URL) is a login chosen as deliberately as an
  * account, and the default account's own profile and cache are not used then, so nothing is refused.
+ * When the accounts there are cannot be listed at all, the call is refused too, saying why: not being able to tell
+ * whether this machine has other logins is no evidence that it has none, and reading it as none let the fallback
+ * through on exactly the machine the refusal is for. Choosing an account skips the listing, so that is the way out.
  */
 function implicitDefaultRefusal(): string | undefined {
   if (customProfile) return undefined;
-  const others = otherAccounts(account);
-  if (!others.length) return undefined;
+  let others: string[];
+  let unlisted: string | undefined;
+  try {
+    others = otherAccounts(account);
+  } catch (e) {
+    others = [];
+    unlisted = e instanceof Error ? e.message : String(e);
+  }
+  if (!others.length && unlisted === undefined) return undefined;
   const where = account.config
     ? `the nearest ${CONFIG_FILE} (${account.config.path}) names no account`
     : `no ${CONFIG_FILE} was found in or above ${resolvedIn}${servedBy === "mcp" ? ", the directory this server was started in" : ""}`;
@@ -269,28 +280,43 @@ function implicitDefaultRefusal(): string | undefined {
       `to use "${DEFAULT_ACCOUNT}" on purpose), or start it in the project's directory, then restart it.`
     : `Run it from the project's directory, or pass --account <name> or set FIGMA_ACCOUNT=<name>; ` +
       `--account ${DEFAULT_ACCOUNT} is the explicit way to use "${DEFAULT_ACCOUNT}".`;
+  const besides = unlisted === undefined
+    ? `other accounts exist (${others.join(", ")})`
+    : `the accounts that exist could not be listed (${unlisted}), so it may not be the only one`;
   return (
-    `no Figma account chosen: ${where}, so this would fall back to the "${DEFAULT_ACCOUNT}" account, and other ` +
-    `accounts exist (${others.join(", ")}). ${fix} An agent should ask the user which account, not pick one. ` +
-    "Local .fig paths need no account."
+    `no Figma account chosen: ${where}, so this would fall back to the "${DEFAULT_ACCOUNT}" account, and ${besides}. ` +
+    `${fix} An agent should ask the user which account, not pick one. Local .fig paths need no account.`
   );
 }
 
-/** Refuse a call that would use figma.com or this account's cache, before it touches either; see implicitDefaultRefusal. */
-function refuseImplicitDefault() {
+/** Each tool call, and whether it has gone through the account yet: what decides whether its error names the account. */
+const callAccount = new AsyncLocalStorage<{ used: boolean }>();
+
+/**
+ * From here on this call goes through figma.com or this account's snapshot cache. Called before either is touched:
+ * a call nothing chose an account for is refused here (see implicitDefaultRefusal), and one let through has any
+ * error it ends in name the account (see attributed).
+ */
+function useAccount() {
   const why = implicitDefaultRefusal();
   if (why) throw new AccountNotChosen(why);
+  const call = callAccount.getStore();
+  if (call) call.used = true;
 }
 
 /**
- * An error from figma.com or this account's cache, with the account named: a file "not found" or "not accessible"
- * there may only be one this login cannot see, and which login that was is what the user needs to hear. A new error
- * rather than an edited one, since concurrent calls on one key await the same export and so the same error.
+ * Run one tool call, and if it ends in an error after it went through the account, name the account in it, whatever
+ * raised it: a file "not found" or "not accessible" on figma.com may only be one this login cannot see, a failed
+ * login check is that login's, and a node missing from a cached snapshot is missing from what that login exported.
+ * Which login it was is what the user needs to hear. A new error rather than an edited one, since concurrent calls on
+ * one key await the same export and so the same error.
  */
-async function namingAccount<T>(call: Promise<T>): Promise<T> {
+async function attributed(run: () => Promise<ToolResult>): Promise<ToolResult> {
+  const call = { used: false };
   try {
-    return await call;
+    return await callAccount.run(call, run);
   } catch (e) {
+    if (!call.used) throw e;
     throw new Error(`${e instanceof Error ? e.message : String(e)} [${accountLabel()}]`, { cause: e });
   }
 }
@@ -298,8 +324,8 @@ async function namingAccount<T>(call: Promise<T>): Promise<T> {
 async function open(file: string, refresh?: boolean) {
   const ref = parseFileRef(file);
   const path = ref.path ?? (refresh ? undefined : localFileForKey(ref.key));
-  if (!path) refuseImplicitDefault();
-  const doc = path ? await store.getLocal(path) : await namingAccount(store.get(ref.key, refresh));
+  if (!path) useAccount();
+  const doc = path ? await store.getLocal(path) : await store.get(ref.key, refresh);
   const key = ref.path ? (ref.keyInName ? ref.key : undefined) : ref.key;
   const source = path ? "local" : "web";
   // A .fig carries no export time of its own, only its file time, and what that time means depends on who wrote the
@@ -329,7 +355,7 @@ const WRITES_STATE = new Set(["figma_status", "figma_login"]);
 
 function tool<S extends z.ZodRawShape>(name: string, description: string, shape: S, run: (a: z.infer<z.ZodObject<S>>) => Promise<ToolResult>) {
   const readOnly = !WRITES_STATE.has(name) && !WRITES_PATH.some((k) => k in shape);
-  tools.push({ name, description, shape, readOnly, run });
+  tools.push({ name, description, shape, readOnly, run: (args) => attributed(() => run(args)) });
 }
 
 /**
@@ -391,8 +417,9 @@ tool(
     // Refused like any web call. On the fallback's profile it would either open a login window that signs the
     // project's Figma login into the wrong account, or, that profile being logged in already, report as ready a
     // login the project may not be meant to use - which is what the next call would then read client files through.
-    refuseImplicitDefault();
-    const who = `account "${account.name}"`;
+    useAccount();
+    // With its source, like every other answer that went through the account.
+    const who = accountLabel();
     const user = browser.launchRecord()?.purpose === "login" ? null : verified(await web.whoami());
     if (user) return json({ ...accountSummary(), loggedIn: true, user });
     await web.openLogin();
@@ -418,8 +445,8 @@ tool(
     limit: z.number().int().positive().optional().describe("Default 30"),
   },
   async ({ source, query, limit }) => {
-    if (source === "web") refuseImplicitDefault();
-    const all: Raw[] = source === "web" ? await namingAccount(web.recentFiles()) : localFigFiles(localDirs);
+    if (source === "web") useAccount();
+    const all: Raw[] = source === "web" ? await web.recentFiles() : localFigFiles(localDirs);
     const files = query ? all.filter((f) => f.name.toLowerCase().includes(query.toLowerCase())) : all;
     const max = limit ?? 30;
     // An empty answer used to be an English sentence, which a client parsing this schema's JSON threw on. The two
@@ -835,12 +862,12 @@ tool(
     const nodeId = id.replaceAll("-", ":");
     // Every screenshot goes through the account's login, from a keyed local path too (the path only supplies the
     // key), and the page check just below reads the account's cache: so the account is settled before either.
-    refuseImplicitDefault();
+    useAccount();
     // Pages cannot be selected; copy everything on them instead. Known only from a local or cached snapshot.
     const localPath = ref.path ?? localFileForKey(ref.key);
     const snapshot = localPath ? await store.getLocal(localPath).catch(() => undefined) : store.peek(ref.key);
     const isPage = snapshot?.get(nodeId)?.type === "CANVAS";
-    const png = await namingAccount(web.copyAsPng(ref.key, nodeId, max_dimension ?? 1568, isPage));
+    const png = await web.copyAsPng(ref.key, nodeId, max_dimension ?? 1568, isPage);
     const note = `${isPage ? "page (all top-level layers) " : "node "}${id}: ${png.width}x${png.height}` +
       (png.originalWidth !== png.width ? ` (downscaled from ${png.originalWidth}x${png.originalHeight})` : "") +
       (save_path ? `, saved to ${writeOut(save_path, Buffer.from(png.base64, "base64"))}` : "") +

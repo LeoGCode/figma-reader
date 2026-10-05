@@ -73,13 +73,21 @@ export function sharedByPage<T>(list: T[], pageOf: (e: T) => string | undefined,
   });
 }
 
-type PageCounts = Record<string, Record<string, number>>;
+/**
+ * Counts per page, by name. A Map and not an object: a page is named by whoever made the file, and a page called
+ * "__proto__" made `counts[page] ??= {}` find Object.prototype and count into it, so every later answer of the process
+ * (a batch, an MCP server) inherited "layers" and "editedNodes" it never counted.
+ */
+type PageCounts = Map<string, Map<string, number>>;
 /** Count `what` under page in counts, leaving out a page or count that has none. */
 const tally = (counts: PageCounts, page: string | undefined, what: string, n = 1) => {
   if (page === undefined || !n) return;
-  const c = (counts[page] ??= {});
-  c[what] = (c[what] ?? 0) + n;
+  let c = counts.get(page);
+  if (!c) counts.set(page, (c = new Map()));
+  c.set(what, (c.get(what) ?? 0) + n);
 };
+/** The counts as the answer carries them. fromEntries defines each page as a property of its own, "__proto__" too. */
+const byPageOf = (counts: PageCounts) => Object.fromEntries([...counts].map(([page, c]) => [page, Object.fromEntries(c)]));
 
 /**
  * Two snapshots of one file, compared by node id: Figma keeps a node's id for its whole life, through renames and
@@ -139,7 +147,7 @@ export function diffDocuments(old: FigDocument, cur: FigDocument, limit: number,
   // Preorder, so a node's parent is settled before it is.
   const rootOf = new Map<string, Found>();
   const roots: Found[] = [];
-  const byPage: PageCounts = {};
+  const byPage: PageCounts = new Map();
   for (const page of oldPages.values()) {
     for (const n of old.walk(page)) {
       if (n === page || cur.get(n.id)) continue;
@@ -178,7 +186,7 @@ export function diffDocuments(old: FigDocument, cur: FigDocument, limit: number,
       removedRoots: rts.length,
       removedNodes: rts.reduce((sum, f) => sum + (f.out.removedCount as number), 0),
     },
-    byPage,
+    byPage: byPageOf(byPage),
     pages: { added: cap(pageLists[0]), removed: cap(pageLists[1]), renamed: cap(pageLists[2]) },
     layers: { added: share(add), removed: share(rem), renamed: share(ren), moved: share(mov) },
     removedNodes: share(rts),
@@ -254,7 +262,7 @@ function editedAt(n: FigNode): number | undefined {
 export function changesSince(doc: FigDocument, since: Date, limit: number, pages?: PageFilter) {
   const at = since.getTime() / 1000;
   const found: { newest: number; out: Raw }[] = [];
-  const byPage: PageCounts = {};
+  const byPage: PageCounts = new Map();
   let editedNodes = 0;
   let undatedNodes = 0;
   for (const page of doc.pages()) {
@@ -301,7 +309,7 @@ export function changesSince(doc: FigDocument, since: Date, limit: number, pages
     limit,
     editedNodes,
     undatedNodes,
-    byPage,
+    byPage: byPageOf(byPage),
     layers: sharedByPage(found, (f) => f.out.page as string, limit).map((f) => f.out),
   };
 }

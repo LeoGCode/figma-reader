@@ -367,6 +367,10 @@ describe("Dev Mode status, annotations and measurements", () => {
     assert.deepEqual(status({ status: "IN_REVIEW", prevStatus: "BUILD" }), { status: "unknown", raw: "IN_REVIEW", previous: "ready_for_dev", previousRaw: "BUILD" });
     // A record that leaves its fields out has nothing marked, and no time or user to report.
     assert.deepEqual(status({}), { status: "none", raw: "NONE", previous: "none", previousRaw: "NONE" });
+    // A value spelled like something every object has is a value with no name all the same, not that inherited thing.
+    for (const raw of ["constructor", "toString", "__proto__"]) {
+      assert.deepEqual(status({ status: raw, prevStatus: raw }), { status: "unknown", raw, previous: "unknown", previousRaw: raw }, raw);
+    }
   });
 
   const doc = figDoc([
@@ -455,6 +459,12 @@ describe("Dev Mode status, annotations and measurements", () => {
       { from: "1:1", fromSide: "BOTTOM", to: "1:3", toSide: "TOP", toPath: ["1:3", "77:5"] },
       { from: "1:3", fromSide: "RIGHT", to: "8:8", toSide: "RIGHT", toMissing: true },
     ]);
+    // A side this decoder has no opposite for has none, rather than whatever an object inherits under that name.
+    const odd = figDoc([
+      { id: "0:1", type: "CANVAS", parent: "0:0", name: "Page" },
+      { id: "1:1", type: "FRAME", parent: "0:1", name: "Card", measurements: [{ id: guid("5:1"), toNode: none, toNodeStablePath: { guids: [guid("1:1")] }, fromNodeSide: "constructor" }] },
+    ]);
+    assert.deepEqual(new Normalizer(odd).node(odd.require("1:1"), 0).measurements, [{ from: "1:1", fromSide: "constructor", to: "1:1" }]);
   });
 });
 

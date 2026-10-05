@@ -171,6 +171,35 @@ describe("diffDocuments", () => {
   });
 });
 
+describe("byPage, with pages named whatever their designers named them", () => {
+  // A page called __proto__ made `counts[page] ??= {}` count into Object.prototype, and every answer after it in the
+  // same process (a batch, an MCP server) inherited counts it never made.
+  const T = Date.parse("2026-10-01T00:00:00Z") / 1000;
+  const reserved = ["__proto__", "constructor", "toString"];
+  const pagesNamed = (names: string[], edited = true) =>
+    figDoc(names.flatMap((name, i): TestNode[] => [
+      { id: `0:${i + 1}`, type: "CANVAS", parent: "0:0", name },
+      { id: `${i + 1}:1`, type: "FRAME", parent: `0:${i + 1}`, name: "Frame", ...(edited ? { editInfo: { createdAt: T + 1, lastEditedAt: T + 1 } } : {}) },
+    ]));
+  const inherited = () => ["layers", "editedNodes", "added", "removed", "removedNodes"].filter((k) => k in {});
+  const expected = (names: string[], counts: object) => JSON.parse(JSON.stringify(Object.fromEntries(names.map((n) => [n, counts]))));
+
+  it("counts a page under its own name, whatever the name, and leaves every other object alone", () => {
+    const r = changesSince(pagesNamed(reserved), new Date(T * 1000), 50);
+    assert.deepEqual(r.byPage, expected(reserved, { editedNodes: 1, layers: 1 }));
+    assert.ok(reserved.every((n) => Object.hasOwn(r.byPage, n)), "each an own property, as JSON writes it");
+    assert.equal(JSON.stringify(r.byPage), JSON.stringify(expected(reserved, { editedNodes: 1, layers: 1 })));
+    assert.deepEqual(inherited(), [], "nothing reached Object.prototype");
+    // The next answer of the same process counts only its own pages.
+    assert.deepEqual(changesSince(pagesNamed(["Ordinary"]), new Date(T * 1000), 50).byPage, { Ordinary: { editedNodes: 1, layers: 1 } });
+
+    const gone = diffDocuments(pagesNamed(reserved, false), figDoc(reserved.map((name, i) => ({ id: `0:${i + 1}`, type: "CANVAS", parent: "0:0", name }))), 100);
+    assert.deepEqual(gone.byPage, expected(reserved, { removedNodes: 1, removed: 1 }));
+    assert.deepEqual(inherited(), []);
+    assert.deepEqual(diffDocuments(pagesNamed(["Ordinary"], false), pagesNamed(["Ordinary"], false), 100).byPage, {});
+  });
+});
+
 describe("sharedByPage", () => {
   const list = [...Array(10).fill("A"), "B", "B", ...Array(5).fill("C")].map((page, i) => ({ page, i }));
   const pages = (l: { page: string }[]) => l.map((e) => e.page).join("");

@@ -64,6 +64,14 @@ test("a frame's Dev Mode status is a hint, and so is the status a frame had befo
   ].join("\n"));
 });
 
+test("a dev status spelled like something every object has is shown as stored", () => {
+  const odd = figDoc([
+    { id: "0:1", type: "CANVAS", parent: "0:0", name: "P" },
+    { id: "1:1", type: "FRAME", parent: "0:1", name: "F", sectionStatusInfo: { status: "toString", prevStatus: "NONE", userId: "1" } },
+  ]);
+  assert.equal(outline(odd, odd.get(odd.rootId)!, 1, 10).split("\n")[1], '  - 1:1 FRAME "F" (dev status toString)');
+});
+
 test("output stops at max_nodes and says so, but only when something was left out", () => {
   // The marker for what a branch left out is a line too, so max_nodes still bounds the output.
   assert.deepEqual(outline(doc, doc.require("1:1"), 1, 3).split("\n"), [

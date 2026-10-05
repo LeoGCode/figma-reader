@@ -273,7 +273,7 @@ export class Normalizer {
         // What toSameSide means was read off real files: every measurement from a layer to itself has it false, so it
         // crosses to the opposite side (a width or a height), and every one to an enclosing frame has it true (a
         // padding). The side it names says that outright, where the bare flag left the caller to work it out.
-        toSide: side && (m.toSameSide ? side : OPPOSITE_SIDE[side]),
+        toSide: side && (m.toSameSide ? side : own(OPPOSITE_SIDE, side)),
         toPath: path.length > 1 ? path : undefined,
         toMissing: to && !this.doc.get(to) ? true : undefined,
         freeText: m.freeText || undefined,
@@ -402,9 +402,9 @@ export function devStatus(n: FigNode): DevStatus | undefined {
   const raw: string = s.status ?? "NONE";
   const previousRaw: string = s.prevStatus ?? "NONE";
   return prune({
-    status: DEV_STATUS[raw] ?? "unknown",
+    status: own(DEV_STATUS, raw) ?? "unknown",
     raw,
-    previous: DEV_STATUS[previousRaw] ?? "unknown",
+    previous: own(DEV_STATUS, previousRaw) ?? "unknown",
     previousRaw,
     changedAt: s.lastUpdateUnixTimestamp ? new Date(s.lastUpdateUnixTimestamp * 1000).toISOString() : undefined,
     by: s.userId || undefined,
@@ -524,6 +524,12 @@ export function labelMarkdown(html: string): { markdown: string; unconverted: st
 }
 
 const OPPOSITE_SIDE: Record<string, string> = { TOP: "BOTTOM", BOTTOM: "TOP", LEFT: "RIGHT", RIGHT: "LEFT" };
+
+/**
+ * table[key], for a key the table itself holds. The keys looked up in these tables come from the file, and a value
+ * spelled "constructor" or "toString" found what every object inherits: a function, standing as a status.
+ */
+export const own = <T>(table: Record<string, T>, key: string): T | undefined => (Object.hasOwn(table, key) ? table[key] : undefined);
 
 function sizing(s: string | undefined) {
   if (!s) return undefined;

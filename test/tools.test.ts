@@ -15,7 +15,7 @@ import { FigmaWeb } from "../src/figma-web.ts";
 import { outline } from "../src/outline.ts";
 import { guid, nodeChanges, type TestNode } from "./fixtures.ts";
 
-// Resolved, as in test/cli.test.ts: the project file is found from the working directory, which the kernel reports
+// Resolved, as in test/cli-helpers.ts: the project file is found from the working directory, which the kernel reports
 // resolved, so on macOS (/var -> /private/var) its path came back under a spelling this test did not build it with.
 const root = realpathSync(mkdtempSync(join(tmpdir(), "figma-reader-tools-")));
 const figs = join(root, "figs");

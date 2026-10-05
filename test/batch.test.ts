@@ -1,6 +1,6 @@
 // figma-reader batch, run in this process against the real tools so that decodes can be counted: a batch exists to
 // decode each file once (while at most four are in play), and one that decoded per line would answer exactly the
-// same, only as slowly as separate processes. test/cli.test.ts runs the command itself, over stdin.
+// same, only as slowly as separate processes. test/cli-batch.test.ts runs the command itself, over stdin.
 import { after, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";

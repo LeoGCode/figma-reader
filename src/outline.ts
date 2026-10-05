@@ -31,10 +31,18 @@ const SHAPES = new Set(["VECTOR", "BOOLEAN_OPERATION", "STAR", "LINE", "ELLIPSE"
  * something to count away. Strokes as well as fills, as figma_export_image_fills reads both: an image stroke on an
  * ellipse used to hide the layer holding the image inside its frame's "(1 vector)".
  */
-const isDrawing = (n: FigNode) =>
-  SHAPES.has(n.type) &&
-  (n.type === "BOOLEAN_OPERATION" || !n.childIds.length) &&
-  ![...(n.fillPaints ?? []), ...(n.strokePaints ?? [])].some((p: { type?: string }) => p.type === "IMAGE");
+const hasImage = (n: FigNode) => [...(n.fillPaints ?? []), ...(n.strokePaints ?? [])].some((p: { type?: string }) => p.type === "IMAGE");
+const isDrawing = (n: FigNode) => SHAPES.has(n.type) && (n.type === "BOOLEAN_OPERATION" || !n.childIds.length) && !hasImage(n);
+
+/**
+ * Layers that are part of a drawing when all they hold is drawing. Drawings nest groups in groups, and counting the
+ * shapes of one level at a time still printed 3,532 lines of a real export inside layers that drew nothing else: 961
+ * GROUP, 205 FRAME and 2,366 VECTOR. Not an instance, whose component names the icon, nor a component or a component
+ * set, nor a frame painted with an image. A group or frame that holds nothing is not part of one either: the 704 next
+ * to the shapes still listed on that export were each a filled frame the size of its parent, a background, as a
+ * rectangle is.
+ */
+const isHolder = (n: FigNode) => ["GROUP", "FRAME"].includes(displayType(n)) && !hasImage(n);
 
 /** Lines a parent's children take when it shows some of them: one each, and one for the "... N more children". */
 const linesFor = (count: number, shown: number) => shown + (shown > 0 && shown < count ? 1 : 0);
@@ -81,15 +89,32 @@ function share(counts: number[], budget: number): number[] {
 export function outline(doc: FigDocument, start: FigNode, depth: number, maxNodes: number): string {
   const roots = start.type === "DOCUMENT" ? doc.pages() : [start];
   /**
-   * The children of a drawing are counted on its line, not listed, except under the node asked for: get-tree with a
-   * drawing's id is how its shapes are seen.
+   * The shapes a layer's subtree draws, when it draws nothing else (0 when it holds anything else, or nothing): a shape
+   * counts one, a group or frame of them what it holds. Kept per node: deciding a layer walks what it holds, and each
+   * layer under it that is listed or printed would walk its own part of that again.
    */
-  const drawing = (n: FigNode, kids: FigNode[]) => n !== start && kids.length > 0 && kids.every(isDrawing);
-  const listed = (n: FigNode, level: number) => {
-    if (level >= depth) return [];
-    const kids = doc.children(n);
-    return drawing(n, kids) ? [] : kids;
+  const drawn = new Map<FigNode, number>();
+  const shapes = (n: FigNode): number => {
+    let total = drawn.get(n);
+    if (total !== undefined) return total;
+    total = 0;
+    for (const c of doc.children(n)) {
+      const part = isDrawing(c) ? 1 : isHolder(c) ? shapes(c) : 0;
+      if (!part) {
+        total = 0;
+        break;
+      }
+      total += part;
+    }
+    drawn.set(n, total);
+    return total;
   };
+  /**
+   * A drawing is counted on its line, its subtree not listed, except the node asked for: get-tree with a drawing's id
+   * is how its parts are seen.
+   */
+  const drawing = (n: FigNode) => (n === start ? 0 : shapes(n));
+  const listed = (n: FigNode, level: number) => (level >= depth || drawing(n) ? [] : doc.children(n));
 
   // Breadth first: how many children each parent shows, the roots under null.
   const shown = new Map<FigNode | null, number>();
@@ -142,7 +167,8 @@ export function outline(doc: FigDocument, start: FigNode, depth: number, maxNode
     const kids = doc.children(n);
     const list = listed(n, level);
     const count = list.length ? (shown.get(n) ?? 0) : 0;
-    if (drawing(n, kids)) extra.push(`${kids.length} ${kids.length === 1 ? "vector" : "vectors"}`);
+    const vectors = drawing(n);
+    if (vectors) extra.push(`${vectors} ${vectors === 1 ? "vector" : "vectors"}`);
     else if (kids.length && !count) extra.push(`${kids.length} ${kids.length === 1 ? "child" : "children"}`);
     lines.push(`${"  ".repeat(level)}- ${n.id} ${displayType(n)} "${n.name}"${size}${extra.length ? ` (${extra.join(", ")})` : ""}`);
     for (const c of list.slice(0, count)) visit(c, level + 1);

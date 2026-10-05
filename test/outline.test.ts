@@ -264,3 +264,89 @@ test("a layer drawn only with vector shapes is one line counting them", () => {
   // Shapes counted on their parent's line are not lines, so they spend none of max_nodes: the twelve above fit twelve.
   assert.doesNotMatch(outline(drawn, drawn.require("1:1"), 6, 12), /truncated/);
 });
+
+test("a drawing of groups of shapes, at any depth, is one line counting all its shapes", () => {
+  // Counting one level at a time left a line per inner group: 3,532 lines of a real export were inside layers that
+  // drew nothing else.
+  const v = (id: string, parent: string, type = "VECTOR") => ({ id, type, parent, name: type.toLowerCase() });
+  const drawn = figDoc([
+    { id: "0:1", type: "CANVAS", parent: "0:0", name: "P" },
+    { id: "1:1", type: "FRAME", parent: "0:1", name: "Header" },
+    { id: "2:1", type: "GROUP", parent: "1:1", name: "Logo", size: { x: 120, y: 32 } },
+    // A group as the file stores it, a frame that resizes to fit; a boolean operation is one shape, as it renders.
+    { id: "2:2", type: "FRAME", parent: "2:1", name: "Mark", resizeToFit: true },
+    v("2:3", "2:2"),
+    { id: "2:4", type: "BOOLEAN_OPERATION", parent: "2:2", name: "Union" },
+    v("2:5", "2:4"),
+    v("2:6", "2:4"),
+    { id: "2:7", type: "FRAME", parent: "2:1", name: "Letters" },
+    { id: "2:8", type: "GROUP", parent: "2:7", name: "L" },
+    v("2:9", "2:8"),
+    v("2:10", "2:8"),
+    { id: "2:11", type: "GROUP", parent: "2:7", name: "o" },
+    v("2:12", "2:11", "ELLIPSE"),
+    v("2:13", "2:11", "ELLIPSE"),
+    v("2:14", "2:1", "LINE"),
+    // Not drawings, however deep the reason: a text in a group in a group, an instance (its component names the
+    // icon), a filled frame with nothing in it (a background, as a rectangle is), and a frame painted with an image,
+    // whose own line still counts what it holds.
+    { id: "3:1", type: "GROUP", parent: "1:1", name: "Card" },
+    { id: "3:2", type: "GROUP", parent: "3:1", name: "art" },
+    v("3:3", "3:2"),
+    { id: "3:4", type: "GROUP", parent: "3:2", name: "caption" },
+    { id: "3:5", type: "TEXT", parent: "3:4", name: "text" },
+    v("3:6", "3:1"),
+    { id: "4:1", type: "GROUP", parent: "1:1", name: "Toolbar" },
+    { id: "4:2", type: "INSTANCE", parent: "4:1", name: "icon", symbolData: { symbolID: guid("9:1") } },
+    v("4:3", "4:2"),
+    v("4:4", "4:1"),
+    { id: "5:1", type: "GROUP", parent: "1:1", name: "Tile" },
+    { id: "5:2", type: "FRAME", parent: "5:1", name: "bg", fillPaints: [{ type: "SOLID" }] },
+    { id: "5:3", type: "GROUP", parent: "5:1", name: "glyph" },
+    v("5:4", "5:3"),
+    v("5:5", "5:3"),
+    { id: "6:1", type: "GROUP", parent: "1:1", name: "Photo" },
+    { id: "6:2", type: "FRAME", parent: "6:1", name: "frame", fillPaints: [{ type: "IMAGE" }] },
+    v("6:3", "6:2"),
+    v("6:4", "6:1"),
+    { id: "0:2", type: "CANVAS", parent: "0:0", name: "Icons" },
+    { id: "9:1", type: "SYMBOL", parent: "0:2", name: "Arrow" },
+    v("9:2", "9:1"),
+  ]);
+  const expected = [
+    '- 1:1 FRAME "Header"',
+    '  - 2:1 GROUP "Logo" 120x32 (7 vectors)',
+    '  - 3:1 GROUP "Card"',
+    '    - 3:2 GROUP "art"',
+    '      - 3:3 VECTOR "vector"',
+    '      - 3:4 GROUP "caption"',
+    '        - 3:5 TEXT "text"',
+    '    - 3:6 VECTOR "vector"',
+    '  - 4:1 GROUP "Toolbar"',
+    '    - 4:2 INSTANCE "icon" (of "Arrow", 1 vector)',
+    '    - 4:4 VECTOR "vector"',
+    '  - 5:1 GROUP "Tile"',
+    '    - 5:2 FRAME "bg"',
+    '    - 5:3 GROUP "glyph" (2 vectors)',
+    '  - 6:1 GROUP "Photo"',
+    '    - 6:2 FRAME "frame" (1 vector)',
+    '    - 6:4 VECTOR "vector"',
+  ];
+  assert.equal(outline(drawn, drawn.require("1:1"), 6, 400), expected.join("\n"));
+  // What a drawing holds spends none of max_nodes, so these lines fit their own count.
+  assert.doesNotMatch(outline(drawn, drawn.require("1:1"), 6, expected.length), /truncated|more|not shown/);
+  // Past the depth the count is still the whole drawing's, not its children's.
+  assert.match(outline(drawn, drawn.get(drawn.rootId)!, 2, 400), /\n {4}- 2:1 GROUP "Logo" 120x32 \(7 vectors\)\n/);
+  // A drawing has nothing to open, so the level under it needs no line for it: four layers, not five.
+  assert.equal(
+    outline(drawn, drawn.require("1:1"), 2, 7).split("\n").at(-1),
+    "... level 2 not shown: 4 layers have children, 1 of 7 lines left; open one with node_id, or pass max_nodes 14",
+  );
+  // The node asked for is always listed, and each layer under it counts its own part.
+  assert.equal(outline(drawn, drawn.require("2:1"), 6, 400), [
+    '- 2:1 GROUP "Logo" 120x32',
+    '  - 2:2 GROUP "Mark" (2 vectors)',
+    '  - 2:7 FRAME "Letters" (4 vectors)',
+    '  - 2:14 LINE "line"',
+  ].join("\n"));
+});

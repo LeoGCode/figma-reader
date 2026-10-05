@@ -606,8 +606,8 @@ tool(
     "line, a layer whose children were all left out says '(N children)', and the last line says it was truncated; when a " +
     "level could not give each of its layers one line, it is left out whole and the last line says so instead: 'level 2 " +
     "not shown: 162 layers have children, 214 of 400 lines left; open one with node_id, or pass max_nodes 494' (levels " +
-    "counted as depth counts them). A layer drawn only with vector shapes is one line counting them, '(27 vectors)': " +
-    "pass its node_id to list them. " +
+    "counted as depth counts them). A layer drawn only with vector shapes, however they are grouped, is one line " +
+    "counting them all, '(27 vectors)': pass its node_id to open it. " +
     EXPORTED_AT_NOTE,
   {
     file: fileArg,

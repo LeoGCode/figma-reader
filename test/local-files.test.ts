@@ -107,6 +107,35 @@ test("a temp image is created, never written through a name that is already ther
   }
 });
 
+test("a temp directory this process may not write is said in words, with what would let the image be saved", { skip: (!process.getuid || process.getuid() === 0) && "permissions do not bind here" }, () => {
+  // Raw, it was "EACCES: permission denied, mkdir '<dir>'", after the screenshot had already been taken.
+  const saved = process.env.TMPDIR;
+  const tmp = join(root, "tmp-read-only");
+  mkdirSync(tmp);
+  process.env.TMPDIR = tmp;
+  const dir = join(tmp, `figma-reader-${process.getuid!()}`);
+  const said = (e: Error) => {
+    assert.ok(e.message.startsWith(`an image given no --save-path is written to this user's own directory in the temp directory, ${dir}, which this process may not write (EACCES: `), e.message);
+    // No read stands in for an image, so it ends with what would save it, not with what reads without writing.
+    assert.ok(e.message.endsWith("Pass --save-path (save_path in a batch) in a directory this process may write, or set TMPDIR to one."), e.message);
+    return true;
+  };
+  try {
+    chmodSync(tmp, 0o555);
+    assert.throws(() => writePrivateTemp("screenshot", "png", new Uint8Array([1])), said);
+    // The directory can stand, and be this user's, and still not take the file.
+    chmodSync(tmp, 0o755);
+    writePrivateTemp("screenshot", "png", new Uint8Array([1]));
+    chmodSync(dir, 0o500);
+    assert.throws(() => writePrivateTemp("screenshot", "png", new Uint8Array([1])), said);
+  } finally {
+    chmodSync(tmp, 0o755);
+    if (readdirSync(tmp).length) chmodSync(dir, 0o700);
+    if (saved === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = saved;
+  }
+});
+
 test("imageExt recognises image-fill formats by their magic bytes", () => {
   const bytes = (...b: number[]) => new Uint8Array([...b, ...Array(12).fill(0)]);
   assert.equal(imageExt(bytes(0x89, 0x50, 0x4e, 0x47)), "png");

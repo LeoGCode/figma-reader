@@ -3,17 +3,18 @@
 import { after, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import {
-  chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync,
-  writeFileSync,
+  chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync,
+  utimesSync, writeFileSync,
 } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
-import { LEASE_BEAT_MS, pidNamespace, processStamp, takeLease } from "../src/browser.ts";
+import { basename, dirname, join } from "node:path";
+import { getHeapStatistics } from "node:v8";
+import { dropLease, LEASE_BEAT_MS, pidNamespace, processStamp, takeLease } from "../src/browser.ts";
 import { FigDocument } from "../src/fig-file.ts";
 import { cleanStaleDownloads, type FigmaWeb } from "../src/figma-web.ts";
-import { LEASE_POLL_MS, SnapshotStore } from "../src/store.ts";
-import { figBytes } from "./fixtures.ts";
+import { decodedBudget, LEASE_POLL_MS, SnapshotStore, weigh } from "../src/store.ts";
+import { figBytes, figDoc, nodeChanges, type TestNode } from "./fixtures.ts";
 
 const dirs: string[] = [];
 after(() => {
@@ -250,6 +251,110 @@ describe("SnapshotStore.get", () => {
     assert.notEqual(b, first, "B was dropped from memory");
     assert.equal(label(b), "export 2", "and decoded again from its own file");
     assert.deepEqual(x.calls, ["A", "B", "C"]);
+  });
+});
+
+// Four documents were kept whatever they weighed, and a decoded 67 MB export holds some 750 MB of heap: a batch or a
+// server over a few large files neared Node's heap limit. What is kept is bounded by what it weighs too.
+describe("SnapshotStore's budget for decoded documents", () => {
+  /** A .fig of one page holding `frames` frames. */
+  const local = (name: string, frames: number) => {
+    const path = join(tempDir(), `${name}.fig`);
+    const page = { id: "0:1", type: "CANVAS", parent: "0:0", name };
+    writeFileSync(path, figBytes([page, ...Array.from({ length: frames }, (_, i) => ({ id: `1:${i + 1}`, type: "FRAME", parent: "0:1", name: `frame ${i}` }))]));
+    return path;
+  };
+  const weightOf = (path: string) => weigh(FigDocument.fromFile(path, path, new Date()));
+
+  it("drops what it used longest ago once what it keeps outweighs the budget, and never the one just used", async () => {
+    const [s1, s2, big] = [local("small 1", 1), local("small 2", 1), local("big", 2000)];
+    // Room for the large one beside one small one, and not beside both.
+    const budget = weightOf(big) + weightOf(s1) + weightOf(s2) / 2;
+    const store = new SnapshotStore(exporter().web, tempDir(), HOUR, 4, undefined, budget);
+    const decode = mock.method(FigDocument, "fromFile");
+    try {
+      for (const path of [s1, s2, big, s2, s1, big]) await store.getLocal(path);
+      // The large one pushes out the small one used longest ago; the other small one, used since, stays; the first
+      // coming back pushes out the large one, then unused longest, which comes back decoded again.
+      assert.deepEqual(decode.mock.calls.map((c) => basename(c.arguments[1], ".fig")), ["small 1", "small 2", "big", "small 1", "big"]);
+    } finally {
+      decode.mock.restore();
+    }
+    // With no room at all, the file in use is still kept for the next call on it.
+    const none = new SnapshotStore(exporter().web, tempDir(), HOUR, 4, undefined, 0);
+    const kept = await none.getLocal(s1);
+    assert.equal(await none.getLocal(s1), kept, "the one just used stays, however little room there is");
+    await none.getLocal(s2);
+    assert.notEqual(await none.getLocal(s1), kept, "and goes once another is used");
+  });
+
+  it("weighs every node by what it decoded, its arrays, strings and byte arrays included, and images by their bytes", () => {
+    // A document, a page and fourteen text nodes: one node in sixteen, the document, was all a sample of them saw, so
+    // their payloads could grow by millions of values and the weight stayed that of an empty file.
+    const page: TestNode = { id: "0:1", type: "CANVAS", parent: "0:0", name: "Page" };
+    const texts = (payload: () => object): TestNode[] => [
+      page,
+      ...Array.from({ length: 14 }, (_, i): TestNode => ({ id: `1:${i + 1}`, type: "TEXT", parent: "0:1", name: `t${i}`, ...payload() })),
+    ];
+    const n = 50_000;
+    const light = weigh(figDoc(texts(() => ({ textData: { characters: "a", characterStyleIDs: [0] } }))));
+    const grown = (payload: () => object) => weigh(figDoc(texts(payload))) - light;
+    // An array element takes 8 bytes at the least, a character and a byte one each: the weight grows by that much.
+    assert.ok(grown(() => ({ textData: { characters: "a", characterStyleIDs: Array(n).fill(1) } })) >= 14 * (n - 1) * 8);
+    assert.ok(grown(() => ({ textData: { characters: "a".repeat(n), characterStyleIDs: [0] } })) >= 14 * (n - 1));
+    assert.ok(grown(() => ({ textData: { characters: "a", characterStyleIDs: [0] }, vectorData: { blob: new Uint8Array(n) } })) >= 14 * n);
+    // And it is the nodes it counts, not the file: twice the frames, twice the weight (their ids are a digit longer).
+    const frames = (count: number): TestNode[] => [page, ...Array.from({ length: count }, (_, i): TestNode => ({ id: `2:${i + 1}`, type: "FRAME", parent: "0:1", name: "f" }))];
+    const [none, one, two] = [0, 1600, 3200].map((count) => weigh(figDoc(frames(count))));
+    assert.ok(Math.abs((two - none) / (one - none) - 2) < 0.01, `${two - none} / ${one - none}`);
+    // An image is kept as its bytes, so it weighs those, however well the .fig compressed them.
+    const image = new FigDocument("k", new Date(0), { nodeChanges: nodeChanges([page]), images: new Map([["ab", new Uint8Array(1_000_000)]]) });
+    assert.equal(weigh(image) - weigh(figDoc([page])), 1_000_000);
+  });
+
+  it("lets a file of few nodes and a large payload push the others out, as its weight says", async () => {
+    // The same sixteen nodes, encoded and decoded as an export is, with 20,000 style ids on each text node in the large
+    // one: it does not fit a budget of 1 MB beside anything, so it is kept alone, and goes when another is read.
+    const schema = `
+      struct GUID { uint sessionID; uint localID; }
+      message ParentIndex { GUID guid = 1; string position = 2; }
+      message TextData { string characters = 1; uint[] characterStyleIDs = 2; }
+      message NodeChange { GUID guid = 1; ParentIndex parentIndex = 2; string type = 3; string name = 4; TextData textData = 5; }
+      message Message { NodeChange[] nodeChanges = 1; }
+    `;
+    const textFile = (name: string, ids: number) => {
+      const path = join(tempDir(), `${name}.fig`);
+      const texts = Array.from({ length: 14 }, (_, i): TestNode => ({
+        id: `1:${i + 1}`, type: "TEXT", parent: "0:1", name: `t${i}`, textData: { characters: "a", characterStyleIDs: Array(ids).fill(1) },
+      }));
+      writeFileSync(path, figBytes([{ id: "0:1", type: "CANVAS", parent: "0:0", name }, ...texts], { schema }));
+      return path;
+    };
+    const [light1, light2, heavy] = [textFile("light 1", 1), textFile("light 2", 1), textFile("heavy", 20_000)];
+    assert.equal(FigDocument.fromFile(heavy, heavy, new Date()).get("1:1")!.textData.characterStyleIDs.length, 20_000, "decoded as written");
+    const store = new SnapshotStore(exporter().web, tempDir(), HOUR, 4, undefined, 2 ** 20);
+    const decode = mock.method(FigDocument, "fromFile");
+    try {
+      for (const path of [light1, light2, heavy, light1, light2]) await store.getLocal(path);
+      assert.deepEqual(decode.mock.calls.map((c) => basename(c.arguments[1], ".fig")), ["light 1", "light 2", "heavy", "light 1", "light 2"]);
+    } finally {
+      decode.mock.restore();
+    }
+  });
+
+  it("takes its budget from FIGMA_DECODED_MAX_MB, else half the heap limit, and says so of a value that is no number", () => {
+    const half = getHeapStatistics().heap_size_limit / 2;
+    assert.equal(decodedBudget({}), half);
+    assert.equal(decodedBudget({ FIGMA_DECODED_MAX_MB: "512" }), 512 * 2 ** 20);
+    assert.equal(decodedBudget({ FIGMA_DECODED_MAX_MB: "0" }), 0, "keep only the file in use");
+    const said = mock.method(process.stderr, "write", () => true);
+    try {
+      for (const raw of ["", "1.5GB", "-1"]) assert.equal(decodedBudget({ FIGMA_DECODED_MAX_MB: raw }), half, raw);
+      assert.equal(said.mock.callCount(), 3);
+      assert.match(String(said.mock.calls[1].arguments[0]), /^figma-reader: FIGMA_DECODED_MAX_MB="1\.5GB" is not a number of MB; using \d+\n$/);
+    } finally {
+      said.mock.restore();
+    }
   });
 });
 
@@ -868,9 +973,12 @@ describe("SnapshotStore between processes", () => {
     const current = await store.get("K", true);
     const decode = mock.method(FigDocument, "fromFile");
     try {
-      assert.equal(await store.getLocal(store.figPath("K")), current, "the key and its path are one document");
+      const byPath = await store.getLocal(store.figPath("K"));
+      assert.equal(byPath.nodes, current.nodes, "the key and its path are one decode");
+      assert.deepEqual([byPath.fileKey, current.fileKey], [store.figPath("K"), "K"], "each answered under its own name");
+      assert.equal(await store.getLocal(store.figPath("K")), byPath, "and the same copy each time it is named so");
       const prev = await store.previousOf("K", current);
-      assert.notEqual(prev, current);
+      assert.notEqual(prev!.nodes, current.nodes);
       assert.deepEqual([label(prev!), label(current)], ["export 1", "export 2"]);
       // Read by its own path afterwards, the previous snapshot is that same decode, and still not the current one.
       assert.equal(await store.getLocal(store.previousPath("K")), prev);
@@ -1224,6 +1332,166 @@ describe("SnapshotStore beside another process's sweep", () => {
       }
     },
   );
+
+  it("sweeps the lock directories a crash left, and none that anyone holds, however old they look", () => {
+    // The publish lock is staged as a directory holding its holder's lease and renamed onto the lock; a crash before
+    // the rename left the staged one for good, a crash while holding left the lock, and diff previous left its reader
+    // directory behind. Judged by leases, never by age: every directory here is an hour old by its mtime, as one is on
+    // a filesystem whose clock runs an hour behind, or whose owner was stopped for an hour.
+    const dir = tempDir();
+    const exports = join(dir, "exports");
+    const past = new Date(Date.now() - HOUR);
+    const planted = (name: string, lease?: string, stamp = processStamp(process.pid)) => {
+      const path = join(exports, name);
+      mkdirSync(path, { recursive: true });
+      if (lease) writeFileSync(join(path, lease), stamp);
+      utimesSync(path, past, past);
+      return path;
+    };
+    // The leases of an export and of a diff previous running here, which a staged lock carrying their pid and tag
+    // belongs to before its own lease is in it.
+    const callers = [
+      takeLease(join(exports, "M"), `${process.pid}-${Date.now()}-uv12wx`),
+      takeLease(join(exports, "N.reading"), `${process.pid}-${Date.now()}-gh78ij`),
+    ];
+    try {
+      // pid 1 is alive but did not write this stamp, which is how liveLeases tells a holder that died.
+      const gone = [
+        planted("K.publish.1.ab12cd", "1-ab12cd"),
+        // Staged and left before its lease went in, by a process whose own lease is gone.
+        planted("K.publish.4242.ef34gh"),
+        planted("K.publish", "1-ij56kl"),
+        planted("K.reading", `1-${Date.now()}-mn78op`),
+        planted("L.reading"),
+      ];
+      const held = [
+        planted(`L.publish.${process.pid}.qr90st`, `${process.pid}-qr90st`),
+        // Staged, its lease not in it yet: the export and the diff previous it is staged for are still running.
+        planted(`M.publish.${process.pid}.uv12wx`),
+        planted(`N.publish.${process.pid}.gh78ij`),
+        planted("L.publish", `${process.pid}-yz34ab`),
+        planted("M.reading", `${process.pid}-${Date.now()}-cd56ef`),
+        // An export's own lease directory, which every export of the key uses again.
+        planted("K"),
+      ];
+      cleanStaleDownloads(dir);
+      assert.deepEqual(gone.filter((p) => existsSync(p)).map((p) => basename(p)), [], "left with nobody holding them");
+      assert.deepEqual(held.filter((p) => !existsSync(p)).map((p) => basename(p)), [], "removed while held");
+    } finally {
+      callers.forEach(dropLease);
+    }
+  });
+
+  /**
+   * A refresh of K run with `during(staged)` called right after each staging of its publish lock is made, before its
+   * lease goes in, and the sweep run there - by a clock `ahead` ms ahead of this one - and right after the lease:
+   * whether the swap onto the snapshot was made holding the lock, and how many stagings it took. The lock's ceiling
+   * is two seconds, past which the swap goes ahead without it: a staging taken away every time it is made ends there
+   * rather than ten minutes on.
+   */
+  const publishBesideSweeps = async ({ during = (_staged: string) => {}, ahead = 0 } = {}) => {
+    const x = exporter();
+    const dir = tempDir();
+    const store = new SnapshotStore(x.web, dir, HOUR, 4, 2000);
+    await store.get("K");
+    const fs = createRequire(import.meta.url)("node:fs");
+    const real = { mkdirSync: fs.mkdirSync, writeFileSync: fs.writeFileSync, renameSync: fs.renameSync };
+    const staging = (path: unknown) => /\.publish\.\d+\.[a-z0-9]+$/.test(String(path));
+    let stagings = 0;
+    const lockedAtSwap: boolean[] = [];
+    fs.mkdirSync = (path: string, ...rest: unknown[]) => {
+      const made = real.mkdirSync(path, ...rest);
+      if (staging(path)) {
+        stagings++;
+        during(String(path));
+        const now = Date.now() + ahead;
+        const clock = mock.method(Date, "now", () => now);
+        try {
+          cleanStaleDownloads(dir);
+        } finally {
+          clock.mock.restore();
+        }
+      }
+      return made;
+    };
+    fs.writeFileSync = (path: string, ...rest: unknown[]) => {
+      real.writeFileSync(path, ...rest);
+      if (staging(dirname(String(path)))) cleanStaleDownloads(dir);
+    };
+    fs.renameSync = (from: string, to: string) => {
+      if (to === store.figPath("K")) lockedAtSwap.push(existsSync(join(dir, "exports", "K.publish")));
+      return real.renameSync(from, to);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(label(await store.get("K", true)), "export 2");
+    } finally {
+      Object.assign(fs, real);
+      syncBuiltinESMExports();
+    }
+    assert.deepEqual(readdirSync(join(dir, "exports")), ["K"], "nothing of the lock left behind");
+    return { stagings, lockedAtSwap };
+  };
+
+  it("never takes a staged publish lock from its owner, before its lease is in it included, whatever the clocks say", async () => {
+    // The one moment a staged lock holds no lease of its own is its owner's, between its mkdir and its lease, and the
+    // sweep judged it there by its age: a minute. A filesystem two minutes behind this process's clock, or an owner
+    // stopped for two minutes in that moment, made it a crash's, and the sweep removed it from under its owner.
+    const minutes = (n: number) => n * 60_000;
+    const behind = await publishBesideSweeps({
+      during: (staged) => {
+        const then = new Date(Date.now() - minutes(2));
+        utimesSync(staged, then, then);
+      },
+    });
+    assert.deepEqual(behind, { stagings: 1, lockedAtSwap: [true] }, "on a filesystem whose clock runs behind");
+    // The sweep runs two minutes after the mkdir, as one would while the owner was stopped there.
+    const stopped = await publishBesideSweeps({ ahead: minutes(2) });
+    assert.deepEqual(stopped, { stagings: 1, lockedAtSwap: [true] }, "with its owner stopped between its mkdir and its lease");
+  });
+
+  it("stages its publish lock again when the staging is taken away, rather than publish without the lock", async () => {
+    // Taken away twice running, a staging counted as a lock that cannot be taken at all, and the swap went ahead
+    // without one: what an age-judging sweep did to a live owner. Three times here, by anything that removes it.
+    let removals = 0;
+    const result = await publishBesideSweeps({
+      during: (staged) => {
+        if (removals++ < 3) rmSync(staged, { recursive: true });
+      },
+    });
+    assert.deepEqual(result, { stagings: 4, lockedAtSwap: [true] });
+  });
+
+  it("leaves no reader directory behind diff previous, and a reader arriving as the last one leaves takes its lease", async () => {
+    // The last reader out removes the directory, and that can land between the next reader's mkdir and its lease,
+    // which then found no directory to write in: diff previous failed with ENOENT.
+    const { dir, store, current } = await pair();
+    const readers = join(dir, "exports", "K.reading");
+    assert.equal(label((await store.previousOf("K", current))!), "export 1");
+    assert.ok(!existsSync(readers), "its reader directory went with its last reader");
+    const fs = createRequire(import.meta.url)("node:fs");
+    const real = fs.writeFileSync;
+    let writes = 0;
+    fs.writeFileSync = (path: string, ...rest: unknown[]) => {
+      // The other reader's rmdir, landing after this one's mkdir: once, which is what one other reader leaving does.
+      if (dirname(String(path)) === readers && !writes++) rmdirSync(readers);
+      return real(path, ...rest);
+    };
+    syncBuiltinESMExports();
+    try {
+      assert.equal(label((await store.previousOf("K", current))!), "export 1");
+    } finally {
+      fs.writeFileSync = real;
+      syncBuiltinESMExports();
+    }
+    assert.equal(writes, 2, "the directory was removed under its lease, which was written again once it was made again");
+    assert.ok(!existsSync(readers));
+    // A reader that crashed holding its lease does not keep the directory for good: the next one out judges it.
+    mkdirSync(readers);
+    writeFileSync(join(readers, `1-${Date.now()}-crashed`), processStamp(process.pid));
+    assert.equal(label((await store.previousOf("K", current))!), "export 1");
+    assert.ok(!existsSync(readers));
+  });
 
   it("fails diff previous on a lease it cannot take for any other reason, rather than link without one", async () => {
     const { dir, store, current } = await pair();

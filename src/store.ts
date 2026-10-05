@@ -1,6 +1,7 @@
 // Snapshot cache: the latest exported .fig per file key on disk, and the one it replaced; decoded documents in memory.
-import { existsSync, linkSync, mkdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { getHeapStatistics } from "node:v8";
 import { cannotWrite, mayNotWrite } from "./account.ts";
 import { dropLease, liveLeases, processStamp, takeLease } from "./browser.ts";
 import { FigDocument } from "./fig-file.ts";
@@ -45,11 +46,122 @@ const STAGED = /^([A-Za-z0-9]+)\.(?:previous\.)?fig\.(\d+)\.([a-z0-9]+)\.tmp/;
  */
 export function stagedByLiveOwner(dir: string, name: string): boolean {
   const m = STAGED.exec(name);
-  if (!m) return false;
-  const [, fileKey, pid, tag] = m;
+  return !!m && claimed(dir, m[1], m[2], m[3]);
+}
+
+/** A live lease of an export or of a diff previous of `fileKey` carries this pid and tag (see stagedByLiveOwner). */
+function claimed(dir: string, fileKey: string, pid: string, tag: string): boolean {
   return [exportLeases(dir, fileKey), readerLeases(dir, fileKey)].some((leases) =>
     liveLeases(leases).some((lease) => lease.split("-")[0] === pid && lease.endsWith(`-${tag}`)),
   );
+}
+
+/**
+ * A key's publish lock as underPublishLock stages it, "<key>.publish.<pid>.<tag>", before renaming it onto the lock:
+ * the pid and tag of the lease its caller holds throughout, the export's own or previousOf's.
+ */
+const STAGED_LOCK = /^([A-Za-z0-9]+)\.publish\.(\d+)\.([a-z0-9]+)$/;
+/** The lock itself, and the directory of a key's reader leases (see previousOf). */
+const LOCK_OR_READERS = /^[A-Za-z0-9]+\.(?:publish|reading)$/;
+
+/**
+ * Remove the lock directories nobody holds from the snapshot directory `dir`: a publish lock a crash left staged, or
+ * held, and a key's reader-lease directory with no reader left in it. Swept with the staging files
+ * (cleanStaleDownloads), by the calls that reach the browser. Each is judged by leases, as liveLeases judges every
+ * lease here, and rmdir is the only removal, so a lease written into one meanwhile always keeps it.
+ *
+ * A staged lock is made, given its holder's lease and renamed onto the lock within a few file operations: a crash in
+ * between leaves it, and nothing ever looked at that name again. Its own lease goes in only after it is made, so its
+ * name says whose it is before that: the pid and tag of the lease its caller holds from before the lock is staged to
+ * after it is given back (see underPublishLock), the lease stagedByLiveOwner judges staging files by. Either lease live
+ * keeps it, however old the directory looks; with neither, its owner is gone. Its age was the rule, a minute for one
+ * holding no lease yet, and an age holds a filesystem's clock against this process's: on a shared filesystem two
+ * minutes behind, or with its owner stopped for over a minute between its mkdir and its lease, the sweep removed a live
+ * owner's staging. The lock itself and a reader-lease directory hold a lease whenever anyone holds them, so an empty
+ * one is held by nobody: the lock comes into being by a rename that carries its holder's lease in (underPublishLock
+ * clears an empty one the same way), and a reader that arrives as its directory is removed makes it again (see
+ * takeLease). An export's own lease directory is left alone.
+ */
+export function cleanStaleLocks(dir: string) {
+  const exports = join(dir, "exports");
+  let names: string[];
+  try {
+    names = readdirSync(exports);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const staged = STAGED_LOCK.exec(name);
+    if (!staged && !LOCK_OR_READERS.test(name)) continue;
+    const path = join(exports, name);
+    try {
+      if (!statSync(path).isDirectory() || liveLeases(path).length) continue;
+      if (staged && claimed(dir, staged[1], staged[2], staged[3])) continue;
+      rmdirSync(path);
+    } catch {}
+  }
+}
+
+/**
+ * What one decoded value takes in memory, about: an object, a key, an array element, a number or a boolean, counted
+ * as bytesOf counts them, with a string's and a byte array's length on top (see weigh for how near that comes).
+ */
+const BYTES_PER_VALUE = 24;
+
+/** About how many bytes `v` takes: BYTES_PER_VALUE for each value in it, itself included, and its strings' and byte arrays' lengths. */
+function bytesOf(v: unknown): number {
+  if (typeof v === "string") return BYTES_PER_VALUE + v.length;
+  if (v === null || typeof v !== "object") return BYTES_PER_VALUE;
+  if (ArrayBuffer.isView(v)) return BYTES_PER_VALUE + v.byteLength;
+  let n = BYTES_PER_VALUE;
+  if (Array.isArray(v)) for (let i = 0; i < v.length; i++) n += bytesOf(v[i]);
+  else for (const k in v) n += BYTES_PER_VALUE + bytesOf((v as Record<string, unknown>)[k]);
+  return n;
+}
+
+/**
+ * About how many bytes the decoded `doc` keeps in memory, which is what the store's budget is spent on (see remember):
+ * every value of every node (see bytesOf), and the bytes of its images.
+ *
+ * Neither the file's size nor the heap says it. A .fig is a zip of the canvas and its images, and on twelve real
+ * exports the heap a document kept ran from 0.2 to 62 times its file's size: a 171 MB file kept 28 MB, a 21 MB one 621
+ * MB. The heap's growth across a decode came within 7-17% of what the document kept in a fresh process, and wrong in a
+ * process that had been working, the one this is for: the documents it had dropped were collected during the next
+ * decode, and one keeping 471 MB grew the heap by -940 MB. This came to 0.82-1.31 times what each of those exports
+ * kept (heap and image bytes) among the seven keeping over 100 MB, and 0.75-1.23 for the rest.
+ *
+ * Every node is walked. Counting one in sixteen and scaling was a tenth of the cost and blind to what the other
+ * fifteen hold: a page of fourteen text nodes holding 3.5 million style ids between them weighed what an empty one
+ * does, and four of them, 150 MB, sat in a budget of 1 MB. Walking took 200-420 ms on the large exports, a tenth to a
+ * fifth of their decode, and it cannot cost more than the decode that made what it walks. Weighing the elements of a
+ * long array by a few of them was slower there, not faster: the time goes on the many small objects of every node.
+ */
+export function weigh(doc: FigDocument): number {
+  let n = 0;
+  for (const node of doc.nodes.values()) n += bytesOf(node);
+  for (const bytes of doc.images.values()) n += bytes.byteLength;
+  return n;
+}
+
+/**
+ * How many bytes of decoded documents a store keeps between calls (see remember): FIGMA_DECODED_MAX_MB, else half of
+ * this process's heap limit, which Node sets from the machine's memory (4 GB with 16 GB or more, 2 GB with 8). Four
+ * files were kept whatever they weighed, and a decoded 67 MB export keeps about 750 MB of heap: with a 2 GB limit, a
+ * batch over four large real exports by path ran out of heap at the fourth, and with 4 GB, one over five peaked at
+ * 3.8 GB of RSS (3.0 GB under this budget). Half leaves the other half to the decode under way, which is not counted
+ * until it is done, and to the call's own work; weigh's estimate is within a third of what a document keeps. A value
+ * that is not a number of MB is said on stderr and replaced by the default, as FIGMA_SNAPSHOT_MAX_AGE_MIN's is.
+ */
+export function decodedBudget(env: NodeJS.ProcessEnv = process.env): number {
+  const fallback = getHeapStatistics().heap_size_limit / 2;
+  const raw = env.FIGMA_DECODED_MAX_MB;
+  if (raw === undefined) return fallback;
+  const mb = Number(raw);
+  if (raw.trim() === "" || !Number.isFinite(mb) || mb < 0) {
+    process.stderr.write(`figma-reader: FIGMA_DECODED_MAX_MB=${JSON.stringify(raw)} is not a number of MB; using ${Math.round(fallback / 2 ** 20)}\n`);
+    return fallback;
+  }
+  return mb * 2 ** 20;
 }
 
 /**
@@ -129,6 +241,10 @@ export class SnapshotStore {
   private docs = new Map<string, FigDocument>();
   /** The file each document was decoded from, as seen then: another process can replace it in a shared cache dir. */
   private stamps = new WeakMap<FigDocument, string>();
+  /** What each decoded document keeps in memory (see weigh). */
+  private weights = new WeakMap<FigDocument, number>();
+  /** Each document under the other names it was asked for by, one per name (see named). */
+  private aliases = new WeakMap<FigDocument, Map<string, FigDocument>>();
   /** Loads in progress, at most one per key: a new one is only ever queued behind the one already there. */
   private inflight = new Map<string, Inflight>();
 
@@ -137,17 +253,20 @@ export class SnapshotStore {
   private maxAgeMs: number;
   private maxDocs: number;
   private otherExportWaitMs: number;
+  private maxBytes: number;
 
   /**
    * `otherExportWaitMs` is a parameter only so that a test can reach the ceiling: what it leaves behind is an
    * export still running that this one has to answer around, and no test can wait out the ten real minutes.
+   * `maxDocs` and `maxBytes` bound the documents kept decoded, by number and by what they weigh (see remember).
    */
-  constructor(web: Exporter, dir: string, maxAgeMs: number, maxDocs = 4, otherExportWaitMs = OTHER_EXPORT_WAIT_MS) {
+  constructor(web: Exporter, dir: string, maxAgeMs: number, maxDocs = 4, otherExportWaitMs = OTHER_EXPORT_WAIT_MS, maxBytes = decodedBudget()) {
     this.web = web;
     this.dir = dir;
     this.maxAgeMs = maxAgeMs;
     this.maxDocs = maxDocs;
     this.otherExportWaitMs = otherExportWaitMs;
+    this.maxBytes = maxBytes;
   }
 
   figPath(fileKey: string) {
@@ -189,19 +308,42 @@ export class SnapshotStore {
    *
    * A snapshot of ours goes by two names: its key, and its path, which getLocal keeps under the real path. Reading by
    * key and then by that path is how a task pins itself to one snapshot, and it decoded the same file twice and kept
-   * both. Under either name, a document kept under the other is that same file when its stamp agrees. Which name the
-   * caller used still decides how the answer is dated (open in tools.ts), and both read the one file time.
+   * both. Under either name, a document kept under the other is that same file when its stamp agrees, and it is
+   * answered under the name asked for (see named). Which name the caller used still decides how the answer is dated
+   * (open in tools.ts), and both read the one file time.
    */
   private fromDisk(fileKey: string, path: string): FigDocument {
     const st = statSync(path);
     const stamp = `${st.mtimeMs}:${st.size}`;
     for (const name of [fileKey, this.otherName(fileKey, path)]) {
       const cached = name === undefined ? undefined : this.docs.get(name);
-      if (cached && this.stamps.get(cached) === stamp) return this.remember(cached);
+      if (cached && this.stamps.get(cached) === stamp) return this.named(this.remember(cached), fileKey);
     }
     const doc = FigDocument.fromFile(fileKey, path, st.mtime);
     this.stamps.set(doc, stamp);
     return this.remember(doc);
+  }
+
+  /**
+   * `doc` under the name `fileKey`, which is how the caller named the file: a document carries the name it was decoded
+   * under, and its errors name the file by it. Sharing one decode between a key and its snapshot's path made a node
+   * missing from that path, read after the key, "not found in file <key>", a name the caller had not used. The copy
+   * shares everything decoded, the very maps and nodes, and differs only in its name, so nothing is decoded or kept
+   * twice; FigDocument keeps all of it in plain fields, which is what lets a copy of them be the same document. One per
+   * name, kept with the document, so that what the other modules work out once per document and keep by it (the
+   * instance-text indexes) is worked out once per name rather than on every call.
+   */
+  private named(doc: FigDocument, fileKey: string): FigDocument {
+    if (doc.fileKey === fileKey) return doc;
+    let byName = this.aliases.get(doc);
+    if (!byName) this.aliases.set(doc, (byName = new Map()));
+    let alias = byName.get(fileKey);
+    if (!alias) {
+      alias = Object.assign(Object.create(FigDocument.prototype) as FigDocument, doc, { fileKey });
+      this.stamps.set(alias, this.stamps.get(doc)!);
+      byName.set(fileKey, alias);
+    }
+    return alias;
   }
 
   /**
@@ -350,7 +492,7 @@ export class SnapshotStore {
       const doc = FigDocument.fromFile(fileKey, mine, st.mtime);
       this.stamps.set(doc, `${st.mtimeMs}:${st.size}`);
       // Only an export that decoded gets this far, so one that failed leaves the snapshot and the previous one alone.
-      await this.underPublishLock(fileKey, () => this.publish(fileKey, mine, tag));
+      await this.underPublishLock(fileKey, tag, () => this.publish(fileKey, mine, tag));
       return this.remember(doc);
     } catch (e) {
       // From here on a failed write may be the browser's or the download directory's, each worded where it happens:
@@ -440,7 +582,7 @@ export class SnapshotStore {
       throw e;
     }
     try {
-      const kept = await this.underPublishLock(fileKey, () => {
+      const kept = await this.underPublishLock(fileKey, tag, () => {
         try {
           linkSync(this.previousPath(fileKey), was);
         } catch (e) {
@@ -470,6 +612,15 @@ export class SnapshotStore {
       rmSync(now, { force: true });
       rmSync(was, { force: true });
       dropLease(lease);
+      // The last reader out removes the directory, which an export never looks in: it was left behind, empty, by
+      // every diff previous. liveLeases first, so that the lease of a reader that crashed is not what keeps it. A
+      // reader arriving meanwhile has its lease in it (rmdir takes only an empty one), or makes it again (takeLease).
+      const readers = readerLeases(this.dir, fileKey);
+      if (!liveLeases(readers).length) {
+        try {
+          rmdirSync(readers);
+        } catch {}
+      }
     }
   }
 
@@ -519,10 +670,17 @@ export class SnapshotStore {
    *
    * Waiting has the export wait's ceiling, past which the step runs without the lock, as every publish did before
    * there was one; so does a lock that cannot be taken at all, since that is no reason to fail an export.
+   *
+   * `tag` is the tag of the lease the caller holds from before this to after it, the export's own or previousOf's: the
+   * staged lock is named by it, so that a sweep can tell it is in use before its own lease is in it (see
+   * cleanStaleLocks). A staged lock that is taken away before it becomes the lock was not refused, and is staged again,
+   * within the same ceiling. It used to count as a lock that cannot be taken at all, and twice running sent the step
+   * ahead without one: a sweep that judged it by its age did that to a live owner on a filesystem whose clock ran
+   * behind. Failing instead at the ceiling would throw away a finished export to protect only the pairing of the
+   * previous snapshot, which the ceiling already gives up for a holder that never lets go.
    */
-  private async underPublishLock<T>(fileKey: string, step: () => T): Promise<T> {
+  private async underPublishLock<T>(fileKey: string, tag: string, step: () => T): Promise<T> {
     const lock = this.publishLock(fileKey);
-    const tag = Math.random().toString(36).slice(2, 8);
     const name = `${process.pid}-${tag}`;
     const staged = `${lock}.${process.pid}.${tag}`;
     const deadline = Date.now() + this.otherExportWaitMs;
@@ -530,15 +688,25 @@ export class SnapshotStore {
     for (let missing = 0; ; ) {
       // Whether this process could stage a lock of its own at all, which a cache it may only read refuses.
       let staging = false;
+      // Whether it had made the staged lock and found it gone before it became the lock (see above).
+      let made = false;
+      let vanished = false;
       try {
         mkdirSync(staged, { recursive: true });
+        made = true;
         writeFileSync(join(staged, name), processStamp(process.pid));
         staging = true;
         renameSync(staged, lock);
         held = true;
         break;
-      } catch {
+      } catch (e) {
+        vanished = made && (e as NodeJS.ErrnoException | null)?.code === "ENOENT";
         rmSync(staged, { recursive: true, force: true });
+      }
+      if (vanished) {
+        if (Date.now() > deadline) break;
+        await sleep(PUBLISH_POLL_MS);
+        continue;
       }
       if (!existsSync(lock)) {
         // Nothing stood in the way, so the lock cannot be taken here at all; a lock released at that instant is the
@@ -571,11 +739,28 @@ export class SnapshotStore {
     }
   }
 
-  /** Keep a document, as the most recently used: when over maxDocs, the least recently used is dropped. */
+  /**
+   * Keep a document, as the most recently used: while more than maxDocs are kept, or more than maxBytes of them by
+   * weight (see weigh), the least recently used is dropped. Never the one just used, however much it weighs alone: a
+   * file larger than the whole budget is then decoded once for a run of calls on it, rather than once for every call.
+   * Small files are kept four at a time, as before; a 67 MB export weighs about 1 GB, so under a 4 GB heap limit the
+   * default budget keeps two.
+   */
   private remember(doc: FigDocument) {
     this.docs.delete(doc.fileKey);
     this.docs.set(doc.fileKey, doc);
-    while (this.docs.size > this.maxDocs) this.docs.delete(this.docs.keys().next().value!);
+    const weight = () => [...this.docs.values()].reduce((sum, d) => sum + this.weightOf(d), 0);
+    while (this.docs.size > 1 && (this.docs.size > this.maxDocs || weight() > this.maxBytes)) this.docs.delete(this.docs.keys().next().value!);
     return doc;
+  }
+
+  /**
+   * What `doc` weighs, worked out the first time it is asked, which is when a second document is kept beside it: a
+   * process that reads one file, as every single CLI call does, never pays for it (200-420 ms on a large export).
+   */
+  private weightOf(doc: FigDocument): number {
+    let weight = this.weights.get(doc);
+    if (weight === undefined) this.weights.set(doc, (weight = weigh(doc)));
+    return weight;
   }
 }

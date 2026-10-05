@@ -42,7 +42,7 @@ JSON on stdout unless marked text; exit 0 ok, 1 failed (message on stderr), 2 ba
 - `diff`: `{old{D}, new{D}, counts, byPage, layers{added, removed, renamed, moved}, removedNodes[{id, page, path, removedCount}], truncated}`; `changes`: `{D, total, byPage, layers[{id, name, page, lastEditedAt, created, editedNodes}]}`.
 - Any other command, key or flag: read `references/output.md` (beside this file) first.
 
-**batch**: one JSON call per stdin line, `{"tool": "locate", "args": {"file": "<file>", "node_ids": ["1:2", "3:4"]}}`: MCP argument names, JSON types (`figma-reader help batch` lists the arrays). One decode for all; one line back per call, `{"i": 0, "ok": true, "result": <its JSON, or text as a string>}` or `{"i": 1, "ok": false, "error": "…"}`; exit 1 if any failed, 2 if any was refused for want of an account. Pipe it through `jq`, or into a file you query: a long answer is cut before you see it.
+**batch**: one JSON call per stdin line, `{"tool": "locate", "args": {"file": "<file>", "node_ids": ["1:2", "3:4"]}}`: MCP argument names, JSON types (`figma-reader help batch` lists the arrays). Calls grouped by file decode it once; one line back per call, `{"i": 0, "ok": true, "result": <its JSON, or text as a string>}` or `{"i": 1, "ok": false, "error": "…"}`; exit 1 if any failed, 2 if any was refused for want of an account. Pipe it to `jq` or a file you query: a long answer is cut before you see it.
 
 ## Rules
 

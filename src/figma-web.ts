@@ -6,7 +6,7 @@ import { cannotWrite } from "./account.ts";
 import { bootId, BrowserManager, dropLease, liveLeases, pidNamespace, processStart, sameBoot, sameProcess, takeLease } from "./browser.ts";
 import { CdpSession, MOD, sleep, type TargetInfo } from "./cdp.ts";
 import type { Raw } from "./fig-file.ts";
-import { stagedByLiveOwner } from "./store.ts";
+import { cleanStaleLocks, stagedByLiveOwner } from "./store.ts";
 
 const ORIGIN = "https://www.figma.com";
 // Each server process owns one editor tab, marked through window.name with its pid.
@@ -798,10 +798,12 @@ export class FigmaWeb {
 const HALF_COPIED = /\.fig\.\d+(?:\.[a-z0-9]+)?\.tmp(?:\.\d+\.[a-z0-9]+\.tmp)?$/;
 
 /**
- * Remove leftovers of exports that never finished: old per-export dirs, half-copied snapshots, and downloads/
- * when no export is running.
+ * Remove leftovers of exports that never finished: old per-export dirs, half-copied snapshots, downloads/ when no
+ * export is running, and the lock directories nobody holds (see cleanStaleLocks).
  */
 export function cleanStaleDownloads(dir: string) {
+  // First, and apart from the rest, which returns early while an export holds a download lease.
+  cleanStaleLocks(dir);
   try {
     const names = readdirSync(dir);
     for (const f of names) if (f.startsWith("dl-")) rmSync(join(dir, f), { recursive: true, force: true });

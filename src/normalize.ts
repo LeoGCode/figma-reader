@@ -219,6 +219,66 @@ export class Normalizer {
     return out;
   }
 
+  private categories?: Map<string, string>;
+
+  /**
+   * Dev Mode annotations: the note a designer pins on a layer, and the properties it asks Dev Mode to show beside it.
+   * An annotation with an empty label is a properties-only one, which is the common kind.
+   */
+  annotations(n: FigNode): Raw[] | undefined {
+    const list: Raw[] = n.annotations ?? [];
+    if (!list.length) return undefined;
+    // Category names live once on the document, keyed by the id each annotation names.
+    if (!this.categories) {
+      this.categories = new Map();
+      for (const c of this.doc.get(this.doc.rootId)?.annotationCategories?.items ?? []) {
+        const name = c.preset && c.preset !== "NONE" ? `${c.preset[0]}${c.preset.slice(1).toLowerCase()}` : c.custom?.label;
+        if (guidId(c.id) && name) this.categories.set(guidId(c.id)!, name);
+      }
+    }
+    return list.map((a) => {
+      const category = guidId(a.categoryId);
+      return prune({
+        label: annotationLabel(a.labelV2) ?? annotationLabel(a.label),
+        // A category the document does not name is kept as its id rather than dropped, so the grouping still shows.
+        category: category ? this.categories!.get(category) : undefined,
+        categoryId: category && !this.categories!.has(category) ? category : undefined,
+        properties: (a.properties ?? []).map((p: Raw) => p.type).filter(Boolean),
+      });
+    });
+  }
+
+  /**
+   * Dev Mode measurements: a distance the designer pinned from one side of this layer to a side of another, or of
+   * itself. What Figma stores is the two nodes and the sides, not the distance, so that is what is reported.
+   */
+  measurements(n: FigNode): Raw[] | undefined {
+    const list: Raw[] = n.measurements ?? [];
+    if (!list.length) return undefined;
+    // 0xFFFFFFFF in both halves is Figma's "no node", and toNode holds it in every measurement seen so far: the
+    // target is in toNodeStablePath instead, and fromNode is left out because the measurement is on its from node.
+    const real = (g: { sessionID: number; localID: number } | undefined) => (g && g.sessionID !== 0xffffffff ? guidId(g) : undefined);
+    return list.map((m) => {
+      // A stable path is the target node, then, when the target is a layer inside that instance, the layer's override
+      // key at each instance level: the same addressing symbolOverrides use, so only its first id is a node here.
+      const path: string[] = (m.toNodeStablePath?.guids ?? []).map(real).filter(Boolean);
+      const to = path[0] ?? real(m.toNode);
+      const side: string | undefined = m.fromNodeSide;
+      return prune({
+        from: real(m.fromNode) ?? n.id,
+        fromSide: side,
+        to,
+        // What toSameSide means was read off real files: every measurement from a layer to itself has it false, so it
+        // crosses to the opposite side (a width or a height), and every one to an enclosing frame has it true (a
+        // padding). The side it names says that outright, where the bare flag left the caller to work it out.
+        toSide: side && (m.toSameSide ? side : OPPOSITE_SIDE[side]),
+        toPath: path.length > 1 ? path : undefined,
+        toMissing: to && !this.doc.get(to) ? true : undefined,
+        freeText: m.freeText || undefined,
+      });
+    });
+  }
+
   node(n: FigNode, depth: number, parent?: FigNode): Raw {
     const out: Raw = { id: n.id, name: n.name, type: displayType(n) };
     if (n.visible === false) out.visible = false;
@@ -285,6 +345,10 @@ export class Normalizer {
     if (n.exportSettings?.length) {
       out.exports = n.exportSettings.map((e: Raw) => prune({ format: e.imageType, suffix: e.suffix || undefined, constraint: e.constraint }));
     }
+    const dev = devStatus(n);
+    if (dev && devMarked(dev)) out.devStatus = dev;
+    out.annotations = this.annotations(n);
+    out.measurements = this.measurements(n);
 
     const kids = this.doc.children(n);
     if (kids.length) {
@@ -303,6 +367,88 @@ export function displayType(n: FigNode): string {
   if (n.type === "ROUNDED_RECTANGLE") return "RECTANGLE";
   return n.type;
 }
+
+/**
+ * Dev Mode's names for the SectionStatus values a .fig stores. BUILD is taken to be what the editor calls "Ready for
+ * dev" and COMPLETED its "Completed": the names line up, but nobody has yet marked a frame and exported the file again
+ * to confirm it, so every answer keeps the stored value beside the name.
+ */
+const DEV_STATUS: Record<string, string> = { NONE: "none", BUILD: "ready_for_dev", COMPLETED: "completed" };
+
+export interface DevStatus {
+  /** ready_for_dev, completed or none; unknown for a value this decoder has no name for, which raw then holds. */
+  status: string;
+  raw: string;
+  previous: string;
+  previousRaw: string;
+  /** ISO-8601: when the status last changed, which for status none with a previous status is when the mark came off. */
+  changedAt?: string;
+  /** The Figma user id that changed it. The export holds no names to go with it. */
+  by?: string;
+  note?: string;
+}
+
+/**
+ * The Dev Mode status a node carries in its own sectionStatusInfo. Each page also keeps a handoffStatusMap of the
+ * statuses on it, but that index goes stale: its entries outlive the nodes they name and can disagree with the node
+ * about the previous status, so the node's own record is what is read. An absent status is NONE, the enum's first
+ * value, and the timestamp is in seconds.
+ */
+export function devStatus(n: FigNode): DevStatus | undefined {
+  const s: Raw | undefined = n.sectionStatusInfo;
+  if (!s) return undefined;
+  const raw: string = s.status ?? "NONE";
+  const previousRaw: string = s.prevStatus ?? "NONE";
+  return prune({
+    status: DEV_STATUS[raw] ?? "unknown",
+    raw,
+    previous: DEV_STATUS[previousRaw] ?? "unknown",
+    previousRaw,
+    changedAt: s.lastUpdateUnixTimestamp ? new Date(s.lastUpdateUnixTimestamp * 1000).toISOString() : undefined,
+    by: s.userId || undefined,
+    note: s.description || undefined,
+  });
+}
+
+/**
+ * Whether a status record says anything: marked now, or marked before and since unmarked ("was ready for dev"). Figma
+ * also writes records that are none and were none on components nobody marked, by the thousand in a component
+ * library; reporting those would put a dated "none" on every variant of it.
+ */
+export const devMarked = (d: DevStatus) => d.status !== "none" || d.previous !== "none";
+
+/**
+ * An annotation's text as markdown. label holds HTML in every export seen (a <p> per line, <br>, <strong>, <code>,
+ * <a href>), and markdown keeps the links and code spans that tag stripping would lose; the Plugin API hands the same
+ * text out as markdown too. labelV2 has not been seen set in any export: it is the later field, so it wins when it is,
+ * and is read the same way - text with no markup passes through unchanged.
+ */
+function annotationLabel(html: unknown): string | undefined {
+  if (typeof html !== "string" || !html.trim()) return undefined;
+  const md = html
+    .replace(/<p\b[^>]*>\s*<br\s*\/?>\s*<\/p>/gi, "\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<(strong|b)\b[^>]*>([\s\S]*?)<\/\1>/gi, "**$2**")
+    .replace(/<(em|i)\b[^>]*>([\s\S]*?)<\/\1>/gi, "*$2*")
+    .replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, "`$1`")
+    .replace(/<a\b[^>]*?\bhref="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)")
+    .replace(/<li\b[^>]*>/gi, "- ")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<\/?[a-z][^>]*>/gi, "")
+    .replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (entity, e: string) => {
+      const k = e.toLowerCase();
+      if (k[0] !== "#") return { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " }[k]!;
+      const cp = k[1] === "x" ? parseInt(k.slice(2), 16) : Number(k.slice(1));
+      // fromCodePoint throws past U+10FFFF; such an entity is left as it was written.
+      return cp <= 0x10ffff ? String.fromCodePoint(cp) : entity;
+    })
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return md || undefined;
+}
+
+const OPPOSITE_SIDE: Record<string, string> = { TOP: "BOTTOM", BOTTOM: "TOP", LEFT: "RIGHT", RIGHT: "LEFT" };
 
 function sizing(s: string | undefined) {
   if (!s) return undefined;

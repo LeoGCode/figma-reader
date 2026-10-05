@@ -1,6 +1,19 @@
 // The compact layer outline figma_get_tree returns: one line per node, indented by depth.
 import type { FigDocument, FigNode } from "./fig-file.ts";
-import { displayType } from "./normalize.ts";
+import { devMarked, devStatus, displayType } from "./normalize.ts";
+
+const HINTS: Record<string, string> = { ready_for_dev: "ready for dev", completed: "completed" };
+
+/**
+ * The Dev Mode status in a word or three: what the node is marked now, or what it was before the mark came off, since
+ * an unmarked frame that was ready for dev is the one a handoff asks about. A value with no name is shown as stored.
+ */
+function devStatusHint(n: FigNode): string | undefined {
+  const d = devStatus(n);
+  if (!d || !devMarked(d)) return undefined;
+  const name = (status: string, raw: string) => HINTS[status] ?? `dev status ${raw}`;
+  return d.status === "none" ? `was ${name(d.previous, d.previousRaw)}` : name(d.status, d.raw);
+}
 
 /** Outline from start (all pages for the DOCUMENT) down depth levels, cut off after maxNodes lines. */
 export function outline(doc: FigDocument, start: FigNode, depth: number, maxNodes: number): string {
@@ -16,6 +29,8 @@ export function outline(doc: FigDocument, start: FigNode, depth: number, maxNode
     const size = n.size ? ` ${Math.round(n.size.x)}x${Math.round(n.size.y)}` : "";
     const extra: string[] = [];
     if (n.visible === false) extra.push("hidden");
+    const dev = devStatusHint(n);
+    if (dev) extra.push(dev);
     if (n.type === "INSTANCE") {
       const main = doc.resolveRef({ guid: n.symbolData?.symbolID });
       if (main) extra.push(`of "${main.name}"`);

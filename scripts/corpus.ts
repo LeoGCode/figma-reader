@@ -7,10 +7,11 @@
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { componentUsage, componentUses } from "../src/component-usage.ts";
+import { devStatusList } from "../src/dev-status.ts";
 import { currentCopy, FigDocument, guidId, type FigNode, type Raw } from "../src/fig-file.ts";
 import { keyPath, layerKey, mainOf, scanText } from "../src/instance-text.ts";
 import { localFigFiles } from "../src/local-files.ts";
-import { Normalizer } from "../src/normalize.ts";
+import { devStatus, Normalizer } from "../src/normalize.ts";
 import { outline } from "../src/outline.ts";
 import { tokenUsage, typographyKey } from "../src/token-usage.ts";
 import { extractStyles, extractVariables, stylesToCss, variablesToCss, variablesToDtcg } from "../src/tokens.ts";
@@ -258,6 +259,41 @@ function check(path: string): Report {
       nameless += (out.component?.propertyDefinitions ?? []).filter((d: { name?: string }) => !d.name).length;
     }
     fail(nameless === 0, `normalize: ${nameless} property definitions without a name`);
+  });
+
+  step("devStatus", () => {
+    let unknown = 0, bare = 0, annotations = 0, markup = 0, measurements = 0, noTarget = 0, missingTarget = 0;
+    r.counts.devStatusRecords = 0;
+    for (const n of doc.nodes.values()) {
+      const d = devStatus(n);
+      if (d) {
+        r.counts.devStatusRecords++;
+        if (d.status === "unknown" || d.previous === "unknown") unknown++;
+      } else if (n.sectionStatus !== undefined && n.sectionStatus !== "NONE") bare++;
+      for (const a of norm.annotations(n) ?? []) {
+        annotations++;
+        if (a.label && /<\/?[a-z][^>]*>|&(#x?[0-9a-f]+|[a-z]+);/i.test(a.label)) markup++;
+      }
+      for (const m of norm.measurements(n) ?? []) {
+        measurements++;
+        if (!m.to) noTarget++;
+        if (m.toMissing) missingTarget++;
+      }
+    }
+    r.counts.devStatusListed = devStatusList(doc).length;
+    r.counts.annotations = annotations;
+    r.counts.measurements = measurements;
+    r.counts.measurementsToMissing = missingTarget;
+    // A status with no name is passed on as stored, so nothing is lost, but every answer about it then says "unknown":
+    // a file that has one is the file to learn its name from.
+    fail(unknown === 0, `dev status: ${unknown} records with a status this decoder has no name for`);
+    // Only sectionStatusInfo is read. The bare sectionStatus beside it has been on no node of any file seen so far; a
+    // node marked through it alone would be a status the tools say nothing about.
+    fail(bare === 0, `dev status: ${bare} nodes marked only through the bare sectionStatus field, which is not read`);
+    // Labels are HTML turned into markdown; a tag or entity left over is markup the conversion did not know.
+    fail(markup === 0, `annotations: ${markup} labels with HTML left in them`);
+    // A target that is gone is reported (toMissing); a measurement naming no target at all says nothing.
+    fail(noTarget === 0, `measurements: ${noTarget} with no target node`);
   });
 
   step("componentUses", () => {

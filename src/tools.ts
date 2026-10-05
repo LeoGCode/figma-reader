@@ -9,6 +9,7 @@ import { z } from "zod";
 import { accountCacheDir, accountProfileDir, expandHome, resolveAccount, writeAccountInfo } from "./account.ts";
 import { BrowserManager, defaultExecutable, defaultStateDir } from "./browser.ts";
 import { componentUsage, componentUses } from "./component-usage.ts";
+import { DEV_STATUS_FILTERS, devStatusList } from "./dev-status.ts";
 import type { Raw } from "./fig-file.ts";
 import { cleanStaleDownloads, FigmaWeb, parseFileRef } from "./figma-web.ts";
 import { groupUnresolved, scanText } from "./instance-text.ts";
@@ -375,7 +376,7 @@ tool(
 
 tool(
   "figma_get_tree",
-  "Compact outline of the layer tree (id, type, name, size, hints). Omit node_id for all pages.",
+  "Compact outline of the layer tree (id, type, name, size, hints such as ready for dev). Omit node_id for all pages.",
   {
     file: fileArg,
     node_id: z.string().optional().describe("Start node id like 12:34 (or 12-34)"),
@@ -398,6 +399,9 @@ tool(
   "figma_get_node",
   "Detailed design data for a node and its subtree: geometry, fills/strokes/effects (hex), auto-layout, text styling and runs, " +
     "component/instance info, bound variables and style names. Instances are not expanded (see mainComponentId). " +
+    "Dev Mode's handoff data where a node has it: devStatus as figma_dev_status describes it (absent on a node never " +
+    "marked), annotations (label as markdown, category, the properties pinned) and measurements (from/to node ids and " +
+    "sides; the distance itself is not stored). " +
     EXPORTED_AT_NOTE,
   {
     file: fileArg,
@@ -648,6 +652,37 @@ tool(
       .map((e): Raw => ({ ...e, variantsUsed: e.variantsUsed.size ? [...e.variantsUsed] : undefined }))
       .sort((a, b) => b.instances + b.swapInstances - (a.instances + a.swapInstances));
     return json({ ...dated, componentSets: sets, components: singles, libraryComponentsUsed });
+  },
+);
+
+tool(
+  "figma_dev_status",
+  "Dev Mode status: the nodes marked Ready for dev or Completed, and those unmarked since, newest change first. " +
+    "Read off each frame's, section's or component's own status record; each entry has id, type, name, page, path and " +
+    "the fields figma_get_node reports as devStatus: status (ready_for_dev, completed, none, or unknown for a value this " +
+    "decoder has no name for), raw (the value Figma stores: BUILD is read as Ready for dev, which has not been confirmed " +
+    "against a re-export, so quote it beside status), previous and previousRaw, changedAt (ISO-8601), and by (a Figma " +
+    "user id) and note when the record has them. status none with a previous status is a mark that came off at changedAt. " +
+    "Internal-only pages, soft-deleted nodes and superseded library copies are left out. " +
+    EXPORTED_AT_NOTE,
+  {
+    file: fileArg,
+    page: z.string().optional().describe("Only nodes on this page; a name no page has is an error listing the pages"),
+    status: z.enum(DEV_STATUS_FILTERS).optional().describe(
+      "Only this status: none covers marks that came off as well as records that never said anything else, and any is " +
+        "every record. Default: every node marked now or before, i.e. not none, or none with a previous status",
+    ),
+    limit: z.number().int().positive().optional().describe("Default 100"),
+    refresh: refreshArg,
+  },
+  async ({ file, page, status, limit, refresh }) => {
+    const { doc, dated } = await open(file, refresh);
+    if (page !== undefined && !doc.pages().some((p) => p.name === page)) {
+      throw new Error(`no page named ${JSON.stringify(page)}; pages: ${doc.pages().map((p) => JSON.stringify(p.name)).join(", ")}`);
+    }
+    const nodes = devStatusList(doc, { page, status });
+    const max = limit ?? 100;
+    return json({ ...dated, returned: Math.min(nodes.length, max), total: nodes.length, truncated: nodes.length > max, nodes: nodes.slice(0, max) });
   },
 );
 

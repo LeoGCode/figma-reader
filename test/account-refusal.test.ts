@@ -1,15 +1,18 @@
 // The refusal of a "default" nothing chose, from inside the process: a refused call must not have reached the snapshot
 // cache or the browser first. The CLI tests cannot tell: a screenshot that read default's cache and was refused after
 // exits 2 with the very same message. So every method of the cache, the Figma web client and the browser manager is
-// counted here, and a refused call has to leave the count at zero. tools.ts resolves the account when it is imported,
+// counted here, and a refused call has to leave the count at zero. The manager is made only by the first call that
+// needs the browser (useBrowser in tools.ts), and making it takes this process's client lease without calling any
+// method the count sees, so what a call left under the state and cache roots is compared too: a refused call leaves
+// both as they were. tools.ts resolves the account when it is imported,
 // which is why this is a file of its own: here nothing chooses one, and another account exists.
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { findProjectConfig } from "../src/account.ts";
+import { appRoot, findProjectConfig } from "../src/account.ts";
 import { BrowserManager } from "../src/browser.ts";
 import { FigmaWeb } from "../src/figma-web.ts";
 import { SnapshotStore } from "../src/store.ts";
@@ -87,11 +90,29 @@ const fileArgs = (t: (typeof tools)[number]) =>
     .filter(([, p]) => p.type === "string" && /\.fig\b/.test(p.description ?? ""))
     .map(([k]) => k);
 
-/** Run a call and return what it touched; it must be refused for want of an account. */
+/** Everything under the roots a call through the account writes: state (the client lease, downloads) and the cache. */
+const onDisk = () =>
+  [appRoot("state"), join(root, "cache")]
+    .flatMap((d) => {
+      try {
+        return readdirSync(d, { recursive: true }).map((p) => join(d, String(p)));
+      } catch {
+        return [];
+      }
+    })
+    .sort();
+
+/** Run a call and return what it touched, and what it wrote or removed; it must be refused for want of an account. */
 async function refused(name: string, args: Record<string, unknown>, why: RegExp) {
   touched.length = 0;
+  const before = onDisk();
   await assert.rejects(byName.get(name)!.run(args), (e: Error) => e instanceof AccountNotChosen && why.test(e.message), `${name} ${JSON.stringify(args)}`);
-  return [...touched];
+  const after = onDisk();
+  return [
+    ...touched,
+    ...after.filter((p) => !before.includes(p)).map((p) => `wrote ${p}`),
+    ...before.filter((p) => !after.includes(p)).map((p) => `removed ${p}`),
+  ];
 }
 
 describe("a call nothing chose an account for, with another account on this machine", { skip: stray && `${stray} is above the temp dir` }, () => {
@@ -134,8 +155,9 @@ describe("a call nothing chose an account for, with another account on this mach
     ];
     const out: { i: number; ok: boolean; error?: string }[] = [];
     touched.length = 0;
+    const before = onDisk();
     const summary = await runBatch([lines[0], lines[2], lines[3]], tools, async (l) => (out.push(JSON.parse(l)), true));
-    assert.deepEqual(touched, [], "a refused line reaches neither the cache nor the browser");
+    assert.deepEqual([touched, onDisk()], [[], before], "a refused line reaches neither the cache nor the browser");
     assert.deepEqual(summary, { answered: 3, failed: [0, 1, 2], refused: [0, 1, 2] });
     for (const o of out) assert.match(o.error!, /^no Figma account chosen: .*other accounts exist \(acme\)/);
     out.length = 0;
@@ -149,6 +171,21 @@ describe("a call nothing chose an account for, with another account on this mach
     const tree = textOf(await byName.get("figma_get_tree")!.run({ file: plain }));
     assert.match(tree, /^# \{"fileModifiedAt":"[^"]+"\}\n- 0:1 PAGE "Page"/);
     assert.ok(touched.includes("store.getLocal"), touched.join(", "));
+  });
+
+  it("is answered from the cache once default is the only account, naming it", async () => {
+    renameSync(join(accounts, "acme"), join(root, "acme.away"));
+    try {
+      touched.length = 0;
+      const [header] = textOf(await byName.get("figma_get_tree")!.run({ file: KEY })).split("\n");
+      assert.deepEqual(JSON.parse(header.slice(2)).account, { name: "default", source: "default" });
+      assert.ok(touched.includes("store.get"), touched.join(", "));
+      // A fresh snapshot answers without the browser, so the manager was never made and no client lease taken: the
+      // refusal has to stand ahead of the cache read itself, since no browser call follows it to stand ahead of.
+      assert.deepEqual(onDisk().filter((p) => p.startsWith(appRoot("state"))), [], "nothing under the state root");
+    } finally {
+      renameSync(join(root, "acme.away"), join(accounts, "acme"));
+    }
   });
 
   it("is refused when the accounts there are cannot be listed, saying why", async () => {
@@ -167,15 +204,4 @@ describe("a call nothing chose an account for, with another account on this mach
     }
   });
 
-  it("is answered from the cache once default is the only account, naming it", async () => {
-    renameSync(join(accounts, "acme"), join(root, "acme.away"));
-    try {
-      touched.length = 0;
-      const [header] = textOf(await byName.get("figma_get_tree")!.run({ file: KEY })).split("\n");
-      assert.deepEqual(JSON.parse(header.slice(2)).account, { name: "default", source: "default" });
-      assert.ok(touched.includes("store.get"), touched.join(", "));
-    } finally {
-      renameSync(join(root, "acme.away"), join(accounts, "acme"));
-    }
-  });
 });

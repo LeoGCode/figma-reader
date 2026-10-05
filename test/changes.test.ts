@@ -23,6 +23,22 @@ describe("topLevelLayers", () => {
     ]);
     assert.deepEqual(ids(topLevelLayers(doc, doc.get("0:1")!)), ["1:1", "2:1", "2:2", "2:4", "2:5", "3:1"]);
   });
+
+  it("takes a section of any width, in both tools", () => {
+    // Its children were spread into one push, one argument each, and 150,000 of them overflowed the stack.
+    const n = 150_000;
+    const nodes: TestNode[] = [
+      { id: "0:1", type: "CANVAS", parent: "0:0", name: "Icons" },
+      { id: "1:1", type: "SECTION", parent: "0:1", name: "All icons" },
+    ];
+    for (let i = 0; i < n; i++) {
+      nodes.push({ id: `2:${i + 1}`, type: "FRAME", parent: "1:1", name: "icon", position: String(i).padStart(6, "0"), editInfo: { createdAt: 1, lastEditedAt: 2 } });
+    }
+    const doc = figDoc(nodes);
+    assert.equal(topLevelLayers(doc, doc.get("0:1")!).length, n + 1);
+    assert.equal(diffDocuments(doc, doc, 1).counts.layersAdded, 0);
+    assert.equal(changesSince(doc, new Date(0), 1).total, n + 1);
+  });
 });
 
 describe("diffDocuments", () => {
@@ -152,9 +168,24 @@ describe("parseSince", () => {
 
   it("refuses anything else rather than guessing at it", () => {
     // Date.parse takes most of these, each some way the answer would not show.
-    for (const bad of ["yesterday", "7", "7days", "-7d", "1.5d", "", "Oct 1", "10/01/2026", "2026", "2026-13-01", "2026-10-01 09:30"]) {
+    for (const bad of ["yesterday", "7", "7days", "-7d", "1.5d", "", "Oct 1", "10/01/2026", "2026", "2026-10-01 09:30"]) {
       assert.throws(() => parseSince(bad, now), /is neither an ISO-8601 date .* nor a duration like 30m, 12h, 7d or 2w/, JSON.stringify(bad));
     }
+  });
+
+  it("refuses a date the calendar does not have, which Date.parse moves into the next month", () => {
+    for (const bad of ["2026-02-29", "2026-04-31", "1900-02-29", "2026-13-01", "2026-00-10", "2026-10-00", "2026-10-01T24:00Z", "2026-10-01T12:60Z", "2026-10-01T12:00:60Z", "2026-10-01T12:00+24:00"]) {
+      assert.throws(() => parseSince(bad, now), /names a date or time that does not exist/, bad);
+    }
+    // Leap days that are there.
+    assert.equal(parseSince("2024-02-29", now).toISOString(), "2024-02-29T00:00:00.000Z");
+    assert.equal(parseSince("2000-02-29", now).toISOString(), "2000-02-29T00:00:00.000Z");
+  });
+
+  it("refuses a duration reaching back past any date, instead of an instant that cannot be written down", () => {
+    // It returned an invalid Date, and the answer's toISOString threw only after the whole file had been read.
+    assert.throws(() => parseSince("99999999999w", now), /since "99999999999w" reaches back further than any date/);
+    assert.throws(() => parseSince(`${"9".repeat(400)}d`, now), /reaches back further than any date/);
   });
 });
 
@@ -205,5 +236,36 @@ describe("changesSince", () => {
   it("lists nothing when nothing is that recent", () => {
     const r = changesSince(doc, new Date((T + 1000) * 1000), 50);
     assert.deepEqual([r.total, r.layers, r.editedNodes], [0, [], 0]);
+  });
+
+  it("dates a node by its creation alone when that is all it records, and rolls that up", () => {
+    // Every fixture above records both times, so a reading of lastEditedAt alone passed them all, and missed every
+    // node that records only that it was made.
+    const created = figDoc([
+      { id: "0:1", type: "CANVAS", parent: "0:0", name: "Screens" },
+      { id: "1:1", type: "FRAME", parent: "0:1", name: "New", editInfo: { createdAt: T + 10 } },
+      { id: "2:1", type: "FRAME", parent: "0:1", name: "Old", ...at(T - 500) },
+      { id: "2:2", type: "FRAME", parent: "2:1", name: "Old group", ...at(T - 500) },
+      { id: "2:3", type: "RECTANGLE", parent: "2:2", name: "Added inside", editInfo: { createdAt: T + 20 } },
+    ]);
+    const r = changesSince(created, since, 50);
+    assert.deepEqual(r.layers.map((l) => [l.id, l.lastEditedAt, l.created, l.editedNodes]), [
+      ["2:1", new Date((T + 20) * 1000).toISOString(), false, 1],
+      ["1:1", new Date((T + 10) * 1000).toISOString(), true, 1],
+    ]);
+  });
+
+  it("counts edit metadata with no time in it as undated, never as 1970", () => {
+    // Every one of these used to read as a time of 0: dated, and listed as edited at the epoch for a since before it.
+    const partial = figDoc([
+      { id: "0:1", type: "CANVAS", parent: "0:0", name: "Screens" },
+      { id: "1:1", type: "FRAME", parent: "0:1", name: "Empty record", editInfo: {} },
+      { id: "2:1", type: "FRAME", parent: "0:1", name: "Zeroes", editInfo: { createdAt: 0, lastEditedAt: 0 } },
+      // In the real export a createdAt of 0 sits beside a real lastEditedAt: the edit is dated, the creation is not.
+      { id: "3:1", type: "FRAME", parent: "0:1", name: "Edited only", editInfo: { createdAt: 0, lastEditedAt: T + 5 } },
+    ]);
+    const r = changesSince(partial, new Date(-1000), 50);
+    assert.deepEqual([r.undatedNodes, r.editedNodes], [2, 1]);
+    assert.deepEqual(r.layers.map((l) => [l.id, l.lastEditedAt, l.created]), [["3:1", new Date((T + 5) * 1000).toISOString(), false]]);
   });
 });

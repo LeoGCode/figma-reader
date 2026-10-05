@@ -21,7 +21,9 @@ export function topLevelLayers(doc: FigDocument, page: FigNode): FigNode[] {
     if (seen.has(n.id)) continue;
     seen.add(n.id);
     out.push(n);
-    if (n.type === "SECTION") stack.push(...doc.children(n).reverse());
+    // One push per child, as FigDocument.walk does: spreading them all into one call passes each as an argument, and
+    // a section of 150,000 frames overflowed the stack in both tools.
+    if (n.type === "SECTION") for (const c of doc.children(n).reverse()) stack.push(c);
   }
   return out;
 }
@@ -107,29 +109,56 @@ export function diffDocuments(old: FigDocument, cur: FigDocument, limit: number)
 
 const UNIT_MS: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
 const DURATION = /^(\d+)([mhdw])$/;
-// A date, or a date and time with an optional offset. Date.parse alone also takes "Oct 1", "1/10/2026" and "2026",
-// each read some way nobody can check from the answer.
-const ISO_DATE = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/i;
+// A date, or a date and time with an optional offset, its parts captured to be checked. Date.parse alone also takes
+// "Oct 1", "1/10/2026" and "2026", and it reads 2026-02-29 as 1 March: each some way nobody can check from the answer.
+const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-](\d{2}):?(\d{2}))?)?$/i;
+
+/** The parts ISO_DATE captured name a day the calendar has, and a time and offset a clock can show. */
+function realDate(m: RegExpExecArray): boolean {
+  const [y, mo, d, h = 0, mi = 0, s = 0, oh = 0, om = 0] = m.slice(1).map((p) => (p === undefined ? undefined : Number(p)));
+  const leap = y! % 4 === 0 && (y! % 100 !== 0 || y! % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo! - 1];
+  return days !== undefined && d! >= 1 && d! <= days && h <= 23 && mi <= 59 && s <= 59 && oh <= 23 && om <= 59;
+}
 
 /**
  * The instant `raw` names: an ISO-8601 date ("2026-10-01", which is midnight UTC) or date and time
  * ("2026-10-01T09:30:00-05:00"; without an offset, local time), or a duration back from `now`: 30m, 12h, 7d, 2w.
+ * Anything else is an error, and it is raised here, before the file it would be applied to is read.
  */
 export function parseSince(raw: string, now = Date.now()): Date {
   const s = raw.trim();
   const d = DURATION.exec(s);
-  if (d) return new Date(now - Number(d[1]) * UNIT_MS[d[2]]);
-  const t = ISO_DATE.test(s) ? Date.parse(s) : NaN;
-  if (Number.isFinite(t)) return new Date(t);
-  throw new Error(`since ${JSON.stringify(raw)} is neither an ISO-8601 date like 2026-10-01 or 2026-10-01T09:30:00Z nor a duration like 30m, 12h, 7d or 2w`);
+  if (d) {
+    const at = new Date(now - Number(d[1]) * UNIT_MS[d[2]]);
+    // A Date spans 100,000,000 days either side of 1970; a duration reaching past that is no instant, and it threw
+    // only when the answer was written, after the file had been read.
+    if (Number.isNaN(at.getTime())) throw new Error(`since ${JSON.stringify(raw)} reaches back further than any date`);
+    return at;
+  }
+  const m = ISO_DATE.exec(s);
+  if (!m) {
+    throw new Error(`since ${JSON.stringify(raw)} is neither an ISO-8601 date like 2026-10-01 or 2026-10-01T09:30:00Z nor a duration like 30m, 12h, 7d or 2w`);
+  }
+  if (!realDate(m)) throw new Error(`since ${JSON.stringify(raw)} names a date or time that does not exist`);
+  return new Date(Date.parse(s));
 }
 
 /**
- * A node's newest edit time in unix seconds, undefined for one that records none. Creation counts: a node made and
- * never touched since has only that time. In the real export no node was created after its last edit.
+ * A recorded time from editInfo, in unix seconds. Missing is not recorded, and neither is 0: in the real export 7
+ * nodes carry a createdAt of 0 beside a real lastEditedAt, and none of them was made in 1970.
  */
-const editedAt = (n: FigNode): number | undefined =>
-  n.editInfo ? Math.max(n.editInfo.lastEditedAt ?? 0, n.editInfo.createdAt ?? 0) : undefined;
+const recorded = (t: unknown): number | undefined => (typeof t === "number" && t > 0 ? t : undefined);
+
+/**
+ * A node's newest recorded time in unix seconds, undefined for one that records none: no editInfo, or one with
+ * neither time in it. Creation counts, since a node made and never touched since has only that time. In the real
+ * export no node was created after its last edit.
+ */
+function editedAt(n: FigNode): number | undefined {
+  const created = recorded(n.editInfo?.createdAt), edited = recorded(n.editInfo?.lastEditedAt);
+  return created === undefined ? edited : edited === undefined ? created : Math.max(created, edited);
+}
 
 /**
  * The top-level layers (see topLevelLayers) holding anything created or edited at or after `since`, newest first.
@@ -168,7 +197,7 @@ export function changesSince(doc: FigDocument, since: Date, limit: number) {
         out: {
           id: top.id, name: top.name, type: displayType(top), page: page.name, path: doc.path(top),
           lastEditedAt: new Date(newest * 1000).toISOString(),
-          created: (top.editInfo?.createdAt ?? -Infinity) >= at,
+          created: (recorded(top.editInfo?.createdAt) ?? -Infinity) >= at,
           editedNodes: count,
         },
       });

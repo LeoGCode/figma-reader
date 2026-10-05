@@ -2,7 +2,7 @@
 // data comes from local .fig files or the logged-in figma.com web app over CDP, via "Save local copy" (.fig, decoded
 // locally) and "Copy as PNG" (captured in-page).
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { z } from "zod";
@@ -803,7 +803,8 @@ tool(
     "its sections) added, removed, renamed (same id, other name) or moved (same id, other parent, so a move to another " +
     "page shows in from.page/to.page; a layer carried inside a moved section keeps its parent and is not listed); and " +
     "removedNodes, every node gone from the visible pages at any depth with the page and path it had, the topmost of " +
-    "each removed subtree first and the rest naming it in removedWith. Every list stops at limit, counts has each " +
+    "each removed subtree first and the rest naming it in removedWith. Only ids, names and parents are compared: an " +
+    "edit to text, fills, sizes or any other property is reported nowhere. Every list stops at limit, counts has each " +
     "total, and truncated says whether any list was cut. A node created and deleted between the two snapshots is in " +
     "neither. old may be the word previous: the snapshot this account's cache held for new's key before its latest " +
     "export (one per key, kept by every export that replaces a snapshot). new is then read from that cache, never from " +
@@ -837,8 +838,9 @@ tool(
     }
     // new first: an export it makes is what decides which snapshot is the previous one.
     const doc = await store.get(ref.key, refresh);
-    const path = store.previousPath(ref.key);
-    if (!existsSync(path)) {
+    // The one this snapshot replaced, read with it as one pair: it throws rather than pair it with another one.
+    const prev = await store.previousOf(ref.key, doc);
+    if (!prev) {
       throw new Error(
         `no previous snapshot of ${ref.key} in account "${account.name}"'s cache, only the current one (exported ` +
           `${doc.exportedAt.toISOString()}): one is kept when an export replaces a snapshot. Pass refresh to export ` +
@@ -846,9 +848,8 @@ tool(
       );
     }
     // A snapshot this tool exported, like the current one, and dated the same way: the link kept that export's time.
-    const prev = await store.getLocal(path);
     return json({
-      old: { key: ref.key, source: PREVIOUS, path, exportedAt: prev.exportedAt.toISOString() },
+      old: { key: ref.key, source: PREVIOUS, path: store.previousPath(ref.key), exportedAt: prev.exportedAt.toISOString() },
       new: { key: ref.key, source: "web", exportedAt: doc.exportedAt.toISOString() },
       ...diffDocuments(prev, doc, max),
     });

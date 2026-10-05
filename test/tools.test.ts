@@ -511,6 +511,14 @@ describe("figma_changes", () => {
   it("reports a since it cannot read, instead of reading it somehow", async () => {
     await assert.rejects(byName.get("figma_changes")!.run({ file, since: "last week" }), /since "last week" is neither an ISO-8601 date/);
   });
+
+  it("reports a bad since before it reads any file", async () => {
+    // A file that is not there would answer "not found" if it were opened first; for a key it would be an export.
+    const missing = join(root, "not-there.fig");
+    for (const since of ["2026-02-29", "99999999999w"]) {
+      await assert.rejects(byName.get("figma_changes")!.run({ file: missing, since }), /since "[^"]+" (names a date|reaches back)/, since);
+    }
+  });
 });
 
 describe("figma_export_image_fills", () => {

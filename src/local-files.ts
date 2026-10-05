@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { type Dirent, lstatSync, mkdirSync, readdirSync, realpathSync, type Stats, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { cannotWrite } from "./account.ts";
 import type { Raw } from "./fig-file.ts";
 import { keyFromFileName } from "./figma-web.ts";
 
@@ -71,17 +72,26 @@ const unique = () => `${Date.now()}-${randomBytes(4).toString("hex")}`;
 export function writePrivateTemp(name: string, ext: string, bytes: Uint8Array, suffix = unique): string {
   const uid = process.getuid?.();
   const dir = join(tmpdir(), uid === undefined ? "figma-reader" : `figma-reader-${uid}`);
+  // A temp directory this process may not write (a read-only sandbox's, a TMPDIR on a read-only mount) said only
+  // "EACCES: permission denied, mkdir", after the screenshot itself had been taken. No read stands in for an image,
+  // so the error ends with what would let it be written, not with what reads without writing.
+  const unwritable = (e: unknown) =>
+    cannotWrite(e, "an image given no --save-path is written to this user's own directory in the temp directory,", dir, "Pass --save-path (save_path in a batch) in a directory this process may write, or set TMPDIR to one.", "");
   try {
     mkdirSync(dir, { mode: 0o700 });
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw unwritable(e);
   }
   const st = lstatSync(dir);
   if (!st.isDirectory() || (uid !== undefined && (st.uid !== uid || (st.mode & 0o077) !== 0))) {
     throw new Error(`${dir} is not a private directory owned by this user; remove it or pass --save-path`);
   }
   const path = join(dir, `${name}-${suffix()}.${ext}`);
-  writeFileSync(path, bytes, { flag: "wx", mode: 0o600 });
+  try {
+    writeFileSync(path, bytes, { flag: "wx", mode: 0o600 });
+  } catch (e) {
+    throw unwritable(e);
+  }
   return path;
 }
 

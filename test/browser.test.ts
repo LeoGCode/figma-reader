@@ -453,6 +453,41 @@ test("a browser that accepts the socket but never answers the target list fails 
   assert.ok(Date.now() - started < 20_000, "gave up long before undici's headers timeout");
 });
 
+test("a write the state directory refuses once registered is said in words: the launch record, the busy lease", { skip: (win || process.getuid?.() === 0) && "permissions do not bind here" }, async (t) => {
+  // Registering, the first write there, is worded where the manager is made (tools.ts). The two after it said only
+  // "EACCES: permission denied", with the path of a temporary file nobody asked about.
+  const server = createServer((_req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:1/devtools/browser/none", "User-Agent": "Chrome/1" }));
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const port = (server.address() as { port: number }).port;
+  const dir = join(root, "unwritable-state");
+  const profile = join(dir, "profile");
+  const exe = join(dir, "fake-browser");
+  mkdirSync(dir, { recursive: true });
+  // A "browser" that says where its DevTools port is, as Chromium does in the profile, and exits: the launch reads it
+  // and goes on to record the browser, with nothing left running.
+  writeFileSync(exe, `#!/bin/sh\nprintf '${port}\\n/devtools/browser/none\\n' > '${join(profile, "DevToolsActivePort")}'\n`);
+  chmodSync(exe, 0o755);
+  const m = new BrowserManager({ executablePath: exe, userDataDir: profile, headless: true, stateDir: join(dir, "state") });
+  chmodSync(m.stateDir, 0o555);
+  const said = (what: string) => (e: Error) => {
+    assert.ok(e.message.startsWith(`${what} in figma-reader's state directory, under ${m.stateDir}, which this process may not write (EACCES: `), e.message);
+    assert.match(e.message, /\)\. Run it where that directory is writable\. Reading a local \.fig by its path/);
+    return true;
+  };
+  try {
+    await assert.rejects(m.launch(true, "work"), said("launching the browser records it (browser.json)"));
+    let ran = false;
+    await assert.rejects(m.busy(async () => void (ran = true)), said("a call through the browser marks it busy"));
+    assert.equal(ran, false, "and nothing ran unannounced");
+  } finally {
+    chmodSync(m.stateDir, 0o755);
+  }
+});
+
 test("a browser executable that cannot be started rejects the launch instead of crashing the process", async () => {
   const dir = join(root, "missing");
   mkdirSync(dir, { recursive: true });

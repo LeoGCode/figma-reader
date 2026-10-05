@@ -4,12 +4,16 @@
 // hardcoded false, with the whole suite green. These call the handlers directly, on .fig files written here.
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync, zipSync } from "fflate";
 import { compileSchema, encodeBinarySchema, parseSchema } from "kiwi-schema";
 import { z } from "zod";
+import { accountDir } from "../src/account.ts";
+import { bootId, defaultStateDir, pidNamespace, processStart } from "../src/browser.ts";
 import { FigDocument } from "../src/fig-file.ts";
 import { FigmaWeb } from "../src/figma-web.ts";
 import { outline } from "../src/outline.ts";
@@ -841,6 +845,49 @@ describe("an answer from figma.com", () => {
     const done = JSON.parse(textOf(await standingIn({ whoami: async () => user }, () => byName.get("figma_login")!.run({}))));
     assert.deepEqual([done.account, done.loggedIn], [{ name: "tools-test", source: "FIGMA_ACCOUNT" }, true]);
   });
+
+  it(
+    "says in words that it could not record who the profile is logged in as, and status does not call that unknown",
+    { skip: (process.platform === "win32" || process.getuid?.() === 0) && "permissions do not bind here" },
+    async () => {
+      // Both record the user figma.com answered with in account.json, under the data directory: raw, a refusal there
+      // was "EACCES: permission denied, mkdir", and status, which caught it with the errors of asking figma.com,
+      // answered loggedIn "unknown" about a login it had just checked.
+      const user = { id: "1", handle: "someone", email: "someone@example.com" };
+      // The account's own directory, which an earlier login here may have made: a fresh account.json is refused there.
+      const data = accountDir("tools-test");
+      mkdirSync(data, { recursive: true });
+      rmSync(join(data, "account.json"), { force: true });
+      // status asks figma.com only about a browser it finds running: a record naming a process of this test's,
+      // stamped as a launch stamps one, stands in for it, so nothing is launched and nothing of ours is ever signalled.
+      // The profile on its command line is what macOS checks beside the start time, as for a browser of ours.
+      const { profile } = JSON.parse(textOf(await byName.get("figma_status")!.run({})));
+      const record = join(defaultStateDir(), createHash("sha1").update(profile).digest("hex").slice(0, 12), "browser.json");
+      const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)", `--user-data-dir=${profile}`], { stdio: "ignore" });
+      writeFileSync(record, JSON.stringify({ pid: child.pid, headless: true, purpose: "work", start: processStart(child.pid!), boot: bootId(), ns: pidNamespace() }));
+      chmodSync(data, 0o555);
+      const said = `status and login record who the account's profile is logged in as (account.json) in figma-reader's data directory, ${data}, ` +
+        "which this process may not write (EACCES: ";
+      try {
+        await assert.rejects(standingIn({ whoami: async () => user }, () => byName.get("figma_status")!.run({})), (e: Error) => {
+          assert.ok(e.message.startsWith(said), e.message);
+          assert.match(e.message, /\)\. Run it where that directory is writable\./);
+          return true;
+        });
+        await assert.rejects(standingIn({ whoami: async () => user }, () => byName.get("figma_login")!.run({})), (e: Error) => {
+          assert.ok(e.message.startsWith(said) && e.message.endsWith(` [${label}]`), e.message);
+          return true;
+        });
+        // Asking figma.com is still what status reports on rather than fails over.
+        const unknown = JSON.parse(textOf(await standingIn({ whoami: async () => { throw new Error("GET /api/user: 503"); } }, () => byName.get("figma_status")!.run({}))));
+        assert.deepEqual([unknown.loggedIn, unknown.error], ["unknown", "GET /api/user: 503"]);
+      } finally {
+        chmodSync(data, 0o755);
+        rmSync(record, { force: true });
+        child.kill();
+      }
+    },
+  );
 });
 
 describe("figma_get_components", () => {

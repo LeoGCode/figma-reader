@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
-import { appRoot } from "./account.ts";
+import { appRoot, cannotWrite } from "./account.ts";
 import { CdpSession, sleep, type TargetInfo } from "./cdp.ts";
 
 export interface BrowserOptions {
@@ -567,8 +567,17 @@ export class BrowserManager {
     return this.readRecord()?.rec;
   }
 
+  /**
+   * Record the browser just launched. The client lease taken when the manager was made (see tools.ts) showed that the
+   * state directory took a write then, not that it still does, nor that every directory in it does: a write refused
+   * here is worded as that one is, rather than left as the bare EACCES of a rename.
+   */
   private writeRecord(r: Omit<LaunchRecord, "start" | "boot" | "ns">) {
-    writeAtomic(this.recordPath, JSON.stringify({ ...r, start: processStart(r.pid), boot: bootId(), ns: pidNamespace() } satisfies LaunchRecord));
+    try {
+      writeAtomic(this.recordPath, JSON.stringify({ ...r, start: processStart(r.pid), boot: bootId(), ns: pidNamespace() } satisfies LaunchRecord));
+    } catch (e) {
+      throw cannotWrite(e, "launching the browser records it (browser.json) in figma-reader's state directory, under", this.stateDir, "Run it where that directory is writable.");
+    }
   }
 
   /**
@@ -871,9 +880,17 @@ export class BrowserManager {
     return join(this.stateDir, "busy");
   }
 
-  /** Run fn while advertising that this process is working in the browser, so no other process closes it meanwhile. */
+  /**
+   * Run fn while advertising that this process is working in the browser, so no other process closes it meanwhile. A
+   * lease it may not write is worded as writeRecord words one.
+   */
   async busy<T>(fn: () => Promise<T>): Promise<T> {
-    const lease = takeLease(this.busyDir, `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    let lease: string;
+    try {
+      lease = takeLease(this.busyDir, `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    } catch (e) {
+      throw cannotWrite(e, "a call through the browser marks it busy in figma-reader's state directory, under", this.stateDir, "Run it where that directory is writable.");
+    }
     try {
       return await fn();
     } finally {

@@ -53,19 +53,20 @@ export function mayNotWrite(e: unknown): boolean {
   return code === "EROFS" || code === "EACCES" || code === "EPERM";
 }
 
+/** What cannotWrite ends with by default: the reads that would have needed no write at all. */
+const READS_WITHOUT_WRITING =
+  "Reading a local .fig by its path, or a key whose cached snapshot is still fresh (younger than FIGMA_SNAPSHOT_MAX_AGE_MIN, 30 minutes unless set), writes nothing.";
+
 /**
  * The error for a write into one of the directories above that this process may not make (see mayNotWrite).
  * Raw, it was "EACCES: permission denied, mkdir '<path>'", which says neither what needed the directory nor that a
  * read needs none of it, and agents guessed. `doing` says what needed `dir`, `fix` what would let it; the system's
- * message stays in it, code and path included. Any other error comes back as it is, to be thrown unchanged.
+ * message stays in it, code and path included. `tail` is what reads without writing, which a write that no read could
+ * stand in for (the image of a screenshot) leaves out. Any other error comes back as it is, to be thrown unchanged.
  */
-export function cannotWrite(e: unknown, doing: string, dir: string, fix: string): unknown {
+export function cannotWrite(e: unknown, doing: string, dir: string, fix: string, tail = READS_WITHOUT_WRITING): unknown {
   if (!mayNotWrite(e)) return e;
-  return new Error(
-    `${doing} ${dir}, which this process may not write (${(e as Error).message}). ${fix} Reading a local .fig by its ` +
-      "path, or a key whose cached snapshot is still fresh (younger than FIGMA_SNAPSHOT_MAX_AGE_MIN, 30 minutes unless set), writes nothing.",
-    { cause: e },
-  );
+  return new Error(`${doing} ${dir}, which this process may not write (${(e as Error).message}). ${fix}${tail ? ` ${tail}` : ""}`, { cause: e });
 }
 
 export function checkAccountName(name: string): string {
@@ -219,10 +220,15 @@ export function readAccountInfo(name: string): AccountInfo {
   }
 }
 
+/** Remember who the account's profile is logged in as; status and login call it once they have asked figma.com. */
 export function writeAccountInfo(name: string, user: { email: string; handle: string }) {
-  mkdirSync(accountDir(name), { recursive: true });
   const info: AccountInfo = { email: user.email, handle: user.handle, verifiedAt: new Date().toISOString() };
-  writeFileSync(join(accountDir(name), "account.json"), `${JSON.stringify(info, null, 2)}\n`);
+  try {
+    mkdirSync(accountDir(name), { recursive: true });
+    writeFileSync(join(accountDir(name), "account.json"), `${JSON.stringify(info, null, 2)}\n`);
+  } catch (e) {
+    throw cannotWrite(e, "status and login record who the account's profile is logged in as (account.json) in figma-reader's data directory,", accountDir(name), "Run it where that directory is writable.");
+  }
 }
 
 export function listAccounts(): string[] {

@@ -490,12 +490,15 @@ tool(
     }
     // whoami throws when Figma cannot be asked (network, 5xx, browser); status reports that instead of failing,
     // since "not logged in" would be a guess.
+    let user: Awaited<ReturnType<typeof web.whoami>>;
     try {
-      const user = verified(await web.whoami());
-      return json({ ...base, loggedIn: !!user, user });
+      user = await web.whoami();
     } catch (e) {
       return json({ ...base, loggedIn: "unknown", error: (e as Error).message });
     }
+    // Recording the answer fails the call with its own error: inside the catch above, a login that was checked but
+    // could not be written down was reported as one nobody could check.
+    return json({ ...base, loggedIn: !!user, user: verified(user) });
   },
 );
 

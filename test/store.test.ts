@@ -1,8 +1,11 @@
 // The snapshot cache decides when a tool call pays for a browser export (up to a minute) and when it may serve an
 // older copy, so each rule is pinned against a fake exporter that counts its calls.
-import { after, describe, it } from "node:test";
+import { after, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import {
+  chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -854,6 +857,106 @@ describe("SnapshotStore between processes", () => {
     linkSync(store.figPath("K"), store.previousPath("K"));
     await assert.rejects(store.previousOf("K", current), /the previous snapshot of K is the same file as its current one/);
   });
+
+  it("reads the previous snapshot from its own file, though the current one is one decode under its key and its path", async () => {
+    // A snapshot is kept under its key and found again under its path (one decode for both). The previous snapshot
+    // must never be answered by that sharing: a diff of the current document with itself reports nothing changed.
+    const x = exporter();
+    const dir = realpathSync(tempDir());
+    const store = new SnapshotStore(x.web, dir, HOUR);
+    await store.get("K");
+    const current = await store.get("K", true);
+    const decode = mock.method(FigDocument, "fromFile");
+    try {
+      assert.equal(await store.getLocal(store.figPath("K")), current, "the key and its path are one document");
+      const prev = await store.previousOf("K", current);
+      assert.notEqual(prev, current);
+      assert.deepEqual([label(prev!), label(current)], ["export 1", "export 2"]);
+      // Read by its own path afterwards, the previous snapshot is that same decode, and still not the current one.
+      assert.equal(await store.getLocal(store.previousPath("K")), prev);
+      assert.equal(decode.mock.callCount(), 1, "the previous snapshot decoded once, the current one not again");
+    } finally {
+      decode.mock.restore();
+    }
+  });
+
+  it("registers with the browser before every wait an export makes, the publish lock's too, and never to read the pair", async () => {
+    // The process a load waits on may be the browser's last client and close it on its way out, so a load says it
+    // may export before any wait (see load). Publishing waits again, for the lock, after its export; and reading a
+    // fresh snapshot and its previous one exports nothing, so it must not register at all.
+    const x = exporter();
+    const dir = tempDir();
+    let said = 0;
+    let saidAtExport = 0;
+    const store = new SnapshotStore(
+      { mayExport: () => void said++, saveLocalCopy: (k: string, p: string) => ((saidAtExport = said), x.web.saveLocalCopy(k, p)) },
+      dir,
+      HOUR,
+    );
+    await store.get("K");
+    plantLock(dir, `${process.pid}-other`);
+    const refreshed = store.get("K", true);
+    await exportsStarted(x, 2);
+    await polls(3);
+    assert.deepEqual([said, saidAtExport], [2, 2], "said so before its export, and so before it waits for the lock");
+    rmSync(lockDir(dir), { recursive: true, force: true });
+    const current = await refreshed;
+    assert.equal(label((await store.previousOf("K", current))!), "export 1");
+    assert.equal(await store.get("K"), current);
+    assert.equal(said, 2, "reading the pair asked nothing of the browser");
+  });
+
+  it(
+    "reads the previous snapshot where it stands from a cache it may not write, and writes nothing there",
+    { skip: (process.platform === "win32" || process.getuid?.() === 0) && "permissions do not bind here" },
+    async () => {
+      // A key whose snapshot is fresh is answered without writing, which is what lets a read-only sandbox use the
+      // cache. diff previous gave both files a private name by hard link first, and failed there with EACCES/EROFS.
+      const x = exporter();
+      const dir = tempDir();
+      const writer = new SnapshotStore(x.web, dir, HOUR);
+      await writer.get("K");
+      await writer.get("K", true);
+      // Every directory of the cache made unwritable, the lease directories an export leaves included.
+      const dirsOf = (d: string): string[] => [d, ...readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()).flatMap((e) => dirsOf(join(d, e.name)))];
+      const lock = (mode: number) => dirsOf(dir).reverse().forEach((d) => chmodSync(d, mode));
+      const listing = () => readdirSync(dir, { recursive: true }).map(String).sort();
+      // Another process, which may only read: a ceiling of 300 ms on the wait for a publish under way.
+      const reader = new SnapshotStore(x.web, dir, HOUR, 4, 300);
+      const before = listing();
+      lock(0o555);
+      try {
+        const current = await reader.get("K");
+        assert.equal(label((await reader.previousOf("K", current))!), "export 1");
+        assert.deepEqual(listing(), before, "nothing written, not even for a moment that outlived the call");
+      } finally {
+        lock(0o755);
+      }
+      // A publish under way holds the lock between swapping the snapshot and renaming the previous one: a pair read
+      // in place then may be one the snapshot never replaced, so it is refused, as previousOf refuses one read late.
+      plantLock(dir, `${process.pid}-other`);
+      lock(0o555);
+      try {
+        const current = await reader.get("K");
+        await assert.rejects(reader.previousOf("K", current), /the snapshot of K changed while it was being read/);
+      } finally {
+        lock(0o755);
+        rmSync(lockDir(dir), { recursive: true, force: true });
+      }
+      // A lock left by a holder that is gone, which this process cannot clear: read without it, and without waiting.
+      plantLock(dir, "1-crashed");
+      lock(0o555);
+      try {
+        const slow = new SnapshotStore(x.web, dir, HOUR, 4, 10_000);
+        const current = await slow.get("K");
+        const began = performance.now();
+        assert.equal(label((await slow.previousOf("K", current))!), "export 1");
+        assert.ok(performance.now() - began < 5_000, "not the ceiling waited out for a holder long gone");
+      } finally {
+        lock(0o755);
+      }
+    },
+  );
 
   it("answers a refresh with an export whose file is the size of the one it replaced", async () => {
     const x = exporter();

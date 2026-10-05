@@ -361,6 +361,10 @@ export class SnapshotStore {
    * has published since `current` was read, this throws rather than answer about a pair nobody asked about; so it
    * does for a previous snapshot that is the current one, which no export here leaves behind, since a diff of the two
    * would report no change at all.
+   *
+   * Where no link can be made because this process may not write the cache (a read-only sandbox, a mount it can only
+   * read), the pair is read in place instead (see previousInPlace): a key whose snapshot is fresh is answered without
+   * writing anything (see load), and diff previous is such an answer.
    */
   async previousOf(fileKey: string, current: FigDocument): Promise<FigDocument | undefined> {
     const tag = Math.random().toString(36).slice(2, 8);
@@ -372,7 +376,9 @@ export class SnapshotStore {
         try {
           linkSync(this.previousPath(fileKey), was);
         } catch (e) {
-          if ((e as NodeJS.ErrnoException).code === "ENOENT") return false;
+          const code = (e as NodeJS.ErrnoException).code;
+          if (code === "ENOENT") return "none";
+          if (code === "EROFS" || code === "EACCES" || code === "EPERM") return "unwritable";
           throw e;
         }
         try {
@@ -380,9 +386,10 @@ export class SnapshotStore {
         } catch {
           // No snapshot to pair it with: the reading below then differs from current's, which says so.
         }
-        return true;
+        return "linked";
       });
-      if (!kept) return undefined;
+      if (kept === "none") return undefined;
+      if (kept === "unwritable") return this.previousInPlace(fileKey, current);
       const seen = asSeen(now);
       if (seen !== this.stamps.get(current)) {
         throw new Error(`the snapshot of ${fileKey} changed while it was being read (another export replaced it, or it was removed); ask again`);
@@ -395,6 +402,29 @@ export class SnapshotStore {
       rmSync(now, { force: true });
       rmSync(was, { force: true });
     }
+  }
+
+  /**
+   * previousOf for a cache this process can read but not write, so that neither file can be given a private name. The
+   * pair is read where it stands and judged by its readings: the snapshot must be `current` before the previous one
+   * is decoded and after, the previous one must be the same file across its decode, and no publish may be under way
+   * at either reading. A publish swaps the snapshot before it renames the previous one, under the lock, so between
+   * its two renames the lock is held; a publish that finished in between moved the snapshot. Either is refused, as
+   * previousOf refuses a pair another export came between.
+   */
+  private previousInPlace(fileKey: string, current: FigDocument): FigDocument | undefined {
+    const path = this.previousPath(fileKey);
+    const changed = () => new Error(`the snapshot of ${fileKey} changed while it was being read (another export replaced it, or it was removed); ask again`);
+    const settled = () => !liveLeases(this.publishLock(fileKey)).length && asSeen(this.figPath(fileKey)) === this.stamps.get(current);
+    const was = asSeen(path);
+    if (was === undefined) return undefined;
+    if (!settled()) throw changed();
+    if (was === this.stamps.get(current)) {
+      throw new Error(`the previous snapshot of ${fileKey} is the same file as its current one, so a diff of the two could only report no change`);
+    }
+    const prev = this.fromDisk(path, path);
+    if (!settled() || asSeen(path) !== was || this.stamps.get(prev) !== was) throw changed();
+    return prev;
   }
 
   /** Where the process holding the key's publish lock names itself (see underPublishLock). */
@@ -429,9 +459,12 @@ export class SnapshotStore {
     const deadline = Date.now() + this.otherExportWaitMs;
     let held = false;
     for (let missing = 0; ; ) {
+      // Whether this process could stage a lock of its own at all, which a cache it may only read refuses.
+      let staging = false;
       try {
         mkdirSync(staged, { recursive: true });
         writeFileSync(join(staged, name), processStamp(process.pid));
+        staging = true;
         renameSync(staged, lock);
         held = true;
         break;
@@ -451,6 +484,9 @@ export class SnapshotStore {
           rmdirSync(lock);
           continue;
         } catch {}
+        // Held by nobody, and this process can neither clear it nor stage one of its own (a read-only cache): it goes
+        // ahead without, as where no lock can be taken at all, rather than wait out the ceiling for a holder long gone.
+        if (!staging) break;
       }
       await sleep(PUBLISH_POLL_MS);
     }

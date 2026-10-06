@@ -15,7 +15,7 @@ process.env.HOME = root;
 process.env.USERPROFILE = root;
 process.env.APPDATA = join(root, "AppData", "Roaming");
 process.env.LOCALAPPDATA = join(root, "AppData", "Local");
-const { abandoned, cleanStaleDownloads, FigmaWeb, markOwner, moveDownload, releaseDownloadBehavior, TAB_MARK } = await import("../src/figma-web.ts");
+const { abandoned, cleanStaleDownloads, FigmaWeb, markOwner, moveDownload, releaseDownloadBehavior, tabMark } = await import("../src/figma-web.ts");
 const { bootId, dropLease, pidNamespace, processStamp, processStart, takeLease } = await import("../src/browser.ts");
 
 const realFetch = globalThis.fetch;
@@ -615,7 +615,7 @@ test("a cached editor tab that another process took over is left to it, not re-m
   const { tabs, world } = tabWorld();
   const { web } = fakeBrowser(world);
   const first = await (web as any).editorTab();
-  assert.equal(tabs.get(first.info.id)!.ctx.window.name, TAB_MARK);
+  assert.equal(tabs.get(first.info.id)!.ctx.window.name, tabMark());
   // A tab that has been used sits on the origin; adoption only ever looks at those.
   tabs.get(first.info.id)!.url = `${ORIGIN}/design/${KEY}/My-App`;
   const other = `figma-reader:${process.ppid}:${processStart(process.ppid)}`; // a live process
@@ -652,7 +652,7 @@ test("a tab marked by a process of another container is left to it, pid for pid"
   // the other one's mark is this process's pid as well - and "the pid in it is mine" is what said the tab was ours.
   const start = processStart(process.pid);
   const twin = `figma-reader/${Number(pidNamespace() ?? 0) + 1}${bootId() ? `@${bootId()}` : ""}:${process.pid}${start ? `:${start}` : ""}`;
-  assert.notEqual(twin, TAB_MARK);
+  assert.notEqual(twin, tabMark());
   const { tabs, world } = tabWorld();
   const theirs = await world.newTab(`${ORIGIN}/design/${KEY}/My-App`);
   theirs.ctx.window.name = twin;
@@ -709,7 +709,7 @@ test("tab marks carry the owner's namespace, boot and start time, and older mark
   for (const name of ["", "other-app:1", "figma-reader:x", "figma-reader-1", "figma-reader@boot", "figma-reader/4026531836"])
     assert.equal(markOwner(name), undefined, name);
   assert.deepEqual(
-    markOwner(TAB_MARK),
+    markOwner(tabMark()),
     { pid: process.pid, start: processStart(process.pid), boot: bootId(), ns: pidNamespace() },
     "our own mark round-trips",
   );

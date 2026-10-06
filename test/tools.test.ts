@@ -4,16 +4,16 @@
 // hardcoded false, with the whole suite green. These call the handlers directly, on .fig files written here.
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync, zipSync } from "fflate";
 import { compileSchema, encodeBinarySchema, parseSchema } from "kiwi-schema";
 import { z } from "zod";
 import { accountDir } from "../src/account.ts";
-import { bootId, defaultStateDir, pidNamespace, processStart } from "../src/browser.ts";
+import { bootId, defaultStateDir, pidAlive, pidNamespace, processStart } from "../src/browser.ts";
 import { FigDocument } from "../src/fig-file.ts";
 import { FigmaWeb } from "../src/figma-web.ts";
 import { outline } from "../src/outline.ts";
@@ -864,7 +864,13 @@ describe("an answer from figma.com", () => {
       const { profile } = JSON.parse(textOf(await byName.get("figma_status")!.run({})));
       const record = join(defaultStateDir(), createHash("sha1").update(profile).digest("hex").slice(0, 12), "browser.json");
       const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)", `--user-data-dir=${profile}`], { stdio: "ignore" });
-      writeFileSync(record, JSON.stringify({ pid: child.pid, headless: true, purpose: "work", start: processStart(child.pid!), boot: bootId(), ns: pidNamespace() }));
+      const recorded = processStart(child.pid!);
+      writeFileSync(record, JSON.stringify({ pid: child.pid, headless: true, purpose: "work", start: recorded, boot: bootId(), ns: pidNamespace() }));
+      // What the platform's ownership check reads about the stand-in, for a failure to show which half refused it.
+      const seen = () => JSON.stringify({
+        alive: pidAlive(child.pid!), recorded, now: processStart(child.pid!), recordKept: existsSync(record),
+        cmdline: process.platform === "darwin" ? execFileSync("ps", ["-ww", "-o", "command=", "-p", String(child.pid)], { encoding: "utf8" }).trim() : undefined,
+      });
       chmodSync(data, 0o555);
       const said = `status and login record who the account's profile is logged in as (account.json) in figma-reader's data directory, ${data}, ` +
         "which this process may not write (EACCES: ";
@@ -875,7 +881,7 @@ describe("an answer from figma.com", () => {
           (r) => ({ answered: textOf(r) }),
           (error: Error) => ({ error }),
         );
-        assert.ok("error" in outcome, `status answered instead of refusing: ${"answered" in outcome ? outcome.answered : ""}`);
+        assert.ok("error" in outcome, `status answered instead of refusing: ${"answered" in outcome ? outcome.answered : ""}; stand-in ${seen()}`);
         assert.ok(outcome.error.message.startsWith(said), outcome.error.message);
         assert.match(outcome.error.message, /\)\. Run it where that directory is writable\./);
         await assert.rejects(standingIn({ whoami: async () => user }, () => byName.get("figma_login")!.run({})), (e: Error) => {

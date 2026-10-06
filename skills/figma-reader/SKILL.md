@@ -8,7 +8,7 @@ description: Read Figma designs from the shell with the figma-reader CLI (layer 
 
 Read-only CLI: `figma-reader <command> <file> [flags]`. `<file>` is a local `.fig` path, a file key, or a `figma.com/design/...` URL (its `?node-id=` stands in for a missing `--node-id`). Node ids look like `12:34` (`12-34` works).
 
-**Setup, once:** `command -v figma-reader`, else `npx -y @leogcode/figma-reader@0.3.2` in its place. Run it from the project's directory, which picks its Figma account. Never send stderr to `/dev/null` on a call whose output you interpret: a hidden error reads as "no results".
+**Setup, once:** `command -v figma-reader`, else `npx -y @leogcode/figma-reader@0.4.0` in its place. Run it from the project's directory, which picks its Figma account. Never send stderr to `/dev/null` on a call whose output you interpret: a hidden error reads as "no results".
 
 ## Which command
 

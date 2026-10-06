@@ -1021,8 +1021,8 @@ tool(
   "Dev Mode status: the nodes marked Ready for dev or Completed, and those unmarked since, newest change first. " +
     "Read off each frame's, section's or component's own status record; each entry has id, type, name, page, path and " +
     "the fields figma_get_node reports as devStatus: status (ready_for_dev, completed, none, or unknown for a value this " +
-    "decoder has no name for), raw (the value Figma stores: BUILD is read as Ready for dev, which has not been confirmed " +
-    "against a re-export, so quote it beside status), previous and previousRaw, changedAt (ISO-8601), and by (a Figma " +
+    "decoder has no name for), raw (the value Figma stores: BUILD for Ready for dev, COMPLETED for Completed), " +
+    "previous and previousRaw, changedAt (ISO-8601), and by (a Figma " +
     "user id) and note when the record has them. status none with a previous status other than none is a mark that came " +
     "off at changedAt; none with previous none is a record Figma keeps on a node never marked, listed only with status " +
     "none or any unless a user or note on it says a person left it. With no status given, neverMarked counts those " +

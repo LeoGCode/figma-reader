@@ -349,7 +349,8 @@ describe("Dev Mode status, annotations and measurements", () => {
   const status = (info: Record<string, unknown>) => devStatus({ id: "1:1", type: "FRAME", name: "F", childIds: [], sectionStatusInfo: info });
 
   it("names each stored status, keeps the stored value beside it, and dates the change", () => {
-    // BUILD is read as Ready for dev without a re-export to confirm it, which is why raw is never dropped.
+    // BUILD is Ready for dev (test/dev-status-export.test.ts reads it off a real export); raw stays beside the name for
+    // a value Figma adds later.
     assert.deepEqual(status({ status: "BUILD", prevStatus: "NONE", lastUpdateUnixTimestamp: at, userId: "1234567" }), {
       status: "ready_for_dev", raw: "BUILD", previous: "none", previousRaw: "NONE", changedAt: "2026-10-01T10:00:00.000Z", by: "1234567",
     });

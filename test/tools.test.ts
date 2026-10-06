@@ -863,7 +863,12 @@ describe("an answer from figma.com", () => {
       // The profile on its command line is what macOS checks beside the start time, as for a browser of ours.
       const { profile } = JSON.parse(textOf(await byName.get("figma_status")!.run({})));
       const record = join(defaultStateDir(), createHash("sha1").update(profile).digest("hex").slice(0, 12), "browser.json");
-      const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)", `--user-data-dir=${profile}`], { stdio: "ignore" });
+      // The profile goes after "--": Node takes a flag behind -e for one of its own, refused --user-data-dir as a bad
+      // option and exited at once, and Linux, which settles ownership on the start time alone, passed this test with
+      // a dead stand-in; macOS reads the command line as well and saw <defunct>.
+      const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)", "--", `--user-data-dir=${profile}`], { stdio: "ignore" });
+      await new Promise((r) => setTimeout(r, 300));
+      assert.equal(child.exitCode, null, "the stand-in browser is running");
       const recorded = processStart(child.pid!);
       writeFileSync(record, JSON.stringify({ pid: child.pid, headless: true, purpose: "work", start: recorded, boot: bootId(), ns: pidNamespace() }));
       // What the platform's ownership check reads about the stand-in, for a failure to show which half refused it.

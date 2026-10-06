@@ -371,9 +371,10 @@ export function displayType(n: FigNode): string {
 }
 
 /**
- * Dev Mode's names for the SectionStatus values a .fig stores. BUILD is taken to be what the editor calls "Ready for
- * dev" and COMPLETED its "Completed": the names line up, but nobody has yet marked a frame and exported the file again
- * to confirm it, so every answer keeps the stored value beside the name.
+ * Dev Mode's names for the SectionStatus values a .fig stores. BUILD is what the editor calls "Ready for dev" and
+ * COMPLETED its "Completed", and "Remove status" leaves NONE with the removed value as prevStatus: frames marked in
+ * the editor and exported again say so (test/dev-status-export.test.ts). Answers still carry the stored value beside
+ * the name, for a value Figma adds later.
  */
 const DEV_STATUS: Record<string, string> = { NONE: "none", BUILD: "ready_for_dev", COMPLETED: "completed" };
 

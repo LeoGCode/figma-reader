@@ -16,10 +16,19 @@ const TAB_PREFIX = "figma-reader";
 // brings window.name back across a reboot, where the pair names an unrelated process. The namespace those pids are
 // numbered in comes first, ahead of the '@' and the ':' an older build's mark begins with, so that build reads a
 // mark of ours as no mark of its own and leaves the tab alone - which is the answer that puts one process on a tab.
-const TAB_START = processStart(process.pid);
-const TAB_BOOT = bootId();
-const TAB_NS = pidNamespace();
-export const TAB_MARK = `${TAB_PREFIX}${TAB_NS ? `/${TAB_NS}` : ""}${TAB_BOOT ? `@${TAB_BOOT}` : ""}:${process.pid}${TAB_START ? `:${TAB_START}` : ""}`;
+//
+// Built on first use, not as the module loads: processStart is a PowerShell process on Windows and a ps on macOS, and
+// every CLI call and MCP server loads this module, so a local read or help paid for it (and on Windows PowerShell
+// wrote its startup profile under LOCALAPPDATA) without ever opening a tab.
+let tabMarkMemo: string | undefined;
+export function tabMark(): string {
+  if (tabMarkMemo !== undefined) return tabMarkMemo;
+  const start = processStart(process.pid);
+  const boot = bootId();
+  const ns = pidNamespace();
+  tabMarkMemo = `${TAB_PREFIX}${ns ? `/${ns}` : ""}${boot ? `@${boot}` : ""}:${process.pid}${start ? `:${start}` : ""}`;
+  return tabMarkMemo;
+}
 // Copy as PNG parks the image on a window global. It is namespaced per process so that two server
 // processes sharing one tab can never consume each other's capture.
 const PNG_KEY = `__figmaReaderPng_${process.pid}`;
@@ -435,7 +444,7 @@ export class FigmaWeb {
    * (about:blank -> figma.com) clears window.name, including on our own tab.
    */
   private claim(s: CdpSession): Promise<boolean> {
-    const mark = JSON.stringify(TAB_MARK);
+    const mark = JSON.stringify(tabMark());
     return s
       .evaluate<boolean>(`(window.name === "" || window.name === ${mark}) && ((window.name = ${mark}), true)`)
       .catch(() => false);
@@ -464,13 +473,13 @@ export class FigmaWeb {
         // Our own mark is the whole string, not the pid in it: two containers driving one browser over
         // FIGMA_CDP_URL both number their server processes from 1, so "the pid is mine" is a thing the other
         // one's mark says too, and it took a tab that process was driving.
-        if (owner !== undefined && (seen === TAB_MARK || abandoned(owner))) {
+        if (owner !== undefined && (seen === tabMark() || abandoned(owner))) {
           // Write only while the name is still the one that was read. Writing unconditionally and re-reading let
           // two processes that both read the free mark verify their own write and both own the tab, whenever the
           // second write landed after the first process stopped looking: two real processes did exactly that.
           // One expression is one page task, so the read and the write cannot be interleaved.
           claimed = await s
-            .evaluate<boolean>(`window.name === ${JSON.stringify(seen)} && ((window.name = ${JSON.stringify(TAB_MARK)}), true)`)
+            .evaluate<boolean>(`window.name === ${JSON.stringify(seen)} && ((window.name = ${JSON.stringify(tabMark())}), true)`)
             .catch(() => false);
         }
         if (claimed) {

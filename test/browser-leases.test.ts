@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  bootId, bystander, children, LEASE_BEAT_MS, liveLeases, OTHER_BOOT, pidNamespace, processStamp, processStart, root, takeLease,
+  bootId, bystander, bystanderOfAnotherStart, children, LEASE_BEAT_MS, liveLeases, OTHER_BOOT, pidNamespace, processStamp, processStart, root, takeLease,
 } from "./browser-helpers.ts";
 
 test("a lease stamped in another boot does not count as live", { skip: !bootId() && "no boot id on this platform" }, () => {
@@ -32,11 +32,11 @@ test("client and lease files of a reused pid do not count as live", () => {
   rmSync(mine);
 });
 
-test("a lease carries the stamp of the process that wrote it, so a pid held by another process is not live", () => {
+test("a lease carries the stamp of the process that wrote it, so a pid held by another process is not live", async () => {
   // An empty stamp passes every test that only counts leases, and silently disables reused-pid detection for all
   // of them: liveLeases then falls back to plain liveness.
   const dir = join(root, "lease-stamp");
-  const other = bystander();
+  const other = await bystanderOfAnotherStart();
   const borrowed = takeLease(dir, String(other)); // written by us, named for a live process that is not us
   assert.ok(readFileSync(borrowed, "utf8").length, "the lease is stamped");
   assert.deepEqual(liveLeases(dir), [], "the stamp says the named pid is not the process that took it");

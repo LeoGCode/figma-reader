@@ -63,6 +63,22 @@ export function bystander(): number {
   return child.pid!;
 }
 
+/**
+ * A bystander whose start time differs from this process's. macOS reads start times from ps's lstart, at one
+ * second, so a bystander spawned within the second this process started carries the same start and the same stamp:
+ * the two are one identity there (see processStart). A test file that runs its first test as it starts lands in that
+ * second, which the single browser test file never did. Linux and Windows resolve far finer, and pass first time.
+ */
+export async function bystanderOfAnotherStart(): Promise<number> {
+  for (;;) {
+    const pid = bystander();
+    // The child's start may not be readable the instant it is spawned; an unreadable one is not a match.
+    if (processStart(pid) !== processStart(process.pid)) return pid;
+    process.kill(pid);
+    await new Promise((r) => setTimeout(r, 1100));
+  }
+}
+
 let n = 0;
 /** A manager whose "browser" only records that it was started, so a launch is detectable and harmless. */
 export function manager() {

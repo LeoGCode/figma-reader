@@ -32,10 +32,13 @@ after(async () => {
 
 const repo = join(import.meta.dirname, "..");
 const skillDir = join(repo, "skills", "figma-reader");
-const skill = readFileSync(join(skillDir, "SKILL.md"), "utf8");
+// As the repository stores them: a Windows checkout turns each \n into \r\n, which broke the frontmatter's line
+// match and put SKILL.md three bytes over its budget there, for a file that is the same everywhere else.
+const lf = (path: string) => readFileSync(path, "utf8").replaceAll("\r\n", "\n");
+const skill = lf(join(skillDir, "SKILL.md"));
 /** Where SKILL.md sends an agent for every shape and flag it leaves out, as SKILL.md names it. */
 const REFERENCE = "references/output.md";
-const reference = readFileSync(join(skillDir, REFERENCE), "utf8");
+const reference = lf(join(skillDir, REFERENCE));
 const docs = [["SKILL.md", skill], [REFERENCE, reference]] as const;
 const byCommand = new Map(tools.map((t) => [commandName(t.name), t]));
 /** The section of `text` under a "## " heading, up to the next one. */
@@ -212,7 +215,7 @@ describe("the agent skill", () => {
 // The README's lists of tools are what someone reads to know which tools do what, and seven lanes each added to them.
 // They are checked against the tools themselves: a tool missing from a list, or listed where it does not belong, fails.
 describe("the README's inventories of tools", () => {
-  const readme = readFileSync(join(repo, "README.md"), "utf8");
+  const readme = lf(join(repo, "README.md"));
   const names = (s: string) => [...s.matchAll(/`(figma_[a-z_]+)`/g)].map((m) => m[1]).sort();
   /** The tool names in the first span of the README between `from` and `to`. */
   const between = (from: string, to: string) => {

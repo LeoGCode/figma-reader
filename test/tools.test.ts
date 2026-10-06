@@ -869,11 +869,15 @@ describe("an answer from figma.com", () => {
       const said = `status and login record who the account's profile is logged in as (account.json) in figma-reader's data directory, ${data}, ` +
         "which this process may not write (EACCES: ";
       try {
-        await assert.rejects(standingIn({ whoami: async () => user }, () => byName.get("figma_status")!.run({})), (e: Error) => {
-          assert.ok(e.message.startsWith(said), e.message);
-          assert.match(e.message, /\)\. Run it where that directory is writable\./);
-          return true;
-        });
+        // What status answered when it did not refuse is the evidence a failure here needs: it says whether it took
+        // the stand-in browser for running, which is the step a platform's process checks decide.
+        const outcome = await standingIn({ whoami: async () => user }, () => byName.get("figma_status")!.run({})).then(
+          (r) => ({ answered: textOf(r) }),
+          (error: Error) => ({ error }),
+        );
+        assert.ok("error" in outcome, `status answered instead of refusing: ${"answered" in outcome ? outcome.answered : ""}`);
+        assert.ok(outcome.error.message.startsWith(said), outcome.error.message);
+        assert.match(outcome.error.message, /\)\. Run it where that directory is writable\./);
         await assert.rejects(standingIn({ whoami: async () => user }, () => byName.get("figma_login")!.run({})), (e: Error) => {
           assert.ok(e.message.startsWith(said) && e.message.endsWith(` [${label}]`), e.message);
           return true;
@@ -1049,6 +1053,10 @@ describe("figma_diff", () => {
     copyFileSync(before, join(cache, `${key}.previous.fig`));
     copyFileSync(after, join(cache, `${key}.fig`));
     utimesSync(join(cache, `${key}.previous.fig`), old, old);
+    // The current snapshot is dated now, as an export just made would be. A copy keeps its source's time on Windows
+    // (after's is fixed, hours back), and the store then took that snapshot for an old one and exported again.
+    const fresh = () => new Date();
+    utimesSync(join(cache, `${key}.fig`), fresh(), fresh());
 
     it("compares the key's previous snapshot with its current one, both dated as exports", async () => {
       const current = statSync(join(cache, `${key}.fig`)).mtime.toISOString();
@@ -1072,6 +1080,7 @@ describe("figma_diff", () => {
 
     it("says there is none rather than comparing with something else", async () => {
       copyFileSync(after, join(cache, "NOPREVKEY123.fig"));
+      utimesSync(join(cache, "NOPREVKEY123.fig"), fresh(), fresh());
       await assert.rejects(
         byName.get("figma_diff")!.run({ old: "previous", new: "NOPREVKEY123" }),
         /no previous snapshot of NOPREVKEY123 in account "tools-test"'s cache, only the current one \(exported .*\).*Pass refresh/,

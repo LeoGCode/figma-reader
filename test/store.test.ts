@@ -62,6 +62,16 @@ function exporter(tag = "export") {
   };
 }
 
+/** An exporter whose every export carries one mtime, `tick`: exports written within one tick of the file clock. */
+function sameTick(x: ReturnType<typeof exporter>, tick = new Date()) {
+  return {
+    async saveLocalCopy(fileKey: string, path: string) {
+      await x.web.saveLocalCopy(fileKey, path);
+      utimesSync(path, tick, tick);
+    },
+  } as unknown as FigmaWeb;
+}
+
 const HOUR = 3_600_000;
 
 /** Wait until n exports have started. Bounded: a regression that starts none used to spin here until CI was killed. */
@@ -952,6 +962,65 @@ describe("SnapshotStore between processes", () => {
     await new SnapshotStore(b.web, dir, HOUR).get("K", true);
     await assert.rejects(first.previousOf("K", current), /the snapshot of K changed while it was being read/);
   });
+
+  it("tells two exports apart that were written in one tick of the file clock at the same size", async () => {
+    // NTFS dates writes by a clock that moves in 15.6 ms ticks: two exports of one size inside a tick carried the same
+    // mtime and size, and previousOf refused the pair as one file (a Windows 11 VM, three runs in three). Both are
+    // written at one time here, which stands for any clock.
+    const tick = new Date();
+    const store = new SnapshotStore(sameTick(exporter("a"), tick), tempDir(), HOUR);
+    await store.get("K");
+    const current = await store.get("K", true);
+    const [now, prev] = [statSync(store.figPath("K")), statSync(store.previousPath("K"))];
+    assert.equal(now.size, prev.size, "one size");
+    // Rounded: a time kept in nanoseconds reads back as a float, 1792107246616 as 1792107246615.999.
+    assert.equal(Math.round(prev.mtimeMs), tick.getTime(), "the first as written");
+    assert.equal(Math.round(now.mtimeMs), tick.getTime() + 1, "the second moved on by a millisecond");
+    assert.equal(current.exportedAt.getTime(), now.mtime.getTime(), "and dated by the time it was given");
+    assert.equal(label((await store.previousOf("K", current))!), "a 1");
+  });
+
+  it("reads each generation's previous snapshot, though three exports in a row were written alike", async () => {
+    // Decoded documents are kept by their reading: with all three alike, the previous snapshot decoded once as the
+    // first was answered again as the first once the third had made the second the previous one.
+    const store = new SnapshotStore(sameTick(exporter("a")), tempDir(), HOUR);
+    await store.get("K");
+    const second = await store.get("K", true);
+    assert.equal(label((await store.previousOf("K", second))!), "a 1");
+    const third = await store.get("K", true);
+    assert.equal(label((await store.previousOf("K", third))!), "a 2");
+  });
+
+  it("still sees another export come between, written in the same tick at the same size", async () => {
+    const tick = new Date();
+    const dir = tempDir();
+    const first = new SnapshotStore(sameTick(exporter("a"), tick), dir, HOUR);
+    await first.get("K");
+    const current = await first.get("K", true);
+    await new SnapshotStore(sameTick(exporter("b"), tick), dir, HOUR).get("K", true);
+    await assert.rejects(first.previousOf("K", current), /the snapshot of K changed while it was being read/);
+  });
+
+  it(
+    "tells two exports apart that were written in one tick, read in place from a cache it may not write",
+    { skip: (process.platform === "win32" || process.getuid?.() === 0) && "permissions do not bind here" },
+    async () => {
+      const dir = tempDir();
+      const writer = new SnapshotStore(sameTick(exporter("a")), dir, HOUR);
+      await writer.get("K");
+      await writer.get("K", true);
+      const dirsOf = (d: string): string[] => [d, ...readdirSync(d, { withFileTypes: true }).filter((e) => e.isDirectory()).flatMap((e) => dirsOf(join(d, e.name)))];
+      const lock = (mode: number) => dirsOf(dir).reverse().forEach((d) => chmodSync(d, mode));
+      lock(0o555);
+      try {
+        const reader = new SnapshotStore(exporter().web, dir, HOUR, 4, 300);
+        const current = await reader.get("K");
+        assert.equal(label((await reader.previousOf("K", current))!), "a 1");
+      } finally {
+        lock(0o755);
+      }
+    },
+  );
 
   it("refuses a previous snapshot that is the current one rather than diff a snapshot with itself", async () => {
     const x = exporter();

@@ -31,7 +31,16 @@ interface Session {
 
 /** Start the server, send these requests after the handshake, close stdin and collect the answers. */
 function serve(requests: { id: number; method: string; params?: object }[], extraEnv: Record<string, string> = {}): Promise<Session> {
-  const env: NodeJS.ProcessEnv = { ...process.env, HOME: join(root, "home"), FIGMA_FILES_DIRS: root };
+  const home = join(root, "home");
+  // Every root a platform builds from, not HOME alone: see cli-helpers.ts.
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    APPDATA: join(home, "AppData", "Roaming"),
+    LOCALAPPDATA: join(home, "AppData", "Local"),
+    FIGMA_FILES_DIRS: root,
+  };
   for (const k of ["FIGMA_ACCOUNT", "FIGMA_READER_CACHE", "FIGMA_CDP_URL", "FIGMA_USER_DATA_DIR"]) delete env[k];
   Object.assign(env, extraEnv);
   const child = spawn(process.execPath, ["--no-warnings", join(import.meta.dirname, "..", "src", "mcp.ts")], { cwd: root, env });

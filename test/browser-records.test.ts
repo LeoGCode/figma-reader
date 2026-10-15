@@ -6,11 +6,12 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import type { Socket } from "node:net";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  bootId, BrowserManager, bystander, KEY_STORE_FILE, keyStoreFor, manager, OTHER_BOOT, ourBrowser, pidAlive, pidNamespace, processStart,
-  profileHasLoginCookie, root, sameProcess,
+  bootId, BrowserManager, bystander, children, KEY_STORE_FILE, keyStoreFor, manager, OTHER_BOOT, ourBrowser, pidAlive, pidNamespace,
+  processStart, profileHasLoginCookie, profileReachedFigmaFiles, root, sameProcess, win,
 } from "./browser-helpers.ts";
 
 /** A directory name of its own for each cookie profile the tests below make. */
@@ -129,9 +130,7 @@ test("a record of the recorded process itself is kept", () => {
 });
 
 test("a login window whose cookie has not appeared is left open rather than closed", async () => {
-  // This is what closeLoginWindow's SIGTERM rests on: it only ever signals a window whose auth cookie is already
-  // committed to the profile, so the graceful exit it asks for carries nothing. Windows turns that signal into
-  // TerminateProcess, which gives Chromium no chance to flush, and the login still survives because of this check.
+  // A window is only closed once loginSeen() says it has the login: closing it sooner would end a sign-in under way.
   const { m, record } = manager();
   const pid = ourBrowser(m.opts.userDataDir);
   writeFileSync(record, JSON.stringify({ pid, headless: false, purpose: "login", start: processStart(pid), launchedAt: Date.now() }));
@@ -220,6 +219,136 @@ test("the login cookie hint ignores expired cookies and, when asked, cookies wri
   const olderSchema = profile([{ created: now - 1000, expires: now + day }], false);
   assert.ok(profileHasLoginCookie(olderSchema, now - 60_000), "creation time when there is no last_update_utc");
   assert.ok(!profileHasLoginCookie(olderSchema, now));
+});
+
+test("the Windows login hint: the last figma.com page since the window opened is in Figma's file browser", async () => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const dir = join(root, `history${n++}`);
+  mkdirSync(join(dir, "Default"), { recursive: true });
+  const scratch = join(root, `history-scratch${n++}`);
+  mkdirSync(scratch);
+  const opened = Date.now();
+  const seen = () => profileReachedFigmaFiles(dir, opened, join(scratch, "history"));
+  assert.equal(seen(), false, "no history yet");
+  // WAL, with this connection held open as the browser holds its own: the visits stay in the -wal, uncheckpointed.
+  const db = new DatabaseSync(join(dir, "Default", "History"));
+  db.exec("pragma journal_mode = wal; create table urls (id integer primary key, url text); create table visits (id integer primary key, url integer, visit_time integer)");
+  const visit = (url: string, after: number) => {
+    const { id } = db.prepare("insert into urls (url) values (?) returning id").get(url) as { id: number };
+    db.prepare("insert into visits (url, visit_time) values (?, ?)").run(id, BigInt(Math.round(opened + after + 11_644_473_600_000)) * 1000n);
+  };
+  visit("https://www.figma.com/files/team/1/recents-and-sharing", -60_000);
+  assert.equal(seen(), false, "a visit before the window opened is an earlier login's");
+  // The sequence a Google sign-in left in a real profile, query strings aside.
+  visit("https://www.figma.com/login", 1000);
+  visit("https://www.figma.com/start_google_sso", 2000);
+  visit("https://accounts.google.com/v3/signin/identifier", 2001);
+  assert.equal(seen(), false, "signing in");
+  visit("https://www.figma.com/finish_google_sso", 3000);
+  assert.equal(seen(), false, "back from Google is not in yet: a failed sign-in goes from here to /login");
+  visit("https://www.figma.com/files", 4000);
+  visit("https://www.figma.com/files/team/1/recents-and-sharing/recently-viewed?fuid=2", 4001);
+  assert.equal(seen(), true, "in the file browser");
+  visit("https://www.figma.com.example.com/login", 5000);
+  visit("https://accounts.google.com/", 5001);
+  assert.equal(seen(), true, "other sites, lookalikes included, do not count");
+  // A signed-out /files is a 302 to /login: two visits, one chain, and the login is the later one.
+  visit("https://www.figma.com/files/recents-and-sharing", 6000);
+  visit("https://www.figma.com/login?is_not_gen_0=true", 6000);
+  assert.equal(seen(), false, "back at the login");
+  db.close();
+  assert.deepEqual(readdirSync(scratch), [], "and no copy is left behind");
+});
+
+test("a scratch copy of the history that cannot be removed does not end the look for a login", { skip: (win || process.getuid?.() === 0) && "permissions do not bind here" }, async () => {
+  // A scanner holding the copy a moment, on Windows: its removal threw out of the hint, and the wait for the login
+  // with it. Here a directory that refuses writes stands for that.
+  const { DatabaseSync } = await import("node:sqlite");
+  const dir = join(root, `history${n++}`);
+  mkdirSync(join(dir, "Default"), { recursive: true });
+  new DatabaseSync(join(dir, "Default", "History")).close();
+  const scratch = join(root, `history-scratch${n++}`);
+  mkdirSync(scratch);
+  writeFileSync(join(scratch, "history-journal"), "left behind by an earlier look");
+  chmodSync(scratch, 0o555);
+  try {
+    assert.equal(profileReachedFigmaFiles(dir, Date.now(), join(scratch, "history")), false, "no answer this time, and no throw");
+  } finally {
+    chmodSync(scratch, 0o755);
+  }
+});
+
+test("a login window still there after being asked to close stays recorded, and is reported as open", { skip: win && "a POSIX signal" }, async (t) => {
+  // Closing it was reported done whether or not it was: the record went, and the next launch found its profile in use.
+  const { m, record } = manager();
+  m.opts.closeWaitMs = 500;
+  const ready = join(root, `sigterm-ready${n++}`);
+  const pid = ourBrowser(
+    m.opts.userDataDir,
+    `import { writeFileSync } from "node:fs";\nprocess.on("SIGTERM", () => {});\nwriteFileSync(${JSON.stringify(ready)}, "");\nsetTimeout(() => {}, 60_000)`,
+  );
+  // Whatever happens below: the SIGTERM after() sends is the one it ignores.
+  t.after(() => {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+  });
+  for (let i = 0; i < 100 && !existsSync(ready); i++) await new Promise((r) => setTimeout(r, 50));
+  assert.ok(existsSync(ready), "its SIGTERM handler is in place");
+  writeFileSync(record, JSON.stringify({ pid, headless: false, purpose: "login", start: processStart(pid), launchedAt: Date.now() }));
+  assert.equal(await m.closeLoginWindow(), false, "not closed");
+  assert.ok(pidAlive(pid), "still running");
+  assert.equal(m.launchRecord()?.pid, pid, "and still the login window");
+});
+
+/** A profile whose cookie DB holds a Figma auth cookie written at `at` (unix ms). */
+async function profileWithLoginCookie(dir: string, at: number) {
+  const { DatabaseSync } = await import("node:sqlite");
+  mkdirSync(join(dir, "Default"), { recursive: true });
+  const db = new DatabaseSync(join(dir, "Default", "Cookies"));
+  const chrome = BigInt(Math.round(at + 11_644_473_600_000)) * 1000n;
+  db.exec("create table cookies (host_key text, name text, creation_utc integer, expires_utc integer, has_expires integer)");
+  db.prepare("insert into cookies values (?, ?, ?, ?, ?)").run(".figma.com", "__Host-figma.authn", chrome, 0n, 0);
+  db.close();
+}
+
+test("on Windows a login window that cannot be asked to close is left open, unless its login is already on disk", { skip: !win && "Windows only (taskkill)" }, async () => {
+  // A process with no window, as taskkill finds a browser in another session: it can only be terminated, and that
+  // could lose a login not yet written, since on Windows the window is closed on a hint.
+  const { m, record } = manager();
+  const pid = ourBrowser(m.opts.userDataDir);
+  const launchedAt = Date.now() - 1000;
+  writeFileSync(record, JSON.stringify({ pid, headless: false, purpose: "login", start: processStart(pid), launchedAt }));
+  assert.equal(await m.closeLoginWindow(), false, "not closed");
+  assert.ok(pidAlive(pid), "nor killed");
+  assert.equal(m.launchRecord()?.pid, pid, "and still the login window");
+
+  await profileWithLoginCookie(m.opts.userDataDir, launchedAt + 500);
+  assert.equal(await m.closeLoginWindow(), true, "with the login on disk, there is nothing to lose");
+  assert.ok(!pidAlive(pid), "so it was ended");
+  assert.equal(m.launchRecord(), undefined);
+});
+
+test("on Windows a login window is asked to close, as its close button would", { skip: !win && "Windows only (taskkill)" }, async (t) => {
+  const ps = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  // Session 0, where services and SSH logons run, has no desktop: no window there can be asked to close (taskkill: "can
+  // only be terminated forcefully"), which is the test above. Measured on Windows 11: refused over SSH, closed from
+  // the desktop session.
+  const session = execFileSync(ps, ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${process.pid}).SessionId`], { encoding: "utf8" });
+  if (session.trim() === "0") return t.skip("session 0 (a service or an SSH logon): no desktop to ask a window on");
+  const { m, record } = manager();
+  const shown = join(root, `shown${n++}`);
+  const form =
+    "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.Form; " +
+    `$f.Add_Shown({ Set-Content -Path '${shown}' -Value 1 }); [System.Windows.Forms.Application]::Run($f)`;
+  const child = spawn(ps, ["-NoProfile", "-NonInteractive", "-Command", form], { stdio: "ignore" });
+  children.push(child.pid!);
+  for (let i = 0; i < 300 && !existsSync(shown); i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(existsSync(shown), "the window came up");
+  writeFileSync(record, JSON.stringify({ pid: child.pid, headless: false, purpose: "login", start: processStart(child.pid!), launchedAt: Date.now() }));
+  assert.equal(await m.closeLoginWindow(), true);
+  assert.ok(!pidAlive(child.pid!), "it closed its window and exited");
+  assert.equal(m.launchRecord(), undefined);
 });
 
 test("on a Mac a profile keeps its cookie key where its login is, decided once and kept", async () => {

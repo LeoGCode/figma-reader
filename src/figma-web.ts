@@ -57,6 +57,18 @@ const QUICK_ACTION_BOX =
  * is asked rather than process.platform, because over FIGMA_CDP_URL the browser can be on another machine.
  */
 const ON_MAC = `/Mac/.test(navigator.platform || navigator.userAgent)`;
+/**
+ * Whether Figma's own keyboard input has the focus: a hidden INPUT of class "focus-target" (aria-label "Figma
+ * Design") through which its shortcuts arrive. Figma focuses it a moment after a file opens - measured 0.8 to 4 s
+ * after the node was selected - and a shortcut sent before then reaches the page and does nothing: Copy as PNG
+ * produced no image, and every node screenshot that navigated waited out its whole 30 s attempt before the retry
+ * worked (36 s on Linux, 40 s on a Mac, 43 s on Windows, against 1 s on a tab already showing the node). The
+ * Comments panel's container carries the same class, so only the INPUT counts.
+ */
+const KEY_TARGET =
+  `(()=>{const a=document.activeElement;return !!a&&a.tagName==="INPUT"&&/(^|\\s)focus-target(\\s|$)/.test(String(a.className))})()`;
+/** How long to wait for Figma to take the keyboard before sending a shortcut anyway. */
+const KEY_TARGET_TIMEOUT_MS = 10_000;
 /** How long a node-id navigation may take to produce a selection before we give up. */
 const SELECT_TIMEOUT_MS = 20_000;
 /** How long one Copy as PNG attempt waits for the image. */
@@ -224,7 +236,15 @@ export function captureTimeoutMessage(d: {
   attempts: number;
   waitedMs: number;
   selectAll: boolean;
+  /** Whether Figma's keyboard input had the focus when the shortcut was sent; undefined when not checked. */
+  keyTarget?: boolean;
 }): string {
+  const keys =
+    d.keyTarget === false
+      ? `the shortcut was delivered, though Figma's keyboard input never took the focus within ${KEY_TARGET_TIMEOUT_MS / 1000}s, `
+      : d.keyTarget
+        ? "Figma's keyboard input had the focus, the shortcut was delivered, "
+        : "the shortcut was delivered, ";
   const sel = !d.selection.readable
     ? "could not be inspected (Figma's internal store was unavailable)"
     : d.selection.ids?.length
@@ -232,7 +252,7 @@ export function captureTimeoutMessage(d: {
       : "empty";
   return (
     `Copy as PNG produced no image for node ${d.nodeId} after ${d.attempts} attempt(s) of ` +
-    `${(d.waitedMs / 1000).toFixed(1)}s each. Checked: the editor was ready, the shortcut was delivered, and ` +
+    `${(d.waitedMs / 1000).toFixed(1)}s each. Checked: the editor was ready, ${keys}and ` +
     `Figma's selection was ${sel}${d.selectAll ? " (select-all was used because the id is a page)" : ""}. ` +
     `Not checked: whether the file restricts copying/exporting, or whether the node renders as an empty image.`
   );
@@ -341,15 +361,22 @@ export class FigmaWeb {
     await this.browser.launchLoginWindow(`${ORIGIN}/login`);
   }
 
-  /** Wait for login in the window (auth cookie appears, or the window is closed), then verify headless. */
+  /** Wait for login in the window (see loginSeen, or the window is closed), then verify headless. */
   async waitForLogin(seconds: number) {
     const deadline = Date.now() + this.ms(seconds * 1000);
-    while (this.browser.launchRecord()?.purpose === "login" && !this.browser.loginCookiePresent()) {
+    const windowOpen = () => this.browser.launchRecord()?.purpose === "login";
+    while (windowOpen() && !this.browser.loginSeen()) {
       if (Date.now() > deadline) return null;
       await sleep(this.ms(2000));
     }
     await sleep(this.ms(3000)); // let the browser persist the fresh cookies before closing it
-    await this.browser.closeLoginWindow();
+    // A window that would not close when asked is the user's to close; the login is read once they have.
+    if (!(await this.browser.closeLoginWindow())) {
+      while (windowOpen()) {
+        if (Date.now() > deadline) return null;
+        await sleep(this.ms(2000));
+      }
+    }
     const user = await this.whoami();
     if (!user) await this.openLogin();
     return user;
@@ -672,6 +699,8 @@ export class FigmaWeb {
     const cmd = await this.shortcutModifier(page);
     for (let attempt = 0; attempt < 3; attempt++) {
       await this.focusCanvas(page, true);
+      // Once: an attempt after the first runs on a page Figma has long since taken the keyboard on, or never will.
+      if (attempt === 0) await this.awaitKeyTarget(page);
       await page.key("/", "Slash", 191, cmd.mod);
       let open = false;
       for (let i = 0; i < 12 && !open; i++) {
@@ -707,6 +736,22 @@ export class FigmaWeb {
     });
   }
 
+  /**
+   * Wait until Figma's keyboard input has the focus (see KEY_TARGET). False when it never took it, in which case the
+   * shortcut is sent anyway, as it always was: a change in Figma's markup costs the old 30 s, not every capture.
+   */
+  private async awaitKeyTarget(page: CdpSession): Promise<boolean> {
+    const deadline = Date.now() + this.ms(KEY_TARGET_TIMEOUT_MS);
+    for (;;) {
+      // Each look within what is left of the wait, and so is each pause, so the wait ends at its ceiling: a renderer
+      // that stopped answering held one look to evaluate's own 60 s.
+      const left = deadline - Date.now();
+      if (left <= 0) return false;
+      if (await page.evaluate<boolean>(KEY_TARGET, left).catch(() => false)) return true;
+      await sleep(Math.min(this.ms(150), Math.max(0, deadline - Date.now())));
+    }
+  }
+
   /** Drop keyboard focus from panels that grab it on load (e.g. Comments), so canvas shortcuts reach Figma. */
   private async focusCanvas(page: CdpSession, escape: boolean) {
     // Escape also clears Figma's selection, so it is only safe before commands that do not need one.
@@ -714,12 +759,16 @@ export class FigmaWeb {
       await page.key("Escape", "Escape", 27);
       await sleep(this.ms(150));
     }
-    await page.evaluate("document.activeElement && document.activeElement !== document.body && document.activeElement.blur()").catch(() => {});
+    // Not Figma's own keyboard input: that is where its shortcuts arrive, not a panel that took them.
+    await page
+      .evaluate(`document.activeElement && document.activeElement !== document.body && !${KEY_TARGET} && document.activeElement.blur()`)
+      .catch(() => {});
     await page.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 800, y: 500 });
   }
 
   private async copyAsPngUnlocked(fileKey: string, nodeId: string, maxDimension: number, selectAll: boolean): Promise<PngCapture> {
     let selection: SelectionWait = { ids: null, readable: false, waitedMs: 0 };
+    let keyTarget: boolean | undefined;
     for (let attempt = 1; ; attempt++) {
       // openFile guarantees a selection when one is required, so the shortcut below never fires into the void.
       const page = await this.openFile(fileKey, nodeId, !selectAll);
@@ -737,6 +786,7 @@ export class FigmaWeb {
       try {
         const cmd = await this.shortcutModifier(page);
         await this.focusCanvas(page, false);
+        keyTarget = await this.awaitKeyTarget(page);
         if (selectAll) {
           await page.key("a", "KeyA", 65, cmd.mod);
           selection = await this.awaitSelection(page, this.ms(5000));
@@ -755,7 +805,7 @@ export class FigmaWeb {
         selection = await this.awaitSelection(page, 0); // report the selection as it stood at the end
         if (attempt >= CAPTURE_ATTEMPTS) {
           throw new Error(
-            captureTimeoutMessage({ nodeId, selection, attempts: attempt, waitedMs: Date.now() - started, selectAll }),
+            captureTimeoutMessage({ nodeId, selection, attempts: attempt, waitedMs: Date.now() - started, selectAll, keyTarget }),
           );
         }
       } finally {

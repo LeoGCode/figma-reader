@@ -41,6 +41,7 @@ export const {
   processStamp,
   processStart,
   profileHasLoginCookie,
+  profileReachedFigmaFiles,
   sameProcess,
   setKeychainProbe,
   takeLease,

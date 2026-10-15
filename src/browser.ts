@@ -21,6 +21,10 @@ export interface BrowserOptions {
   ownsProfile?: boolean;
   headless: boolean;
   stateDir: string;
+  /** How long a launch waits for the browser's DevTools port before giving up on it (20 s). */
+  launchWaitMs?: number;
+  /** How long closing the login window waits for it to exit (10 s). */
+  closeWaitMs?: number;
 }
 
 interface LaunchRecord {
@@ -55,6 +59,8 @@ export function pidAlive(pid: number) {
 // 26100), so PowerShell is what can be asked about a process there. It is named by its own path because a server's
 // environment need not carry System32 on PATH, and Windows PowerShell is in every supported version of Windows.
 const POWERSHELL = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+// taskkill by its path likewise. Without /F it asks a process's windows to close, as their close buttons do.
+const TASKKILL = join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe");
 // ps by its path for the same reason, off Linux (macOS, where it is always /bin/ps): run with a PATH that lacked it,
 // every launch record read as a stranger's process, so a browser that started fine was taken for one that had not.
 const PS = "/bin/ps";
@@ -631,9 +637,15 @@ export class BrowserManager {
 
   /** Endpoint of a browser already running on our profile, if any. */
   private async discover(): Promise<string | undefined> {
-    const file = join(this.opts.userDataDir, "DevToolsActivePort");
-    if (!existsSync(file)) return undefined;
-    const port = readFileSync(file, "utf8").split("\n")[0]?.trim();
+    let port: string | undefined;
+    try {
+      port = readFileSync(join(this.opts.userDataDir, "DevToolsActivePort"), "utf8").split("\n")[0]?.trim();
+    } catch {
+      // Absent, or on Windows held by the browser that is writing it: Edge keeps the file locked while it writes, and
+      // the EBUSY a read raised escaped a launch whose browser was already up, which then ran on with no record and
+      // was never closed (Windows 11, on the first call after every login). Not there yet, either way.
+      return undefined;
+    }
     const url = `http://127.0.0.1:${port}`;
     return port && (await this.reachable(url)) ? url : undefined;
   }
@@ -652,8 +664,9 @@ export class BrowserManager {
   }
 
   /**
-   * Visible login window with no DevTools port: sites like Google sign-in refuse remotely controlled browsers.
-   * Login is detected later, after the user closes the window, by a headless launch on the same profile.
+   * Visible login window with no DevTools port: Google sign-in refuses a browser that has one, even with no client
+   * connected (measured, see profileReachedFigmaFiles). The login is seen from the profile's files (loginSeen), and
+   * verified by a headless launch on the same profile once the window is closed.
    */
   async launchLoginWindow(url: string): Promise<number> {
     const exe = this.opts.executablePath ?? defaultExecutable();
@@ -683,21 +696,66 @@ export class BrowserManager {
   }
 
   /**
-   * Close the login window. SIGTERM asks Chromium to shut down rather than dropping it, but nothing here rests on
-   * that: both callers signal only once loginCookiePresent() has seen the auth cookie in the profile's cookie DB,
-   * so the login is already on disk. Windows has no graceful signal to send -- process.kill(pid, "SIGTERM") is
-   * TerminateProcess there, and the window is gone the moment it arrives.
+   * Whether the login window has the login, so it is time to close it and verify with the real session: its auth
+   * cookie is in the profile's cookie DB or, on Windows, where that file cannot be read while the browser runs, the
+   * window has gone on from the sign-in to Figma's file browser (see profileReachedFigmaFiles).
    */
-  async closeLoginWindow(): Promise<void> {
+  loginSeen(): boolean {
+    // One read of the record for both: on Windows each is a PowerShell process (see processStart).
+    const rec = this.record();
+    const since = rec?.purpose === "login" ? rec.launchedAt : undefined;
+    if (profileHasLoginCookie(this.opts.userDataDir, since)) return true;
+    if (process.platform !== "win32" || since === undefined) return false;
+    return profileReachedFigmaFiles(this.opts.userDataDir, since, join(this.stateDir, `history-${process.pid}`));
+  }
+
+  /**
+   * Close the login window, and say whether it is gone. SIGTERM asks Chromium to shut down, writing out its cookies.
+   * Windows has no signal for that -- process.kill is TerminateProcess there -- so the window is asked to close, as its
+   * close button does: Edge exited in half a second with every cookie on disk and its profile marked as closed
+   * normally, where TerminateProcess marked it crashed and would lose cookies not yet written (Chromium writes them
+   * every 30 s). That matters because on Windows the window is closed on a hint, before its cookie can be read; one
+   * that does not close when asked (a dialog in the way, or a window in another session, where taskkill cannot ask)
+   * is left open for the user unless its login is already on disk.
+   *
+   * A window still there after all that stays recorded, and this says so: it is still the login window, holding the
+   * profile, and a browser launched beside it would find the profile in use.
+   */
+  async closeLoginWindow(): Promise<boolean> {
     const found = this.readRecord();
-    if (found?.rec.purpose !== "login") return;
+    if (found?.rec.purpose !== "login") return true;
     const { raw, rec } = found;
-    try {
-      process.kill(rec.pid, "SIGTERM");
-    } catch {}
-    // Liveness, not identity, for the same reason as in close(): the wait is over when the process is gone.
-    for (let i = 0; i < 100 && (pidAlive(rec.pid) || this.profileLockPid()); i++) await sleep(100);
+    // Liveness, not identity, for the same reason as in close(): the wait is over when the process is gone. Identity
+    // once it is over, also as there: in that time Windows can hand the pid to another process.
+    const exited = async () => {
+      for (let i = 0; i < (this.opts.closeWaitMs ?? 10_000) / 100 && (pidAlive(rec.pid) || this.profileLockPid()); i++) await sleep(100);
+    };
+    const there = () => this.ownsProcess(rec.pid, rec.start, rec.ns);
+    if (process.platform === "win32") {
+      let asked = true;
+      try {
+        execFileSync(TASKKILL, ["/PID", String(rec.pid)], { stdio: "ignore", timeout: 10_000 });
+      } catch {
+        asked = false; // no window it could ask: nothing to wait for
+      }
+      if (asked) await exited();
+      // Its login on disk first, read for this window as recorded, then whether the pid is still the window's, the
+      // last thing before the signal: a pid can change hands while files are read.
+      if (profileHasLoginCookie(this.opts.userDataDir, rec.launchedAt) && there()) {
+        try {
+          process.kill(rec.pid);
+        } catch {}
+        await exited();
+      }
+    } else {
+      try {
+        process.kill(rec.pid, "SIGTERM");
+      } catch {}
+      await exited();
+    }
+    if (there()) return false;
     removeIfUnchanged(this.recordPath, raw);
+    return true;
   }
 
   async executable() {
@@ -763,8 +821,15 @@ export class BrowserManager {
 
   private async launchWith(exe: string, headless: boolean, purpose: LaunchRecord["purpose"], url: string, keyStore: string[]): Promise<string> {
     mkdirSync(this.opts.userDataDir, { recursive: true });
-    rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
+    // On Windows a browser still closing can hold it a moment, and then it stays: one left in place names a port
+    // nothing answers on, which discover() reads as no browser, and the new browser overwrites it.
+    try {
+      rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
+    } catch {}
     this.forgetSession();
+    // Names this launch on the browser's command line, which Chromium lets through as a switch it does not know: a
+    // browser the launch was handed to can then be told apart from someone else's on the profile (see below).
+    const launchTag = `--figma-reader-launch=${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
     const args = [
       "--remote-debugging-port=0",
       `--user-data-dir=${this.opts.userDataDir}`,
@@ -773,24 +838,42 @@ export class BrowserManager {
       "--window-size=1600,1000",
       ...keyStore,
       ...(headless ? ["--headless=new", "--mute-audio"] : ["--new-window"]),
+      launchTag,
       url,
     ];
     const child = spawnBrowser(exe, args);
-    for (let i = 0; i < 100; i++) {
-      await sleep(200);
-      child.check();
-      const ep = await this.discover();
-      if (ep) {
-        this.writeRecord({ pid: this.profileLockPid() ?? child.process.pid!, headless, purpose, exe });
-        this.endpoint = ep;
-        this.browserSession = undefined;
-        return ep;
+    try {
+      for (let i = 0; i < (this.opts.launchWaitMs ?? 20_000) / 200; i++) {
+        await sleep(200);
+        child.check();
+        const ep = await this.discover();
+        if (ep) {
+          this.writeRecord({ pid: this.profileLockPid() ?? child.process.pid!, headless, purpose, exe });
+          this.endpoint = ep;
+          this.browserSession = undefined;
+          return ep;
+        }
+        if (child.process.exitCode !== null && !this.profileLockPid()) break;
       }
-      if (child.process.exitCode !== null && !this.profileLockPid()) break;
+    } catch (e) {
+      // Whatever fails between the spawn and the record, the browser it started is not left running unrecorded:
+      // nothing would ever close it, and every later call would find it and work in it.
+      child.process.kill();
+      throw e;
     }
+    // Nor one still starting when the wait gives up on it, which would open its port later, unrecorded: the child, and
+    // the browser holding the profile when it is this launch's (a launcher that forks the browser and exits leaves the
+    // child gone already). One without this launch's tag is someone else's, and is left alone.
     const holder = this.profileLockPid();
+    const ours = holder !== undefined && !!processCmdline(holder)?.includes(launchTag);
+    child.process.kill();
+    if (ours) {
+      try {
+        process.kill(holder);
+      } catch {}
+    }
     throw new Error(
-      holder
+      holder && !ours
         ? `Profile ${this.opts.userDataDir} is in use by another browser (pid ${holder}) without a DevTools port. ` +
             `Close it, or start it with --remote-debugging-port and set FIGMA_CDP_URL.`
         // Seen twice while setting up CI, from two different browsers: the process starts and exits without ever
@@ -812,8 +895,10 @@ export class BrowserManager {
       throw new Error(`No browser DevTools endpoint at ${this.opts.cdpUrl}.`);
     }
     if (!ep && this.record()?.purpose === "login") {
-      if (!this.loginCookiePresent()) throw new Error("A Figma login window is open. Log in there, then retry.");
-      await this.closeLoginWindow();
+      if (!this.loginSeen()) throw new Error("A Figma login window is open. Log in there, then retry.");
+      if (!(await this.closeLoginWindow())) {
+        throw new Error("The Figma login window looks logged in but did not close when asked. Close it, then retry.");
+      }
     }
     if (!ep) ep = await this.launch(this.opts.headless, "work");
     const v = await this.reachable(ep);
@@ -974,6 +1059,63 @@ export function profileHasLoginCookie(userDataDir: string, since?: number): bool
     } catch {}
   }
   return false;
+}
+
+/** Removing a scratch copy, retried for a scanner holding it a moment: Node retries only a recursive removal. */
+const SCRATCH_RM = { force: true, recursive: true, maxRetries: 2, retryDelay: 50 };
+
+/** A page of Figma's file browser: where a sign-in started from /login lands, and what /login guards. */
+const FIGMA_FILES = /^https:\/\/www\.figma\.com\/files([/?#]|$)/;
+
+/**
+ * The login hint on Windows while the login window runs, where profileHasLoginCookie cannot be: Chromium-family
+ * browsers there keep the cookie database locked (Edge 155: "unable to open database file", with or without
+ * --disable-features=LockProfileCookieDatabase). The window has no DevTools port to ask instead: with only the port
+ * open, no client connected, Google rejected the sign-in as "This browser or app may not be secure", and passed the
+ * same window without it. Its history database is held by SQLite's lock alone, so a copy of its bytes reads.
+ *
+ * The hint: the last www.figma.com page the profile visited since `since` (unix ms) is in the file browser. Every
+ * sign-in in our profiles' histories went /start_google_sso, Google, /finish_google_sso, then /files; one that failed
+ * went back to /login, and a signed-out /files is a 302 to /login, so it ends there too. Chromium writes visits about
+ * every 10 s. Only a hint, as the cookie is: callers close the window, then verify with the real session.
+ */
+export function profileReachedFigmaFiles(userDataDir: string, since: number, scratch: string): boolean {
+  const history = join(userDataDir, "Default", "History");
+  if (!existsSync(history)) return false;
+  // Beside the copy, whichever journal the browser has: a -wal holds commits not yet in the file, and a hot journal is
+  // what SQLite rolls a half-written copy back with. Both need a connection that may write, which the copy can take.
+  const parts = ["", "-wal", "-journal"];
+  let db: any;
+  try {
+    // A part the browser has not got now must not be one an earlier look left behind, applied to this copy.
+    for (const p of parts) {
+      if (existsSync(history + p)) writeFileSync(scratch + p, readFileSync(history + p));
+      else rmSync(scratch + p, SCRATCH_RM);
+    }
+    const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite");
+    db = new DatabaseSync(scratch);
+    const sinceChrome = (BigInt(since) + 11_644_473_600_000n) * 1000n;
+    const last = db
+      .prepare(
+        "select u.url from visits v join urls u on u.id = v.url where v.visit_time >= ? and u.url like 'https://www.figma.com/%' " +
+          "order by v.visit_time desc, v.id desc limit 1",
+      )
+      .get(sinceChrome) as { url: string } | undefined;
+    return !!last && FIGMA_FILES.test(last.url);
+  } catch {
+    return false; // copied mid-write, or not a history database: the next look will tell
+  } finally {
+    try {
+      db?.close();
+    } catch {}
+    // A copy that cannot be removed this time (a scanner holding it, on Windows) is overwritten by the next look; the
+    // look itself still answers.
+    for (const p of [...parts, "-shm"]) {
+      try {
+        rmSync(scratch + p, SCRATCH_RM);
+      } catch {}
+    }
+  }
 }
 
 /** File in a profile of ours naming where its cookies' key lives on macOS: "keychain" or "mock". */

@@ -48,7 +48,19 @@ export interface Run {
 
 /** Run the CLI with stdout and stderr on pipes, the way `figma-reader ... | jq` runs it; `input` is written to its stdin. */
 export function cli(args: string[], opts: { cwd?: string; env?: Record<string, string | undefined>; input?: string } = {}): Promise<Run> {
-  const env: Record<string, string | undefined> = { ...process.env, HOME: home, FIGMA_FILES_DIRS: work, FIGMA_ACCOUNT: undefined, FIGMA_READER_CACHE: undefined, ...opts.env };
+  // Windows builds the roots from APPDATA and LOCALAPPDATA, and homedir() from USERPROFILE: with HOME alone, a suite run
+  // on a clean Windows 11 left a dozen state directories in the real profile.
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    APPDATA: join(home, "AppData", "Roaming"),
+    LOCALAPPDATA: join(home, "AppData", "Local"),
+    FIGMA_FILES_DIRS: work,
+    FIGMA_ACCOUNT: undefined,
+    FIGMA_READER_CACHE: undefined,
+    ...opts.env,
+  };
   for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["--no-warnings", CLI, ...args], { cwd: opts.cwd ?? work, env: env as NodeJS.ProcessEnv });

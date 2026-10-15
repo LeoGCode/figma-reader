@@ -193,6 +193,11 @@ interface Editor {
   height: number;
   /** navigator.platform. On a Mac Figma's shortcuts take Cmd and ignore Ctrl; everywhere else the other way round. */
   platform: string;
+  /**
+   * Page evaluations after a navigation before Figma focuses its keyboard input, standing in for the 0.8 to 4 s it
+   * takes. A Copy as PNG sent before then does nothing, as measured on all three platforms.
+   */
+  keyTargetAfter: number;
 }
 
 interface FakeTab {
@@ -214,6 +219,8 @@ interface FakeTab {
   /** Whether Ctrl+/ reached the canvas, and how many polls have passed since. */
   opening: boolean;
   boxPolls: number;
+  /** Page evaluations since the last navigation: Figma takes the keyboard once there have been keyTargetAfter. */
+  evals: number;
 }
 
 /**
@@ -246,6 +253,7 @@ function tabWorld(
     width: 800,
     height: 400,
     platform: "Linux x86_64",
+    keyTargetAfter: 0,
     ...hooks.editor,
   };
   const cmd = () => (/Mac/.test(ed.platform) ? "cmd+" : "ctrl+");
@@ -268,6 +276,9 @@ function tabWorld(
       isReady: () => true,
       _store: { getState: () => ({ mirror: { sceneGraphSelection: t.selection && Object.fromEntries(t.selection.map((id) => [id, 1])) } }) },
     };
+    // A new page: nothing has the focus, and Figma takes the keyboard only after a while (see keyTargetAfter).
+    t.evals = 0;
+    t.dom.doc.activeElement = null;
     const node = new URL(url, ORIGIN).searchParams.get("node-id")?.replace("-", ":");
     // Figma selects the node a ?node-id names when the file holds it; a page id selects nothing.
     t.selection = node && ed.pageIds.includes(node) ? [node] : [];
@@ -284,7 +295,7 @@ function tabWorld(
       select(t, [...ed.pageIds]);
     } else if (name === `${cmd()}Slash`) {
       if (ed.box === "opens" && !(ed.swallowFirstSlash && t.keys.filter((k) => k === name).length === 1)) t.opening = true;
-    } else if (name === `${cmd()}shift+KeyC` && ed.copies && t.selection?.length) {
+    } else if (name === `${cmd()}shift+KeyC` && ed.copies && t.selection?.length && t.evals > ed.keyTargetAfter) {
       // Through the page's own clipboard patch, so what parks the image is the code under test.
       t.ctx.__item = { types: ["image/png"], getType: async () => pngBlob(t.selection!, ed.width, ed.height) };
       await vm.runInContext("navigator.clipboard.write([__item])", t.ctx);
@@ -302,7 +313,7 @@ function tabWorld(
     });
     const t: FakeTab = {
       id, type: "page", url, title: "", webSocketDebuggerUrl: `ws://x/${id}`, ctx,
-      polls: 0, selection: [], keys: [], typed: [], dom, opening: false, boxPolls: 0,
+      polls: 0, selection: [], keys: [], typed: [], dom, opening: false, boxPolls: 0, evals: 0,
     }; // prettier-ignore
     // The quick-action container is the box's own element here: nothing in the fake page is nested, so an ancestor
     // lookup only ever reaches the element itself.
@@ -315,6 +326,8 @@ function tabWorld(
     // from the box, and typed the query into it.
     dom.add("input", { "data-testid": "layer-name", "aria-label": "Rename layer" });
     dom.add("button", { "data-testid": "save-as", "aria-disabled": "true" }, () => hooks.onClick?.(t, "save-as"));
+    // Figma's own keyboard input, which it focuses on its own a while after the page loads.
+    dom.add("input", { class: "focus-target", "aria-label": "Figma Design" });
     tabs.set(id, t);
     return t;
   };
@@ -327,8 +340,10 @@ function tabWorld(
       close() {},
       evaluate: async (expr: string) => {
         if (expr.includes("isReady")) t.polls++;
-        // Whatever it asks about the focused input is the poll that waits for the box to open.
-        if (expr.includes("activeElement") && expr.includes("INPUT")) {
+        // Figma takes the keyboard once enough time (evaluations) has passed, unless something else has the focus.
+        if (++t.evals > ed.keyTargetAfter && dom.doc.activeElement === null) dom.doc.activeElement = dom.get('input[aria-label="Figma Design"]');
+        // Whatever else it asks about the focused input is the poll that waits for the box to open.
+        if (expr.includes("activeElement") && expr.includes("INPUT") && !expr.includes("focus-target")) {
           if (ed.box === "rename") dom.doc.activeElement = dom.get('[data-testid="layer-name"]');
           else if (t.opening && ++t.boxPolls >= ed.boxOpensAfter) dom.doc.activeElement = dom.get("input");
         }
@@ -682,19 +697,36 @@ test("the wait for a login goes through the same scale as every other wait here"
   // ms() says every wait and deadline in figma-web.ts goes through it. This one did not: it counted the deadline in
   // real seconds, polled every real 2 s and then sat out a real 3 s, so the login path cost seconds of a test run
   // that had asked for all of it to be scaled away. Unscaled, each half below takes 30 s, 2 s and 3 s.
-  const waiting = fakeBrowser({ launchRecord: () => ({ purpose: "login" }), loginCookiePresent: () => false }, { timeScale: 0.001 });
+  const waiting = fakeBrowser({ launchRecord: () => ({ purpose: "login" }), loginSeen: () => false }, { timeScale: 0.001 });
   let began = Date.now();
   assert.equal(await waiting.web.waitForLogin(30), null, "gave up at its deadline");
   assert.ok(Date.now() - began < 1_000, `a 30 s deadline polled every 2 s, scaled by 0.001, took ${Date.now() - began} ms`);
 
   loggedIn();
   const done = fakeBrowser(
-    { launchRecord: () => ({ purpose: "login" }), loginCookiePresent: () => true, closeLoginWindow: async () => {} },
+    { launchRecord: () => ({ purpose: "login" }), loginSeen: () => true, closeLoginWindow: async () => true },
     { timeScale: 0.001 },
   );
   began = Date.now();
   assert.deepEqual(await done.web.waitForLogin(30), user, "and the cookie is there");
   assert.ok(Date.now() - began < 1_000, `letting the browser persist the cookies took ${Date.now() - began} ms`);
+});
+
+test("a login window that does not close when asked is the user's to close, and the login is verified once they have", async () => {
+  // On Windows the window is closed on a hint, before its cookie can be read, and one that refuses (a dialog in the
+  // way, another session) is never killed: the login it holds may not be written yet.
+  loggedIn();
+  let looks = 0;
+  const closing = fakeBrowser(
+    { launchRecord: () => (++looks <= 3 ? { purpose: "login" } : undefined), loginSeen: () => true, closeLoginWindow: async () => false },
+    { timeScale: 0.001 },
+  );
+  // 600 s scaled to 600 ms: room for the three waits on the way, each of which Windows rounds up to a 15.6 ms tick.
+  assert.deepEqual(await closing.web.waitForLogin(600), user, "verified after the user closed it");
+  assert.equal(looks, 4, "and not before: it looked until the window was gone");
+
+  const stuck = fakeBrowser({ launchRecord: () => ({ purpose: "login" }), loginSeen: () => true, closeLoginWindow: async () => false }, { timeScale: 0.001 });
+  assert.equal(await stuck.web.waitForLogin(30), null, "a window left open runs out the deadline");
 });
 
 test("tab marks carry the owner's namespace, boot and start time, and older marks still parse", () => {
@@ -818,6 +850,35 @@ test("on a Mac the shortcuts are sent with Cmd, which is all Figma answers there
   // The box that does not open on a Mac says which shortcut it was asked for with, so the failure can be told apart.
   const shut = tabWorld({ editor: { platform: "MacIntel", box: "never" } });
   await assert.rejects(fakeBrowser(shut.world, { dir: workDir() }).web.saveLocalCopy(KEY, join(root, "never.fig"), 300), /after Cmd\+\//);
+});
+
+test("a capture waits for Figma to take the keyboard after a navigation, rather than lose its shortcut and 30 s", async () => {
+  // Measured on all three platforms: Figma focuses its keyboard input 0.8 to 4 s after the node is selected, and a
+  // Copy as PNG sent before then did nothing, so every node screenshot that navigated waited out a whole 30 s
+  // attempt and won on the retry (36 to 43 s, against 1 s on a tab already showing the node).
+  loggedIn();
+  const { tabs, world } = tabWorld({ editor: { pageIds: ["1:2"], keyTargetAfter: 12 } });
+  // Not 0.005: that made the 10 s wait 50 ms, polled every 0.75 ms, and Windows fires timers every 15.6 ms, so the
+  // wait gave up after three polls, before the fake had handed Figma the keyboard (measured on Windows 11).
+  const { web } = fakeBrowser(world, { timeScale: 0.05 });
+  assert.deepEqual(idsOf(await web.copyAsPng(KEY, "1:2", 400)), ["1:2"]);
+  const t = [...tabs.values()][0]!;
+  assert.equal(t.keys.filter((k) => k === "ctrl+shift+KeyC").length, 1, "one shortcut, sent once Figma had the keyboard");
+});
+
+test("the wait for Figma to take the keyboard ends at its ceiling, even on a page that stopped answering", async () => {
+  // A stalled renderer answers no evaluation, and each look took evaluate's own 60 s before the 10 s ceiling was
+  // checked. Here as there, a look ends only at the timeout it is given.
+  const { web } = fakeBrowser({}, { timeScale: 0.01 });
+  // Every timer cleared once the race is decided, so a look left pending cannot hold the test file open. Not unref'd:
+  // with nothing else pending, Node 22 then ends the file while the wait is still on its look (measured on macOS).
+  const timers: NodeJS.Timeout[] = [];
+  const stalled = { evaluate: (_expr: string, timeoutMs = 60_000) => new Promise((_, reject) => timers.push(setTimeout(() => reject(new Error("timed out")), timeoutMs))) };
+  const began = Date.now();
+  const gaveUp = await Promise.race([(web as any).awaitKeyTarget(stalled), new Promise((r) => timers.push(setTimeout(() => r("still waiting"), 5_000)))]);
+  timers.forEach(clearTimeout);
+  assert.equal(gaveUp, false, "it gave up rather than wait on the page");
+  assert.ok(Date.now() - began < 1_000, `a 10 s ceiling scaled by 0.01 took ${Date.now() - began} ms`);
 });
 
 test("a capture is downscaled to the size asked for, and never enlarged", async () => {

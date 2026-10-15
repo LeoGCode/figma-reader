@@ -35,6 +35,13 @@ test("capture timeout names the selection it actually observed", () => {
   assert.match(m, /Not checked:/);
 });
 
+test("capture timeout says whether Figma had taken the keyboard", () => {
+  const base = { nodeId: "1:2", selection: { ids: ["1:2"], readable: true, waitedMs: 0 }, attempts: 2, waitedMs: 30_000, selectAll: false };
+  assert.match(captureTimeoutMessage({ ...base, keyTarget: false }), /Figma's keyboard input never took the focus within 10s/);
+  assert.match(captureTimeoutMessage({ ...base, keyTarget: true }), /Figma's keyboard input had the focus, the shortcut was delivered/);
+  assert.doesNotMatch(captureTimeoutMessage(base), /keyboard input/);
+});
+
 test("capture timeout distinguishes an empty selection from an uninspectable one", () => {
   const empty = captureTimeoutMessage({
     nodeId: "1:2",

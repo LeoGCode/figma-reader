@@ -41,16 +41,24 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           echo "FIGMA_BROWSER_PATH=$(node -e "console.log(require('playwright-core').chromium.executablePath())")" >> "$GITHUB_ENV"
 
-      # Typechecks src, test and scripts, then runs the suite from the TypeScript source.
-      - run: npm test
+      # Typechecks src, test and scripts, then runs the suite from the TypeScript source. Its output is kept for the
+      # report below; bash on every runner, for the pipe (its default -o pipefail keeps a failed run failed).
+      - run: npm test 2>&1 | tee test-output.txt
+        shell: bash
 
-      # A few tests skip themselves where the machine cannot answer (no chromium on the runner, no boot id off
-      # Linux, running as root). Print the count so a suite that quietly stops running is visible here.
+      # A few tests skip themselves where the machine cannot answer (no browser that starts, no boot id off Linux,
+      # running as root). This used to be counted on Linux only, and the macOS runner skipped both tests that launch a
+      # real browser with nobody seeing it, through a release that was broken on a Mac. So every runner lists its
+      # skips, by name and reason, in the job summary. Both reporters are matched: Node 22 prints TAP into a pipe.
       - name: Report skipped tests
-        if: always() && runner.os == 'Linux'
+        if: always()
+        shell: bash
         run: |
-          skipped=$(node --test --test-timeout=30000 --test-reporter=tap test/*.test.ts 2>/dev/null | grep -c '# SKIP' || true)
-          echo "skipped on this runner: $skipped"
+          {
+            echo "### Skipped on ${{ matrix.os }}, node ${{ matrix.node }}"
+            grep -aE '^ℹ skipped [0-9]+|^# skipped [0-9]+' test-output.txt | tail -1 || echo "(no test output)"
+            grep -aE '^\s*﹣ |# SKIP' test-output.txt | sed -E 's/^\s*/- /' || true
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The published package is built from src by prepack, so a build that no longer compiles is a release that
       # cannot be made. npm pack --dry-run catches a files/bin entry pointing at something the build does not emit.

@@ -5,7 +5,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
-import { hostname } from "node:os";
+import { homedir, hostname } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import { appRoot, cannotWrite } from "./account.ts";
 import { CdpSession, sleep, type TargetInfo } from "./cdp.ts";
@@ -55,6 +55,9 @@ export function pidAlive(pid: number) {
 // 26100), so PowerShell is what can be asked about a process there. It is named by its own path because a server's
 // environment need not carry System32 on PATH, and Windows PowerShell is in every supported version of Windows.
 const POWERSHELL = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+// ps by its path for the same reason, off Linux (macOS, where it is always /bin/ps): run with a PATH that lacked it,
+// every launch record read as a stranger's process, so a browser that started fine was taken for one that had not.
+const PS = "/bin/ps";
 
 /** One PowerShell expression about a process. Measured at 240-320 ms a call on a warm runner, so nothing asks twice. */
 function powershell(expr: string): string | undefined {
@@ -104,7 +107,7 @@ function readStart(pid: number): string | undefined {
   // Digits alone, which the stamp formats below need: they separate their own parts with '|' and ':'.
   if (process.platform === "win32") return powershell(`(Get-Process -Id ${pid}).StartTime.Ticks`);
   try {
-    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const out = execFileSync(PS, ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     return out.trim() || undefined;
   } catch {
     return undefined;
@@ -152,7 +155,7 @@ function processCmdline(pid: number): string | undefined {
     // -ww, because BSD ps cuts the command at the terminal width and --user-data-dir sits behind the executable's
     // path, which for a browser is a path inside an .app bundle: two -w mean no limit, so the profile is there to
     // be read. A truncated line would read as a browser on some other profile, which is the answer that relaunches.
-    return execFileSync("ps", ["-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return execFileSync(PS, ["-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch {
     return undefined;
   }
@@ -392,7 +395,8 @@ export function dropLease(path: string) {
 const BROWSER_NAMES = ["brave", "brave-browser", "chromium", "chromium-browser", "google-chrome-stable", "google-chrome"];
 // Windows spells them with an extension: there is no google-chrome-stable, and Brave is brave.exe.
 const WINDOWS_NAMES = ["brave.exe", "chrome.exe", "chromium.exe", "msedge.exe"];
-const onWindows = () => process.platform === "win32";
+// macOS names the executable inside an app bundle after the app. Each is its bundle's name too (see macDirs).
+const MAC_APPS = ["Brave Browser", "Chromium", "Google Chrome", "Microsoft Edge"];
 // path.delimiter, because Windows separates PATH with ';' and a split on ':' cuts every entry at its drive letter.
 const pathEntries = () => (process.env.PATH ?? "").split(delimiter).filter(Boolean);
 /**
@@ -403,6 +407,15 @@ function windowsDirs(): string[] {
   const roots = [process.env.PROGRAMFILES, process.env["PROGRAMFILES(X86)"], process.env.LOCALAPPDATA].filter((d): d is string => !!d);
   const apps = ["BraveSoftware\\Brave-Browser\\Application", "Google\\Chrome\\Application", "Chromium\\Application", "Microsoft\\Edge\\Application"];
   return roots.flatMap((root) => apps.map((app) => join(root, app)));
+}
+
+/**
+ * Where macOS keeps browsers, which is never on PATH: an app is a bundle dragged into /Applications (or the user's own
+ * ~/Applications), with its executable at Contents/MacOS/<app>. Brave there was reported as "No Chromium-family
+ * browser found" until FIGMA_BROWSER_PATH named it, on every Mac it was tried on.
+ */
+function macDirs(): string[] {
+  return ["/Applications", join(homedir(), "Applications")].flatMap((root) => MAC_APPS.map((app) => join(root, `${app}.app`, "Contents", "MacOS")));
 }
 
 /**
@@ -437,7 +450,10 @@ export const demoteConfined = (paths: string[]) => [...paths.filter((p) => !sand
  * can hand in a directory of its own: emptying PATH is no longer enough on Windows, where the install directories
  * above put the machine's real Chrome and Edge in front of anything a test lays out.
  */
-export const browserSearchDirs = () => [...pathEntries(), ...(onWindows() ? windowsDirs() : [])];
+export const browserSearchDirs = (platform = process.platform) => [
+  ...pathEntries(),
+  ...(platform === "win32" ? windowsDirs() : platform === "darwin" ? macDirs() : []),
+];
 
 /**
  * Installed browsers, best first. Existence is not usability -- a file can be there, be a directory, lack the execute
@@ -445,13 +461,14 @@ export const browserSearchDirs = () => [...pathEntries(), ...(onWindows() ? wind
  * candidate and launch() works down the list. Playwright's build ("Chrome for Testing") is last whatever else is
  * found: Google sign-in refuses it as insecure, which breaks "Continue with Google" on figma.com.
  */
-export function browserCandidates(dirs = browserSearchDirs()): string[] {
+export function browserCandidates(dirs = browserSearchDirs(), platform = process.platform): string[] {
   const found: string[] = [];
   // One browser is on PATH under several names once directories are merged: on Debian /bin links to /usr/bin, so
   // /bin/chromium and /usr/bin/chromium are one file and trying both is one failed launch paid for twice. The first
   // spelling is what gets reported, since that is the one a user would recognise.
   const seen = new Set<string>();
-  const names = onWindows() ? WINDOWS_NAMES : BROWSER_NAMES;
+  // On a Mac the names on PATH come first: a browser someone put there is one they chose over the installed apps.
+  const names = platform === "win32" ? WINDOWS_NAMES : platform === "darwin" ? [...BROWSER_NAMES, ...MAC_APPS] : BROWSER_NAMES;
   for (const name of names) {
     for (const dir of dirs) {
       const path = join(dir, name);
@@ -640,11 +657,12 @@ export class BrowserManager {
    */
   async launchLoginWindow(url: string): Promise<number> {
     const exe = this.opts.executablePath ?? defaultExecutable();
+    const keyStore = this.keyStoreArgs();
     mkdirSync(this.opts.userDataDir, { recursive: true });
     rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
     this.forgetSession();
     const launchedAt = Date.now();
-    const child = spawnBrowser(exe, [`--user-data-dir=${this.opts.userDataDir}`, "--no-first-run", "--no-default-browser-check", "--new-window", url]);
+    const child = spawnBrowser(exe, [`--user-data-dir=${this.opts.userDataDir}`, "--no-first-run", "--no-default-browser-check", ...keyStore, "--new-window", url]);
     await sleep(1500);
     child.check();
     // Launcher scripts may exit after handing off; the profile lock names the real browser pid.
@@ -693,13 +711,15 @@ export class BrowserManager {
    * FIGMA_BROWSER_PATH is never substituted: someone who says which browser to use gets told it failed.
    */
   async launch(headless: boolean, purpose: LaunchRecord["purpose"], url = "about:blank"): Promise<string> {
-    if (this.opts.executablePath) return this.launchWith(this.opts.executablePath, headless, purpose, url);
+    // Before the loop: a profile whose login this session cannot read is not a browser that failed to start.
+    const keyStore = this.keyStoreArgs();
+    if (this.opts.executablePath) return this.launchWith(this.opts.executablePath, headless, purpose, url, keyStore);
     const candidates = browserCandidates();
     if (!candidates.length) throw new Error("No Chromium-family browser found. Install Brave/Chromium/Chrome or set FIGMA_BROWSER_PATH.");
     const failures: string[] = [];
     for (const exe of candidates) {
       try {
-        return await this.launchWith(exe, headless, purpose, url);
+        return await this.launchWith(exe, headless, purpose, url, keyStore);
       } catch (e) {
         const message = (e as Error).message;
         // A profile already held by another browser is about this profile, not this executable: trying a different
@@ -735,7 +755,13 @@ export class BrowserManager {
     }
   }
 
-  private async launchWith(exe: string, headless: boolean, purpose: LaunchRecord["purpose"], url: string): Promise<string> {
+  /** The flag that keeps this profile's cookie key where its login is: macOS only, see keyStoreFor. */
+  private keyStoreArgs(): string[] {
+    if (process.platform !== "darwin") return [];
+    return keyStoreFor(this.opts.userDataDir, !!this.opts.ownsProfile, () => keychainProbe()) === "mock" ? ["--use-mock-keychain"] : [];
+  }
+
+  private async launchWith(exe: string, headless: boolean, purpose: LaunchRecord["purpose"], url: string, keyStore: string[]): Promise<string> {
     mkdirSync(this.opts.userDataDir, { recursive: true });
     rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
     this.forgetSession();
@@ -745,6 +771,7 @@ export class BrowserManager {
       "--no-first-run",
       "--no-default-browser-check",
       "--window-size=1600,1000",
+      ...keyStore,
       ...(headless ? ["--headless=new", "--mute-audio"] : ["--new-window"]),
       url,
     ];
@@ -947,6 +974,79 @@ export function profileHasLoginCookie(userDataDir: string, since?: number): bool
     } catch {}
   }
   return false;
+}
+
+/** File in a profile of ours naming where its cookies' key lives on macOS: "keychain" or "mock". */
+export const KEY_STORE_FILE = "figma-reader-key-store";
+
+/**
+ * Whether this session can use the macOS login Keychain. Over SSH, or from a job outside the desktop session, it
+ * cannot: `security` answers "User interaction is not allowed" (measured over SSH on macOS 26).
+ */
+export function keychainReachable(): boolean {
+  try {
+    execFileSync("/usr/bin/security", ["show-keychain-info"], { stdio: "ignore", timeout: 10_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * What a launch asks about the Keychain. The test suite answers it itself: whether the Keychain is in reach depends
+ * on the session the suite runs in (a terminal on the Mac, SSH, a CI runner), which no launch test is about, and
+ * four of them failed over SSH on what was only this check. keyStoreFor's own test hands in both answers.
+ */
+let keychainProbe = keychainReachable;
+export const setKeychainProbe = (probe: () => boolean) => {
+  keychainProbe = probe;
+};
+
+/**
+ * Where a profile's cookie key lives on macOS: the login Keychain, or Chromium's mock keychain (a fixed key, so the
+ * cookies are kept by the profile directory's permissions alone, as Playwright launches every Chromium on a Mac).
+ *
+ * A browser that cannot reach the Keychain can neither read a login kept under it nor save a new one. Measured over
+ * SSH: the login window took the sign-in and wrote no cookie at all, so every call after it found no login and opened
+ * another window. The mock keychain needs nothing from the session, but each key reads only the cookies it wrote,
+ * so the choice is made once per profile and kept in it: chosen afresh at each launch, a login saved over SSH would
+ * read as logged out from a terminal on the Mac, and the other way round.
+ *
+ * - A profile marked mock stays mock.
+ * - With the Keychain in reach, an unmarked profile is marked keychain: one with a login made before this mark
+ *   existed has it there, and a new one has the Keychain like any browser on the Mac.
+ * - Out of reach, a profile with nothing to keep moves to mock; one with a login cannot, and this throws instead.
+ * - FIGMA_USER_DATA_DIR may be someone's everyday browser, whose cookies the mock key would make unreadable to
+ *   them: that profile is never moved, only told about.
+ */
+export function keyStoreFor(dir: string, ownsProfile: boolean, reachable: () => boolean = keychainReachable): "keychain" | "mock" {
+  const file = join(dir, KEY_STORE_FILE);
+  const why = "which this session cannot reach (over SSH, or from a job outside the desktop session)";
+  const fix = "Run figma-reader from a terminal on this Mac, or unlock the Keychain in this session first with `security unlock-keychain`.";
+  if (!ownsProfile) {
+    if (reachable()) return "keychain";
+    throw new Error(`The browser profile ${dir} (FIGMA_USER_DATA_DIR) keeps its logins under the macOS Keychain, ${why}. ${fix}`);
+  }
+  let marked = "";
+  try {
+    marked = readFileSync(file, "utf8").trim();
+  } catch {}
+  if (marked === "mock") return "mock";
+  const mark = (store: "keychain" | "mock") => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(file, `${store}\n`);
+    return store;
+  };
+  if (reachable()) return marked === "keychain" ? "keychain" : mark("keychain");
+  if (profileHasLoginCookie(dir)) {
+    throw new Error(
+      `This account's Figma login is kept under the macOS Keychain, ${why}: the browser would read it as logged out, ` +
+        `and a new login would not be saved. ${fix} To use this account from such sessions, delete its browser ` +
+        `profile ${dir} and sign in again from one (\`figma-reader login\`): a login made where the Keychain is out ` +
+        `of reach is kept without it.`,
+    );
+  }
+  return mark("mock");
 }
 
 export const defaultStateDir = () => appRoot("state");

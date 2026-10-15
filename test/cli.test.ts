@@ -2,7 +2,7 @@
 // suite, output through a pipe, the end of the options, a bad snapshot age, dev-status's envelope and list-files.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { bigFile, cli, FRAMES, root, type Run, work } from "./cli-helpers.ts";
@@ -10,7 +10,10 @@ import { figBytes } from "./fixtures.ts";
 
 const bigFig = bigFile();
 
-test("npm run test:private fails when there are no private tests to run", async () => {
+// The script is POSIX shell, run here through sh: a clean Windows has none until Git for Windows brings one.
+const hasSh = spawnSync("sh", ["-c", "exit 0"]).status === 0;
+
+test("npm run test:private fails when there are no private tests to run", { skip: !hasSh && "no sh on this machine" }, async () => {
   // An unmatched glob stays literal, node then collects zero files and exits 0: anyone who never writes the private
   // suite gets a passing "private tests" step forever.
   const script: string = JSON.parse(readFileSync(join(import.meta.dirname, "..", "package.json"), "utf8")).scripts["test:private"];

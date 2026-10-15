@@ -727,7 +727,9 @@ test("tab marks carry the owner's namespace, boot and start time, and older mark
 });
 
 test("a tab is free only when its owner is gone, including when the owner's pid was reused", async (t) => {
-  const child = spawn("sleep", ["60"], { stdio: "ignore" });
+  // Node itself as the process that stays up: Windows has no sleep but the one Git for Windows brings, and without it
+  // the spawn failed and every check below ran on a pid that never existed (measured on a clean Windows 11).
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { stdio: "ignore" });
   t.after(() => child.kill());
   const pid = child.pid!;
   const start = processStart(pid);

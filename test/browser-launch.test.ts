@@ -2,9 +2,10 @@
 // closed again by another manager.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import {
   BrowserManager, browserCandidates, browserSearchDirs, children, confinedPath, demoteConfined, dudBrowser, pidAlive, processStart, root,
@@ -44,6 +45,112 @@ test("a write the state directory refuses once registered is said in words: the 
   } finally {
     chmodSync(m.stateDir, 0o755);
   }
+});
+
+test("a launch that fails after its browser started does not leave that browser running", { skip: (win || process.getuid?.() === 0) && "a POSIX stand-in, and permissions that bind" }, async (t) => {
+  // Measured on Windows 11: a read that failed while the new browser was still writing its DevTools port escaped the
+  // launch, and the browser, already up, ran on with no record. Nothing ever closed it, and every later call worked
+  // in it. Here the record cannot be written, which fails the launch at the same point, after the spawn.
+  const server = createServer((_req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:1/devtools/browser/none", "User-Agent": "Chrome/1" }));
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const port = (server.address() as { port: number }).port;
+  const dir = join(root, "orphan");
+  const profile = join(dir, "profile");
+  const exe = join(dir, "lingering-browser");
+  mkdirSync(profile, { recursive: true });
+  // Says where its port is, as Chromium does, and stays up as a browser would; its pid is left beside it.
+  writeFileSync(exe, `#!/bin/sh\necho $$ > '${join(dir, "pid")}'\nprintf '${port}\\n/devtools/browser/none\\n' > '${join(profile, "DevToolsActivePort")}'\nexec sleep 30\n`);
+  chmodSync(exe, 0o755);
+  const m = new BrowserManager({ executablePath: exe, userDataDir: profile, headless: true, stateDir: join(dir, "state") });
+  chmodSync(m.stateDir, 0o555);
+  try {
+    await assert.rejects(m.launch(true, "work"), /launching the browser records it/);
+  } finally {
+    chmodSync(m.stateDir, 0o755);
+  }
+  const pid = Number(readFileSync(join(dir, "pid"), "utf8"));
+  for (let i = 0; i < 50 && pidAlive(pid); i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(!pidAlive(pid), "the browser it started was stopped");
+});
+
+test("a launch that gives up waiting for the port does not leave its browser starting", { skip: win && "a POSIX stand-in" }, async () => {
+  // One slow enough to outlast the wait (Edge took 10 s to start on a loaded Windows VM) would open its port later
+  // with no record: found by every later call, closed by none.
+  const dir = join(root, "slow-start");
+  const profile = join(dir, "profile");
+  const exe = join(dir, "slow-browser");
+  mkdirSync(profile, { recursive: true });
+  writeFileSync(exe, `#!/bin/sh\necho $$ > '${join(dir, "pid")}'\nexec sleep 30\n`);
+  chmodSync(exe, 0o755);
+  const m = new BrowserManager({ executablePath: exe, userDataDir: profile, headless: true, stateDir: join(dir, "state"), launchWaitMs: 1000 });
+  await assert.rejects(m.launch(true, "work"), /never opened a DevTools port/);
+  const pid = Number(readFileSync(join(dir, "pid"), "utf8"));
+  for (let i = 0; i < 50 && pidAlive(pid); i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(!pidAlive(pid), "the browser it started was stopped");
+});
+
+/**
+ * A browser for the profile that holds its lock as Chromium does (SingletonLock names "<host>-<pid>") and stays up
+ * without a DevTools port: started with `args`, it reports what it was launched with, as a browser's command line does.
+ */
+function lockHolderScript(dir: string, profile: string) {
+  const script = join(dir, "holder.mjs");
+  writeFileSync(script, "setTimeout(() => {}, 30_000);\n");
+  // Its output away from the shell's: whoever waits on that shell (spawnSync) would otherwise wait for this too.
+  return (args: string) => `'${process.execPath}' '${script}' ${args} </dev/null >/dev/null 2>&1 &\nln -s '${hostname()}'-$! '${join(profile, "SingletonLock")}'\necho $! > '${join(dir, "pid")}'\n`;
+}
+
+test("a launch that gives up stops the browser a launcher handed it to, not someone else's on the profile", { skip: win && "a POSIX stand-in" }, async () => {
+  // A launcher that forks the browser and exits leaves the child gone already: stopping only the child left the
+  // browser it started running, unrecorded, and named it "another browser".
+  const dir = join(root, "forking-launcher");
+  const profile = join(dir, "profile");
+  mkdirSync(profile, { recursive: true });
+  const exe = join(dir, "launcher");
+  writeFileSync(exe, `#!/bin/sh\n${lockHolderScript(dir, profile)('"$@"')}exit 0\n`);
+  chmodSync(exe, 0o755);
+  const m = new BrowserManager({ executablePath: exe, userDataDir: profile, headless: true, stateDir: join(dir, "state"), launchWaitMs: 1000 });
+  await assert.rejects(m.launch(true, "work"), /never opened a DevTools port/);
+  const forked = Number(readFileSync(join(dir, "pid"), "utf8"));
+  for (let i = 0; i < 50 && pidAlive(forked); i++) await new Promise((r) => setTimeout(r, 100));
+  assert.ok(!pidAlive(forked), "the browser the launcher started was stopped");
+
+  // Someone else's browser already on the profile, without this launch's tag: the launch is handed to it, as Chromium
+  // does, and it is named, and left running.
+  const other = join(root, "foreign-holder");
+  const otherProfile = join(other, "profile");
+  mkdirSync(otherProfile, { recursive: true });
+  const holder = join(other, "holder.sh");
+  writeFileSync(holder, `#!/bin/sh\n${lockHolderScript(other, otherProfile)(`--user-data-dir=${otherProfile}`)}`);
+  chmodSync(holder, 0o755);
+  spawnSync(holder);
+  const theirs = Number(readFileSync(join(other, "pid"), "utf8"));
+  children.push(theirs);
+  const handoff = join(other, "handoff");
+  writeFileSync(handoff, "#!/bin/sh\nexit 0\n");
+  chmodSync(handoff, 0o755);
+  const n = new BrowserManager({ executablePath: handoff, userDataDir: otherProfile, headless: true, stateDir: join(other, "state"), launchWaitMs: 1000 });
+  await assert.rejects(n.launch(true, "work"), new RegExp(`in use by another browser \\(pid ${theirs}\\)`));
+  assert.ok(pidAlive(theirs), "and theirs was left running");
+});
+
+test("a DevTools port file that cannot be read is no browser yet, not a failed launch", async () => {
+  // On Windows the browser holds the file locked while it writes it, and the EBUSY that read raised failed the launch
+  // outright. A directory of that name can be neither read nor removed, here as there.
+  const dir = join(root, "unreadable-port");
+  const profile = join(dir, "profile");
+  mkdirSync(join(profile, "DevToolsActivePort"), { recursive: true });
+  const exe = dudBrowser(join(dir, "bin"), win ? "brave.exe" : "brave");
+  const m = new BrowserManager({ executablePath: exe, userDataDir: profile, headless: true, stateDir: join(dir, "state") });
+  await assert.rejects(m.launch(true, "work"), (e: Error) => {
+    assert.match(e.message, /never opened a DevTools port/, "the launch's own answer about a browser that did not start");
+    assert.doesNotMatch(e.message, /EISDIR|EBUSY|is a directory/i);
+    return true;
+  });
 });
 
 test("a browser executable that cannot be started rejects the launch instead of crashing the process", async () => {

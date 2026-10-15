@@ -21,6 +21,8 @@ export interface BrowserOptions {
   ownsProfile?: boolean;
   headless: boolean;
   stateDir: string;
+  /** How long a launch waits for the browser's DevTools port before giving up on it (20 s). */
+  launchWaitMs?: number;
 }
 
 interface LaunchRecord {
@@ -631,9 +633,15 @@ export class BrowserManager {
 
   /** Endpoint of a browser already running on our profile, if any. */
   private async discover(): Promise<string | undefined> {
-    const file = join(this.opts.userDataDir, "DevToolsActivePort");
-    if (!existsSync(file)) return undefined;
-    const port = readFileSync(file, "utf8").split("\n")[0]?.trim();
+    let port: string | undefined;
+    try {
+      port = readFileSync(join(this.opts.userDataDir, "DevToolsActivePort"), "utf8").split("\n")[0]?.trim();
+    } catch {
+      // Absent, or on Windows held by the browser that is writing it: Edge keeps the file locked while it writes, and
+      // the EBUSY a read raised escaped a launch whose browser was already up, which then ran on with no record and
+      // was never closed (Windows 11, on the first call after every login). Not there yet, either way.
+      return undefined;
+    }
     const url = `http://127.0.0.1:${port}`;
     return port && (await this.reachable(url)) ? url : undefined;
   }
@@ -763,8 +771,15 @@ export class BrowserManager {
 
   private async launchWith(exe: string, headless: boolean, purpose: LaunchRecord["purpose"], url: string, keyStore: string[]): Promise<string> {
     mkdirSync(this.opts.userDataDir, { recursive: true });
-    rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
+    // On Windows a browser still closing can hold it a moment, and then it stays: one left in place names a port
+    // nothing answers on, which discover() reads as no browser, and the new browser overwrites it.
+    try {
+      rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
+    } catch {}
     this.forgetSession();
+    // Names this launch on the browser's command line, which Chromium lets through as a switch it does not know: a
+    // browser the launch was handed to can then be told apart from someone else's on the profile (see below).
+    const launchTag = `--figma-reader-launch=${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
     const args = [
       "--remote-debugging-port=0",
       `--user-data-dir=${this.opts.userDataDir}`,
@@ -773,24 +788,42 @@ export class BrowserManager {
       "--window-size=1600,1000",
       ...keyStore,
       ...(headless ? ["--headless=new", "--mute-audio"] : ["--new-window"]),
+      launchTag,
       url,
     ];
     const child = spawnBrowser(exe, args);
-    for (let i = 0; i < 100; i++) {
-      await sleep(200);
-      child.check();
-      const ep = await this.discover();
-      if (ep) {
-        this.writeRecord({ pid: this.profileLockPid() ?? child.process.pid!, headless, purpose, exe });
-        this.endpoint = ep;
-        this.browserSession = undefined;
-        return ep;
+    try {
+      for (let i = 0; i < (this.opts.launchWaitMs ?? 20_000) / 200; i++) {
+        await sleep(200);
+        child.check();
+        const ep = await this.discover();
+        if (ep) {
+          this.writeRecord({ pid: this.profileLockPid() ?? child.process.pid!, headless, purpose, exe });
+          this.endpoint = ep;
+          this.browserSession = undefined;
+          return ep;
+        }
+        if (child.process.exitCode !== null && !this.profileLockPid()) break;
       }
-      if (child.process.exitCode !== null && !this.profileLockPid()) break;
+    } catch (e) {
+      // Whatever fails between the spawn and the record, the browser it started is not left running unrecorded:
+      // nothing would ever close it, and every later call would find it and work in it.
+      child.process.kill();
+      throw e;
     }
+    // Nor one still starting when the wait gives up on it, which would open its port later, unrecorded: the child, and
+    // the browser holding the profile when it is this launch's (a launcher that forks the browser and exits leaves the
+    // child gone already). One without this launch's tag is someone else's, and is left alone.
     const holder = this.profileLockPid();
+    const ours = holder !== undefined && !!processCmdline(holder)?.includes(launchTag);
+    child.process.kill();
+    if (ours) {
+      try {
+        process.kill(holder);
+      } catch {}
+    }
     throw new Error(
-      holder
+      holder && !ours
         ? `Profile ${this.opts.userDataDir} is in use by another browser (pid ${holder}) without a DevTools port. ` +
             `Close it, or start it with --remote-debugging-port and set FIGMA_CDP_URL.`
         // Seen twice while setting up CI, from two different browsers: the process starts and exits without ever

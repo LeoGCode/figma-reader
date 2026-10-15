@@ -191,6 +191,8 @@ interface Editor {
   /** Size of the image a capture produces. */
   width: number;
   height: number;
+  /** navigator.platform. On a Mac Figma's shortcuts take Cmd and ignore Ctrl; everywhere else the other way round. */
+  platform: string;
 }
 
 interface FakeTab {
@@ -204,7 +206,7 @@ interface FakeTab {
   polls: number;
   /** Node ids Figma reports as selected; null stands for an internal store that cannot be read at all. */
   selection: string[] | null;
-  /** Keys delivered to this tab, as "ctrl+shift+KeyC". */
+  /** Keys delivered to this tab, as "ctrl+shift+KeyC" (or "cmd+shift+KeyC"). */
   keys: string[];
   /** Text Input.insertText put into the page, one entry per call. */
   typed: string[];
@@ -222,7 +224,7 @@ interface FakeTab {
  * The tab also answers keystrokes the way the editor does: Ctrl+A selects the page, Ctrl+Shift+C writes an image
  * of the selection to the clipboard (through the page's own patched navigator.clipboard.write), Escape drops the
  * selection and the focus, and Ctrl+/ opens the Quick actions box - or does not, which is where the interesting
- * failures live.
+ * failures live. On a Mac each of those takes Cmd instead, and the Ctrl one does nothing.
  */
 function tabWorld(
   hooks: {
@@ -243,8 +245,10 @@ function tabWorld(
     copies: true,
     width: 800,
     height: 400,
+    platform: "Linux x86_64",
     ...hooks.editor,
   };
+  const cmd = () => (/Mac/.test(ed.platform) ? "cmd+" : "ctrl+");
   /**
    * Figma selecting nodes. It also rewrites the node-id in the address bar, which is how a page capture's
    * select-all left the next call looking at a url that named the very frame it wanted.
@@ -276,11 +280,11 @@ function tabWorld(
       t.boxPolls = 0;
       doc.activeElement = null;
       select(t, []);
-    } else if (name === "ctrl+KeyA") {
+    } else if (name === `${cmd()}KeyA`) {
       select(t, [...ed.pageIds]);
-    } else if (name === "ctrl+Slash") {
-      if (ed.box === "opens" && !(ed.swallowFirstSlash && t.keys.filter((k) => k === "ctrl+Slash").length === 1)) t.opening = true;
-    } else if (name === "ctrl+shift+KeyC" && ed.copies && t.selection?.length) {
+    } else if (name === `${cmd()}Slash`) {
+      if (ed.box === "opens" && !(ed.swallowFirstSlash && t.keys.filter((k) => k === name).length === 1)) t.opening = true;
+    } else if (name === `${cmd()}shift+KeyC` && ed.copies && t.selection?.length) {
       // Through the page's own clipboard patch, so what parks the image is the code under test.
       t.ctx.__item = { types: ["image/png"], getType: async () => pngBlob(t.selection!, ed.width, ed.height) };
       await vm.runInContext("navigator.clipboard.write([__item])", t.ctx);
@@ -293,7 +297,7 @@ function tabWorld(
       window: { name: "" },
       document: dom.doc,
       location: { href: url },
-      navigator: { clipboard: { write: async () => {} } },
+      navigator: { platform: ed.platform, userAgent: "", clipboard: { write: async () => {} } },
       ...captureGlobals,
     });
     const t: FakeTab = {
@@ -333,7 +337,7 @@ function tabWorld(
         return v;
       },
       key: async (_key: string, code: string, _keyCode: number, modifiers = 0) => {
-        const name = `${modifiers & 2 ? "ctrl+" : ""}${modifiers & 8 ? "shift+" : ""}${code}`;
+        const name = `${modifiers & 2 ? "ctrl+" : ""}${modifiers & 4 ? "cmd+" : ""}${modifiers & 8 ? "shift+" : ""}${code}`;
         t.keys.push(name);
         await press(t, name);
       },
@@ -793,6 +797,25 @@ test("a node capture takes the node asked for: not a different one, not one of s
   tab.selection = ["1:2", "1:3"];
   await shared.web.openFile(KEY, "1:2");
   assert.deepEqual(tab.selection, ["1:2"], "the file was loaded again rather than reused with more selected");
+});
+
+test("on a Mac the shortcuts are sent with Cmd, which is all Figma answers there", async () => {
+  // Measured in a browser made to report a Mac: Ctrl+/ left Quick actions shut and Ctrl+Shift+C copied nothing, so
+  // every export failed with "quick action not available" and every screenshot timed out, while Cmd did both.
+  loggedIn();
+  const mac = tabWorld({ editor: { platform: "MacIntel", pageIds: ["1:2", "1:3"] } });
+  const b = fakeBrowser(mac.world, { dir: workDir() });
+  // Nothing answers the click here, so the export times out - after the query reached the box, which is the point.
+  await assert.rejects(b.web.saveLocalCopy(KEY, join(root, "mac.fig"), 300), /Save local copy timeout/);
+  const t = [...mac.tabs.values()][0]!;
+  assert.deepEqual(t.typed, ["Save local copy"], "Cmd+/ opened the Quick actions box");
+  assert.deepEqual(idsOf(await b.web.copyAsPng(KEY, "1:2", 400)), ["1:2"], "Cmd+Shift+C copied the node");
+  assert.deepEqual(idsOf(await b.web.copyAsPng(KEY, "0:1", 400, true)), ["1:2", "1:3"], "Cmd+A selected the page");
+  assert.deepEqual(t.keys.filter((k) => k.includes("ctrl+")), [], "and no Ctrl shortcut was sent");
+
+  // The box that does not open on a Mac says which shortcut it was asked for with, so the failure can be told apart.
+  const shut = tabWorld({ editor: { platform: "MacIntel", box: "never" } });
+  await assert.rejects(fakeBrowser(shut.world, { dir: workDir() }).web.saveLocalCopy(KEY, join(root, "never.fig"), 300), /after Cmd\+\//);
 });
 
 test("a capture is downscaled to the size asked for, and never enlarged", async () => {

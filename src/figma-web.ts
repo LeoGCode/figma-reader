@@ -50,6 +50,13 @@ const QUICK_ACTION_BOX =
   `const t=((a.getAttribute("placeholder")||"")+" "+(a.getAttribute("aria-label")||"")+" "+(a.className||"")).toLowerCase();` +
   `if(/quick.?action|find action|search action/.test(t))return true;` +
   `return !!a.closest?.('[data-testid*="quick-action"],[data-testid*="quick_action"],[data-testid*="quickAction"]')}catch(e){return false}})()`;
+/**
+ * Whether the browser runs on macOS, where Figma's shortcuts take Cmd rather than Ctrl. Measured in one browser made to
+ * report each platform: reporting a Mac, Ctrl+/ never opened Quick actions and Ctrl+Shift+C copied nothing, while Cmd
+ * did both; reporting Linux, the other way round. Every export and capture failed on macOS for want of this. The page
+ * is asked rather than process.platform, because over FIGMA_CDP_URL the browser can be on another machine.
+ */
+const ON_MAC = `/Mac/.test(navigator.platform || navigator.userAgent)`;
 /** How long a node-id navigation may take to produce a selection before we give up. */
 const SELECT_TIMEOUT_MS = 20_000;
 /** How long one Copy as PNG attempt waits for the image. */
@@ -653,12 +660,19 @@ export class FigmaWeb {
     }
   }
 
+  /** The modifier of Figma's own shortcuts in this page: Cmd on macOS, Ctrl elsewhere. */
+  private async shortcutModifier(page: CdpSession): Promise<{ mod: number; name: string }> {
+    const mac = await page.evaluate<boolean>(ON_MAC).catch(() => process.platform === "darwin");
+    return mac ? { mod: MOD.meta, name: "Cmd" } : { mod: MOD.ctrl, name: "Ctrl" };
+  }
+
   private async quickAction(page: CdpSession, query: string, testId: string) {
-    // Panels that grab focus on load (e.g. Comments on files with comments) swallow Ctrl+/; clear focus and
-    // confirm the Quick actions search box actually opened before typing, retrying a few times.
+    // Panels that grab focus on load (e.g. Comments on files with comments) swallow Ctrl+/ (Cmd+/ on a Mac); clear
+    // focus and confirm the Quick actions search box actually opened before typing, retrying a few times.
+    const cmd = await this.shortcutModifier(page);
     for (let attempt = 0; attempt < 3; attempt++) {
       await this.focusCanvas(page, true);
-      await page.key("/", "Slash", 191, MOD.ctrl);
+      await page.key("/", "Slash", 191, cmd.mod);
       let open = false;
       for (let i = 0; i < 12 && !open; i++) {
         await sleep(this.ms(250));
@@ -682,7 +696,7 @@ export class FigmaWeb {
           dialogs: [...document.querySelectorAll('[role=dialog],[role=alertdialog]')].map(d=>d.textContent.trim().slice(0,120))}})()`)
       .catch((e) => ({ error: String(e) }));
     await page.key("Escape", "Escape", 27);
-    throw new Error(`quick action "${query}" not available (data-testid=${testId}) ${JSON.stringify(diag)}`);
+    throw new Error(`quick action "${query}" not available (data-testid=${testId}) after ${cmd.name}+/ ${JSON.stringify(diag)}`);
   }
 
   /** Select nodeId and run Edit > Copy as PNG, capturing the image in-page without touching the system clipboard. */
@@ -721,9 +735,10 @@ export class FigmaWeb {
         cb.write = write;
       })()`);
       try {
+        const cmd = await this.shortcutModifier(page);
         await this.focusCanvas(page, false);
         if (selectAll) {
-          await page.key("a", "KeyA", 65, MOD.ctrl);
+          await page.key("a", "KeyA", 65, cmd.mod);
           selection = await this.awaitSelection(page, this.ms(5000));
         } else {
           selection = await this.awaitSelection(page, this.ms(2000), nodeId);
@@ -732,7 +747,7 @@ export class FigmaWeb {
         // above spent up to 5 s of the 30 s on the selection, and captureTimeoutMessage then reported the whole
         // window as time spent waiting for the image.
         const started = Date.now();
-        await page.key("C", "KeyC", 67, MOD.ctrl | MOD.shift);
+        await page.key("C", "KeyC", 67, cmd.mod | MOD.shift);
         while (Date.now() - started < this.ms(CAPTURE_TIMEOUT_MS)) {
           await sleep(this.ms(250));
           if (await page.evaluate<boolean>(`!!window.${PNG_KEY}`)) return await this.readPng(page, maxDimension);

@@ -1,5 +1,5 @@
 // Snapshot cache: the latest exported .fig per file key on disk, and the one it replaced; decoded documents in memory.
-import { existsSync, linkSync, mkdirSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { getHeapStatistics } from "node:v8";
 import { cannotWrite, mayNotWrite } from "./account.ts";
@@ -196,6 +196,32 @@ function asSeen(path: string): string | undefined | typeof UNREADABLE {
     return `${st.mtimeMs}:${st.size}`;
   } catch (e) {
     return (e as NodeJS.ErrnoException | null)?.code === "ENOENT" ? undefined : UNREADABLE;
+  }
+}
+
+/**
+ * Make the export at `mine` read differently (see asSeen) from the snapshot at `path` it is about to replace, by moving
+ * its mtime on by as little as the filesystem keeps: 1 ms, or a second or two where times are kept to those (ext3,
+ * HFS+, FAT). Every reading here takes two files that read alike for one, so two generations of a snapshot must never
+ * read alike. They did, written within one tick of the file clock at one size: on a Windows 11 VM, whose NTFS times
+ * move in 15.6 ms ticks, two exports in the store's tests did that in three standalone runs of three, and previousOf
+ * refused the pair as one file. Telling files apart by inode instead is wrong where the client numbers them (CIFS
+ * noserverino: two links to one file can differ). Best effort: a time that cannot be set leaves the reading as it was.
+ */
+function distinctFrom(path: string, mine: string) {
+  const current = asSeen(path);
+  if (typeof current !== "string" || asSeen(mine) !== current) return;
+  const { atime, mtimeMs } = statSync(mine);
+  // From the time rounded: one kept in nanoseconds reads back as 1792107296861.999, and a millisecond on from that,
+  // as a Date takes it, is the same millisecond again.
+  const from = Math.round(mtimeMs);
+  for (const step of [1, 1000, 2000]) {
+    try {
+      utimesSync(mine, atime, new Date(from + step));
+    } catch {
+      return;
+    }
+    if (asSeen(mine) !== current) return;
   }
 }
 
@@ -485,6 +511,10 @@ export class SnapshotStore {
       // snapshot goes in: one that took no file was found only by the move, after the whole export.
       writeFileSync(mine, "", { flag: "wx" });
       await this.web.saveLocalCopy(fileKey, mine);
+      // Before it is dated and decoded, so this document's date and reading are those of the file it publishes. The
+      // snapshot it is checked against is the one standing now: an export published between this and the swap, in the
+      // same tick and at the same size, is the one case left, and previousOf refuses that pair rather than misread it.
+      distinctFrom(path, mine);
       const st = statSync(mine);
       // exportedAt comes from the file's mtime, as for a snapshot read back later, so both agree on its age. The
       // rename carries that mtime and size onto the snapshot, which is the reading fromDisk keys its decode by, so

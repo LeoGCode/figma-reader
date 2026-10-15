@@ -697,19 +697,36 @@ test("the wait for a login goes through the same scale as every other wait here"
   // ms() says every wait and deadline in figma-web.ts goes through it. This one did not: it counted the deadline in
   // real seconds, polled every real 2 s and then sat out a real 3 s, so the login path cost seconds of a test run
   // that had asked for all of it to be scaled away. Unscaled, each half below takes 30 s, 2 s and 3 s.
-  const waiting = fakeBrowser({ launchRecord: () => ({ purpose: "login" }), loginCookiePresent: () => false }, { timeScale: 0.001 });
+  const waiting = fakeBrowser({ launchRecord: () => ({ purpose: "login" }), loginSeen: () => false }, { timeScale: 0.001 });
   let began = Date.now();
   assert.equal(await waiting.web.waitForLogin(30), null, "gave up at its deadline");
   assert.ok(Date.now() - began < 1_000, `a 30 s deadline polled every 2 s, scaled by 0.001, took ${Date.now() - began} ms`);
 
   loggedIn();
   const done = fakeBrowser(
-    { launchRecord: () => ({ purpose: "login" }), loginCookiePresent: () => true, closeLoginWindow: async () => {} },
+    { launchRecord: () => ({ purpose: "login" }), loginSeen: () => true, closeLoginWindow: async () => true },
     { timeScale: 0.001 },
   );
   began = Date.now();
   assert.deepEqual(await done.web.waitForLogin(30), user, "and the cookie is there");
   assert.ok(Date.now() - began < 1_000, `letting the browser persist the cookies took ${Date.now() - began} ms`);
+});
+
+test("a login window that does not close when asked is the user's to close, and the login is verified once they have", async () => {
+  // On Windows the window is closed on a hint, before its cookie can be read, and one that refuses (a dialog in the
+  // way, another session) is never killed: the login it holds may not be written yet.
+  loggedIn();
+  let looks = 0;
+  const closing = fakeBrowser(
+    { launchRecord: () => (++looks <= 3 ? { purpose: "login" } : undefined), loginSeen: () => true, closeLoginWindow: async () => false },
+    { timeScale: 0.001 },
+  );
+  // 600 s scaled to 600 ms: room for the three waits on the way, each of which Windows rounds up to a 15.6 ms tick.
+  assert.deepEqual(await closing.web.waitForLogin(600), user, "verified after the user closed it");
+  assert.equal(looks, 4, "and not before: it looked until the window was gone");
+
+  const stuck = fakeBrowser({ launchRecord: () => ({ purpose: "login" }), loginSeen: () => true, closeLoginWindow: async () => false }, { timeScale: 0.001 });
+  assert.equal(await stuck.web.waitForLogin(30), null, "a window left open runs out the deadline");
 });
 
 test("tab marks carry the owner's namespace, boot and start time, and older marks still parse", () => {

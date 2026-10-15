@@ -361,15 +361,22 @@ export class FigmaWeb {
     await this.browser.launchLoginWindow(`${ORIGIN}/login`);
   }
 
-  /** Wait for login in the window (auth cookie appears, or the window is closed), then verify headless. */
+  /** Wait for login in the window (see loginSeen, or the window is closed), then verify headless. */
   async waitForLogin(seconds: number) {
     const deadline = Date.now() + this.ms(seconds * 1000);
-    while (this.browser.launchRecord()?.purpose === "login" && !this.browser.loginCookiePresent()) {
+    const windowOpen = () => this.browser.launchRecord()?.purpose === "login";
+    while (windowOpen() && !this.browser.loginSeen()) {
       if (Date.now() > deadline) return null;
       await sleep(this.ms(2000));
     }
     await sleep(this.ms(3000)); // let the browser persist the fresh cookies before closing it
-    await this.browser.closeLoginWindow();
+    // A window that would not close when asked is the user's to close; the login is read once they have.
+    if (!(await this.browser.closeLoginWindow())) {
+      while (windowOpen()) {
+        if (Date.now() > deadline) return null;
+        await sleep(this.ms(2000));
+      }
+    }
     const user = await this.whoami();
     if (!user) await this.openLogin();
     return user;

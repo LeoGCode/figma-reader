@@ -640,11 +640,12 @@ export class BrowserManager {
    */
   async launchLoginWindow(url: string): Promise<number> {
     const exe = this.opts.executablePath ?? defaultExecutable();
+    const keyStore = this.keyStoreArgs();
     mkdirSync(this.opts.userDataDir, { recursive: true });
     rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
     this.forgetSession();
     const launchedAt = Date.now();
-    const child = spawnBrowser(exe, [`--user-data-dir=${this.opts.userDataDir}`, "--no-first-run", "--no-default-browser-check", "--new-window", url]);
+    const child = spawnBrowser(exe, [`--user-data-dir=${this.opts.userDataDir}`, "--no-first-run", "--no-default-browser-check", ...keyStore, "--new-window", url]);
     await sleep(1500);
     child.check();
     // Launcher scripts may exit after handing off; the profile lock names the real browser pid.
@@ -693,13 +694,15 @@ export class BrowserManager {
    * FIGMA_BROWSER_PATH is never substituted: someone who says which browser to use gets told it failed.
    */
   async launch(headless: boolean, purpose: LaunchRecord["purpose"], url = "about:blank"): Promise<string> {
-    if (this.opts.executablePath) return this.launchWith(this.opts.executablePath, headless, purpose, url);
+    // Before the loop: a profile whose login this session cannot read is not a browser that failed to start.
+    const keyStore = this.keyStoreArgs();
+    if (this.opts.executablePath) return this.launchWith(this.opts.executablePath, headless, purpose, url, keyStore);
     const candidates = browserCandidates();
     if (!candidates.length) throw new Error("No Chromium-family browser found. Install Brave/Chromium/Chrome or set FIGMA_BROWSER_PATH.");
     const failures: string[] = [];
     for (const exe of candidates) {
       try {
-        return await this.launchWith(exe, headless, purpose, url);
+        return await this.launchWith(exe, headless, purpose, url, keyStore);
       } catch (e) {
         const message = (e as Error).message;
         // A profile already held by another browser is about this profile, not this executable: trying a different
@@ -735,7 +738,13 @@ export class BrowserManager {
     }
   }
 
-  private async launchWith(exe: string, headless: boolean, purpose: LaunchRecord["purpose"], url: string): Promise<string> {
+  /** The flag that keeps this profile's cookie key where its login is: macOS only, see keyStoreFor. */
+  private keyStoreArgs(): string[] {
+    if (process.platform !== "darwin") return [];
+    return keyStoreFor(this.opts.userDataDir, !!this.opts.ownsProfile, () => keychainProbe()) === "mock" ? ["--use-mock-keychain"] : [];
+  }
+
+  private async launchWith(exe: string, headless: boolean, purpose: LaunchRecord["purpose"], url: string, keyStore: string[]): Promise<string> {
     mkdirSync(this.opts.userDataDir, { recursive: true });
     rmSync(join(this.opts.userDataDir, "DevToolsActivePort"), { force: true });
     this.forgetSession();
@@ -745,6 +754,7 @@ export class BrowserManager {
       "--no-first-run",
       "--no-default-browser-check",
       "--window-size=1600,1000",
+      ...keyStore,
       ...(headless ? ["--headless=new", "--mute-audio"] : ["--new-window"]),
       url,
     ];
@@ -947,6 +957,79 @@ export function profileHasLoginCookie(userDataDir: string, since?: number): bool
     } catch {}
   }
   return false;
+}
+
+/** File in a profile of ours naming where its cookies' key lives on macOS: "keychain" or "mock". */
+export const KEY_STORE_FILE = "figma-reader-key-store";
+
+/**
+ * Whether this session can use the macOS login Keychain. Over SSH, or from a job outside the desktop session, it
+ * cannot: `security` answers "User interaction is not allowed" (measured over SSH on macOS 26).
+ */
+export function keychainReachable(): boolean {
+  try {
+    execFileSync("/usr/bin/security", ["show-keychain-info"], { stdio: "ignore", timeout: 10_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * What a launch asks about the Keychain. The test suite answers it itself: whether the Keychain is in reach depends
+ * on the session the suite runs in (a terminal on the Mac, SSH, a CI runner), which no launch test is about, and
+ * four of them failed over SSH on what was only this check. keyStoreFor's own test hands in both answers.
+ */
+let keychainProbe = keychainReachable;
+export const setKeychainProbe = (probe: () => boolean) => {
+  keychainProbe = probe;
+};
+
+/**
+ * Where a profile's cookie key lives on macOS: the login Keychain, or Chromium's mock keychain (a fixed key, so the
+ * cookies are kept by the profile directory's permissions alone, as Playwright launches every Chromium on a Mac).
+ *
+ * A browser that cannot reach the Keychain can neither read a login kept under it nor save a new one. Measured over
+ * SSH: the login window took the sign-in and wrote no cookie at all, so every call after it found no login and opened
+ * another window. The mock keychain needs nothing from the session, but each key reads only the cookies it wrote,
+ * so the choice is made once per profile and kept in it: chosen afresh at each launch, a login saved over SSH would
+ * read as logged out from a terminal on the Mac, and the other way round.
+ *
+ * - A profile marked mock stays mock.
+ * - With the Keychain in reach, an unmarked profile is marked keychain: one with a login made before this mark
+ *   existed has it there, and a new one has the Keychain like any browser on the Mac.
+ * - Out of reach, a profile with nothing to keep moves to mock; one with a login cannot, and this throws instead.
+ * - FIGMA_USER_DATA_DIR may be someone's everyday browser, whose cookies the mock key would make unreadable to
+ *   them: that profile is never moved, only told about.
+ */
+export function keyStoreFor(dir: string, ownsProfile: boolean, reachable: () => boolean = keychainReachable): "keychain" | "mock" {
+  const file = join(dir, KEY_STORE_FILE);
+  const why = "which this session cannot reach (over SSH, or from a job outside the desktop session)";
+  const fix = "Run figma-reader from a terminal on this Mac, or unlock the Keychain in this session first with `security unlock-keychain`.";
+  if (!ownsProfile) {
+    if (reachable()) return "keychain";
+    throw new Error(`The browser profile ${dir} (FIGMA_USER_DATA_DIR) keeps its logins under the macOS Keychain, ${why}. ${fix}`);
+  }
+  let marked = "";
+  try {
+    marked = readFileSync(file, "utf8").trim();
+  } catch {}
+  if (marked === "mock") return "mock";
+  const mark = (store: "keychain" | "mock") => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(file, `${store}\n`);
+    return store;
+  };
+  if (reachable()) return marked === "keychain" ? "keychain" : mark("keychain");
+  if (profileHasLoginCookie(dir)) {
+    throw new Error(
+      `This account's Figma login is kept under the macOS Keychain, ${why}: the browser would read it as logged out, ` +
+        `and a new login would not be saved. ${fix} To use this account from such sessions, delete its browser ` +
+        `profile ${dir} and sign in again from one (\`figma-reader login\`): a login made where the Keychain is out ` +
+        `of reach is kept without it.`,
+    );
+  }
+  return mark("mock");
 }
 
 export const defaultStateDir = () => appRoot("state");

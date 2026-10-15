@@ -31,6 +31,8 @@ export const {
   browserCandidates,
   confinedPath,
   demoteConfined,
+  KEY_STORE_FILE,
+  keyStoreFor,
   LEASE_BEAT_MS,
   liveLeases,
   pidAlive,
@@ -39,8 +41,12 @@ export const {
   processStart,
   profileHasLoginCookie,
   sameProcess,
+  setKeychainProbe,
   takeLease,
 } = await import("../src/browser.ts");
+// A desktop session's answer: on a Mac over SSH (and maybe on a CI runner) the Keychain is out of reach, and every
+// launch test would fail on that rather than on what it tests. keyStoreFor's own test covers both answers.
+setKeychainProbe(() => true);
 
 export const children: number[] = [];
 after(() => {

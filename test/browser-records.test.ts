@@ -9,8 +9,8 @@ import type { Socket } from "node:net";
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  bootId, BrowserManager, bystander, manager, OTHER_BOOT, ourBrowser, pidAlive, pidNamespace, processStart, profileHasLoginCookie, root,
-  sameProcess,
+  bootId, BrowserManager, bystander, KEY_STORE_FILE, keyStoreFor, manager, OTHER_BOOT, ourBrowser, pidAlive, pidNamespace, processStart,
+  profileHasLoginCookie, root, sameProcess,
 } from "./browser-helpers.ts";
 
 /** A directory name of its own for each cookie profile the tests below make. */
@@ -220,6 +220,63 @@ test("the login cookie hint ignores expired cookies and, when asked, cookies wri
   const olderSchema = profile([{ created: now - 1000, expires: now + day }], false);
   assert.ok(profileHasLoginCookie(olderSchema, now - 60_000), "creation time when there is no last_update_utc");
   assert.ok(!profileHasLoginCookie(olderSchema, now));
+});
+
+test("on a Mac a profile keeps its cookie key where its login is, decided once and kept", async () => {
+  // Over SSH the Keychain is out of reach, and a browser started there saved no login at all: every call found
+  // none and opened another login window. The mock keychain works anywhere, but each key reads only the cookies it
+  // wrote, so a profile switching with the session would lose its login every time it changed sessions.
+  const { DatabaseSync } = await import("node:sqlite");
+  let n = 0;
+  const profile = (login: boolean) => {
+    const dir = join(root, `key-store${n++}`);
+    mkdirSync(join(dir, "Default"), { recursive: true });
+    if (login) {
+      const db = new DatabaseSync(join(dir, "Default", "Cookies"));
+      db.exec("create table cookies (host_key text, name text, creation_utc integer, expires_utc integer, has_expires integer, last_update_utc integer)");
+      const t = BigInt(Date.now() + 11_644_473_600_000) * 1000n;
+      db.prepare("insert into cookies values (?,?,?,?,?,?)").run(".figma.com", "__Host-figma.authn", t, 0n, 0, t);
+      db.close();
+    }
+    return dir;
+  };
+  const marked = (dir: string) => (existsSync(join(dir, KEY_STORE_FILE)) ? readFileSync(join(dir, KEY_STORE_FILE), "utf8").trim() : undefined);
+  const inReach = () => true;
+  const outOfReach = () => false;
+
+  const fresh = profile(false);
+  assert.equal(keyStoreFor(fresh, true, inReach), "keychain", "a new profile in a desktop session uses the Keychain");
+  assert.equal(marked(fresh), "keychain");
+
+  const overSsh = profile(false);
+  assert.equal(keyStoreFor(overSsh, true, outOfReach), "mock", "one started over SSH does without it");
+  assert.equal(keyStoreFor(overSsh, true, inReach), "mock", "and keeps doing so from the desktop, where its login is readable");
+
+  // A login made before the mark existed was saved under the Keychain: over SSH it cannot be read, nor replaced.
+  const before = profile(true);
+  assert.throws(() => keyStoreFor(before, true, outOfReach), (e: Error) => {
+    assert.match(e.message, /login is kept under the macOS Keychain, which this session cannot reach \(over SSH/);
+    assert.match(e.message, /security unlock-keychain/);
+    assert.ok(e.message.includes(`delete its browser profile ${before}`), e.message);
+    return true;
+  });
+  assert.equal(marked(before), undefined, "and nothing was decided for it");
+  assert.equal(keyStoreFor(before, true, inReach), "keychain", "from the desktop it is the Keychain's, without a new login");
+  assert.throws(() => keyStoreFor(before, true, outOfReach), /kept under the macOS Keychain/, "and stays so");
+
+  const empty = profile(false);
+  keyStoreFor(empty, true, inReach);
+  assert.equal(keyStoreFor(empty, true, outOfReach), "mock", "a Keychain profile with nothing to keep moves rather than fails");
+
+  // Someone's everyday profile: the mock key would make their own cookies unreadable to them, so it is never moved.
+  const theirs = profile(false);
+  assert.equal(keyStoreFor(theirs, false, inReach), "keychain");
+  assert.throws(() => keyStoreFor(theirs, false, outOfReach), (e: Error) => {
+    assert.match(e.message, /FIGMA_USER_DATA_DIR\) keeps its logins under the macOS Keychain/);
+    assert.doesNotMatch(e.message, /delete/);
+    return true;
+  });
+  assert.equal(marked(theirs), undefined, "and nothing is written into it");
 });
 
 test("a login cookie still in the write-ahead log counts, not only a checkpointed one", async (t) => {

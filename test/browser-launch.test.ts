@@ -4,9 +4,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import {
-  BrowserManager, browserCandidates, children, confinedPath, demoteConfined, dudBrowser, pidAlive, processStart, root, win,
+  BrowserManager, browserCandidates, browserSearchDirs, children, confinedPath, demoteConfined, dudBrowser, pidAlive, processStart, root,
+  throwawayProfile, win,
 } from "./browser-helpers.ts";
 
 test("a write the state directory refuses once registered is said in words: the launch record, the busy lease", { skip: (win || process.getuid?.() === 0) && "permissions do not bind here" }, async (t) => {
@@ -108,17 +110,46 @@ test("a browser is chosen by what can run, and a confined build only as a last r
   }
 });
 
+test("on a Mac the browsers in /Applications are found, behind any on PATH", () => {
+  // A Mac app is never on PATH, so Brave in /Applications was "No Chromium-family browser found" until
+  // FIGMA_BROWSER_PATH named it. The platform is handed in, so this runs wherever the suite does.
+  const bundle = (app: string) => join("Applications", `${app}.app`, "Contents", "MacOS");
+  const dirs = browserSearchDirs("darwin");
+  for (const app of ["Brave Browser", "Google Chrome", "Chromium", "Microsoft Edge"]) {
+    assert.ok(dirs.includes(join("/", bundle(app))), `/Applications holds ${app}`);
+    assert.ok(dirs.includes(join(homedir(), bundle(app))), `and so does ~/Applications`);
+  }
+  // Only the bundles this adds: PATH itself holds .app directories on a Mac (an editor's bin, say), measured in a
+  // terminal there, where the first version of this check failed on them.
+  const elsewhere = browserSearchDirs("linux");
+  assert.ok(!elsewhere.includes(join("/", bundle("Brave Browser"))), "no bundle is looked for off a Mac");
+  assert.ok(!elsewhere.includes(join(homedir(), bundle("Brave Browser"))));
+
+  const mac = join(root, "mac-picker");
+  const onPath = join(mac, "bin");
+  const brave = join(mac, bundle("Brave Browser"));
+  for (const [dir, name] of [[onPath, "chromium"], [brave, "Brave Browser"]]) {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, name), "#!/bin/sh\nexit 1\n");
+    chmodSync(join(dir, name), 0o755);
+  }
+  const found = browserCandidates([onPath, brave], "darwin");
+  assert.deepEqual(found.slice(0, 2), [join(onPath, "chromium"), join(brave, "Brave Browser")], "PATH first, then the app");
+  assert.ok(!browserCandidates([brave], "linux").includes(join(brave, "Brave Browser")), "an app's name is a Mac's alone");
+});
+
 // brave comes before every other name in the preference order, so a dud under it is what a first launch gets.
 const dudDir = join(root, "fallthrough");
 const dud = dudBrowser(dudDir, win ? "brave.exe" : "brave");
 
 const chromium = [process.env.FIGMA_BROWSER_PATH, "/usr/bin/chromium", "/usr/bin/chromium-browser"].filter((p) => p !== undefined).find(existsSync);
 /**
- * A browser that really starts, for a launch to land on. A Unix lays out a wrapper around one beside the dud;
- * Windows can lay out no working stand-in at all (see dudBrowser) and does not need to, since the picker searches
- * the standard install directories besides PATH: the machine's own browser is the next candidate after the dud.
+ * A browser that really starts, for a launch to land on. One known by path gets a wrapper beside the dud. Windows and
+ * macOS need none, since the picker searches their install directories besides PATH (Program Files, /Applications):
+ * the machine's own browser is the next candidate after the dud. Windows could lay out no working stand-in anyway (see
+ * dudBrowser). macOS was left out until its picker found /Applications, so its runner skipped both tests below.
  */
-const launchable = chromium ?? (win ? browserCandidates()[0] : undefined);
+const launchable = chromium ?? (win || process.platform === "darwin" ? browserCandidates()[0] : undefined);
 
 // A real browser behind the dud, and on Windows every record written and read on the way costs a PowerShell call:
 // measured at 9 s on one runner and 24 s on a slower one, which is too close to the suite's 30 s ceiling.
@@ -126,15 +157,15 @@ test("a browser that cannot start is passed over for one that can", { skip: !lau
   // The picker used to commit to the first browser that existed, so a snap Chromium was a dead end: it exits
   // without opening a DevTools port, and nothing tried the working Chrome beside it. Here the first candidate
   // exits at once, exactly as that one does, and the launch must end on the browser behind it.
-  if (!win) {
+  if (!win && chromium) {
     const real = join(dudDir, "chromium");
-    writeFileSync(real, `#!/bin/sh\nexec ${chromium} "$@"\n`);
+    writeFileSync(real, `#!/bin/sh\nexec "${chromium}" "$@"\n`);
     chmodSync(real, 0o755);
   }
   const env = process.env.PATH;
   process.env.PATH = dudDir;
   const dir = join(root, "fallthrough-state");
-  const manager = new BrowserManager({ userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") });
+  const manager = new BrowserManager({ userDataDir: throwawayProfile(join(dir, "profile")), ownsProfile: true, headless: true, stateDir: join(dir, "state") });
   try {
     // Playwright's build is appended whatever else is installed, so what matters here is the first two.
     const found = browserCandidates();
@@ -167,7 +198,7 @@ test("a browser named outright is never quietly swapped for another", async () =
 // record is what stands between a reused pid and process.kill.
 test("a launched headless browser is recorded with its identity and closed by release() from a fresh manager", { skip: !launchable && "no browser that starts" }, async () => {
   const dir = join(root, "real");
-  const opts = { executablePath: launchable, userDataDir: join(dir, "profile"), headless: true, stateDir: join(dir, "state") };
+  const opts = { executablePath: launchable, userDataDir: throwawayProfile(join(dir, "profile")), ownsProfile: true, headless: true, stateDir: join(dir, "state") };
   const first = new BrowserManager(opts);
   await first.launch(true, "work");
   const rec = first.launchRecord()!;

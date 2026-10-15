@@ -29,6 +29,7 @@ export const {
   bootId,
   BrowserManager,
   browserCandidates,
+  browserSearchDirs,
   confinedPath,
   demoteConfined,
   KEY_STORE_FILE,
@@ -128,6 +129,16 @@ export const OTHER_BOOT = "0f9c8d2a-other-boot";
  * executable -- libuv spawns a PE image and nothing else, and Node refuses a .cmd outright unless it is given a
  * shell -- so there it is node itself, which is certainly runnable and rejects browser flags as bad node options.
  */
+/**
+ * A throwaway profile for a real launch, marked for the mock keychain: on a Mac a new profile would otherwise use the
+ * login Keychain, which a CI runner or an SSH session cannot always reach, and nothing a launch test checks is in it.
+ */
+export function throwawayProfile(dir: string): string {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, KEY_STORE_FILE), "mock\n");
+  return dir;
+}
+
 export function dudBrowser(dir: string, name: string): string {
   mkdirSync(dir, { recursive: true });
   const path = join(dir, name);

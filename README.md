@@ -99,7 +99,7 @@ A dated result names the date after what it dates, because the two are not the s
 
 [Install](#install) has the one-liners. This section is what each form needs beyond them.
 
-Node 22+ throughout. For web mode, a Chromium-family browser: on Linux and macOS the first of Brave, Chromium, Chrome found on `PATH`, on Windows `brave.exe`, `chrome.exe`, `chromium.exe` or `msedge.exe` on `PATH` or in the usual install directories, or whatever `FIGMA_BROWSER_PATH` names. A browser that cannot start is passed over for the next one, and a confined build (snap, flatpak) is tried only after an ordinary one, since it cannot reach a profile outside its own sandbox. Playwright's "Chrome for Testing" is a last resort because Google sign-in rejects it as insecure.
+Node 22+ throughout. For web mode, a Chromium-family browser: on Linux the first of Brave, Chromium, Chrome found on `PATH`, on macOS the same and then Brave, Chromium, Google Chrome or Microsoft Edge in `/Applications` or `~/Applications`, on Windows `brave.exe`, `chrome.exe`, `chromium.exe` or `msedge.exe` on `PATH` or in the usual install directories, or whatever `FIGMA_BROWSER_PATH` names. A browser that cannot start is passed over for the next one, and a confined build (snap, flatpak) is tried only after an ordinary one, since it cannot reach a profile outside its own sandbox. Playwright's "Chrome for Testing" is a last resort because Google sign-in rejects it as insecure.
 
 From a clone, `npm link` puts `figma-reader` and `figma-reader-mcp` on `PATH`; without it, run `node /path/to/figma-reader/dist/cli.js`.
 

@@ -279,7 +279,8 @@ test("a browser that cannot start is passed over for one that can", { skip: !lau
     assert.equal(found[0], dud, "the dud is preferred, so it is what a first launch gets");
     assert.ok(found.length > 1, `nothing behind the dud to fall through to: ${found.join(" ")}`);
     await manager.launch(true, "work");
-    const rec = manager.launchRecord()!;
+    const rec = manager.launchRecord();
+    assert.ok(rec, "the browser that started is recorded");
     children.push(rec.pid);
     assert.equal(rec.exe, found[1], "the browser that started is the one recorded");
   } finally {

@@ -1,6 +1,6 @@
 // What the browser test files (test/browser-*.test.ts) share: a temp root that the state, data and cache roots are
-// moved into before the browser module is loaded, the processes the tests spawn (killed when the file ends), and the
-// stand-ins they launch. Not a test file itself.
+// moved into before the browser module is loaded, the processes the tests spawn (killed when the file ends, along with
+// anything else still running on a profile under the root), and the stand-ins they launch. Not a test file itself.
 //
 // They were one file until it took 21.4 s of the 30 s --test-timeout on Node 22.18, which applies the timeout to each
 // test file as a whole as well as to each test in it, and 24.9 s on a loaded machine: real timers, mostly (a heartbeat
@@ -8,8 +8,8 @@
 // file of its own now, and the runner runs the files side by side.
 import { after } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, copyFileSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -51,14 +51,66 @@ export const {
 setKeychainProbe(() => true);
 
 export const children: number[] = [];
-after(() => {
-  for (const pid of children) {
+
+/**
+ * The pids of every process whose command line names this file's root: the browsers the tests start, on profiles
+ * under it, and the stand-ins, whose scripts live there. Found by their command lines, not by anything the code under
+ * test recorded, since that is what a failing test cannot be trusted for: a launch test failed on a missing launch
+ * record (the bug of the moment), so neither it nor release() had a pid to stop, and two headless Braves ran on for
+ * seven hours on the Mac. Browsers are started detached, so nothing stops them with the test file either.
+ *
+ * Best effort: a listing that cannot be had is no strays, never a failed file.
+ */
+function strays(): number[] {
+  try {
+    let found: { pid: number; command: string }[];
+    if (process.platform === "linux") {
+      found = readdirSync("/proc")
+        .filter((d) => /^\d+$/.test(d))
+        .map((d) => {
+          try {
+            return { pid: Number(d), command: readFileSync(`/proc/${d}/cmdline`, "utf8") };
+          } catch {
+            return { pid: 0, command: "" };
+          }
+        });
+    } else if (process.platform === "win32") {
+      const ps = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      const out = execFileSync(ps, ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }"], { encoding: "utf8", timeout: 30_000 });
+      found = out.split(/\r?\n/).map((l) => ({ pid: Number.parseInt(l, 10), command: l }));
+    } else {
+      const out = execFileSync("/bin/ps", ["-axww", "-o", "pid=,command="], { encoding: "utf8", timeout: 30_000 });
+      found = out.split("\n").map((l) => ({ pid: Number.parseInt(l, 10), command: l }));
+    }
+    return found.filter((p) => p.pid > 0 && p.pid !== process.pid && p.command.includes(root)).map((p) => p.pid);
+  } catch {
+    return [];
+  }
+}
+
+let cleanedUp = false;
+/** Stop whatever the tests started, and drop the root, once: after(), or the exit of a file that never got to it. */
+function cleanUp() {
+  if (cleanedUp) return;
+  cleanedUp = true;
+  for (const pid of [...children, ...strays()]) {
     try {
-      process.kill(pid);
+      process.kill(pid, "SIGKILL");
     } catch {}
   }
   rmSync(root, { recursive: true, force: true });
-});
+}
+after(cleanUp);
+// A file stopped from outside (Ctrl+C, a closed terminal, the runner ending one past its time) runs no after(), and
+// its detached browsers would outlive it there too. So the exit runs the same sweep (synchronous, as cleanUp is), and
+// the signals are turned into an exit. With on(), not once(): once() hands the signal back to its default action as it
+// fires, so another one during the sweep (the runner, signalled with its whole process group, passes its own on to
+// the file) ends the file there, browser alive. Measured on Linux: 4 SIGTERMs in 10 left a browser with once(), none
+// in 10 with on(), nor of 10 SIGINTs.
+process.once("exit", cleanUp);
+for (const [signal, code] of [["SIGHUP", 129], ["SIGINT", 130], ["SIGTERM", 143]] as const) {
+  process.on(signal, () => process.exit(code));
+}
 
 /**
  * A long-running process that is certainly not a browser on our profile: stands in for a reused pid. node runs it,
